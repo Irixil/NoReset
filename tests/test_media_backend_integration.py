@@ -77,7 +77,7 @@ def test_upload_create_replay_reuses_persisted_integrity_declarations(tmp_path):
     assert replay["media_id"] == first["media_id"]
 
 
-def test_default_backend_recognizes_scans_and_links_only_one_event(tmp_path):
+def test_default_backend_mock_recognition_fails_without_creating_patient_event(tmp_path):
     media_backend = backend(tmp_path)
     media = upload_image(media_backend)
 
@@ -94,14 +94,14 @@ def test_default_backend_recognizes_scans_and_links_only_one_event(tmp_path):
         actor="老人",
     )
 
-    assert first["attempt"]["text"] == "[Mock OCR] original"
-    assert first["attempt"]["is_mock"] is True
-    assert first["media"]["recognition_status"] == "succeeded"
-    assert first["media"]["link_status"] == "linked"
-    assert first["event"]["state"] == "inbox"
+    assert first["attempt"].get("text") is None
+    assert first["attempt"]["is_mock"] is None
+    assert first["attempt"]["status"] == "failed"
+    assert first["attempt"]["error_code"] == "provider_mock"
+    assert first["media"]["recognition_status"] == "failed"
+    assert first["media"]["link_status"] == "not_linked"
     assert replay["attempt"]["attempt_id"] == first["attempt"]["attempt_id"]
-    assert replay["event"]["record_id"] == first["event"]["record_id"]
-    assert len(media_backend.event_store.list()) == 1
+    assert len(media_backend.event_store.list()) == 0
 
 
 def test_unconfigured_recognition_keeps_saved_original(tmp_path):
@@ -142,7 +142,7 @@ def test_pending_link_reuses_saved_text_without_recognizing_again(tmp_path):
         text=text,
         provider="mock",
         model="mock-recognition-v1",
-        is_mock=True,
+        is_mock=False,
         actor="老人",
     )
     media_backend.event_store.save_media_recognition_safety(

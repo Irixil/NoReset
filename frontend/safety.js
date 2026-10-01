@@ -7,7 +7,7 @@
 
   const RULE_VERSION = 'offline-danger-v2';
   const CLINICAL_REVIEW_VERSION = 'offline-review-flags-v1';
-  const DANGER_REMINDER = '原始记录中出现需要及时人工或急救专业人员判断的描述，请联系当地急救服务或专业人员，不要自行改药。';
+  const DANGER_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。不要自行加药、减药或停药。';
   const INTENSIFIER = '(?:(?:突然|一直|仍然|还是|非常|特别|明显|很|有点儿?|有些|持续|十分|极其|越来越)(?:地|的)?){0,2}';
   const rules = [
     ['chest', new RegExp(`胸(?:口|部)?${INTENSIFIER}(?:疼痛|疼|痛)|胸闷`, 'gu')],
@@ -93,5 +93,12 @@
     };
   }
 
-  return { CLINICAL_REVIEW_VERSION, DANGER_REMINDER, RULE_VERSION, scanDanger };
+  // An OCR result is a candidate until a person compares this exact text with
+  // its source. A legacy recorded/draft state is not that attestation.
+  function documentNeedsReview(event) {
+    return event?.source_kind === 'document' && !(event.source_review?.method === 'original_comparison' &&
+      event.source_review?.confirmed_at && event.source_review.text === event.raw_text);
+  }
+
+  return { CLINICAL_REVIEW_VERSION, DANGER_REMINDER, RULE_VERSION, scanDanger, documentNeedsReview };
 });

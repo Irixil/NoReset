@@ -112,3 +112,5 @@ def test_loopback_auto_bind_requires_explicit_switch_exact_origin_and_loopback_c
     assert app_access.loopback_auto_bind_allowed("127.0.0.1", "https://untrusted.example", allowed) is False
     assert app_access.loopback_auto_bind_allowed("203.0.113.9", allowed, allowed) is False
     assert app_access.loopback_auto_bind_allowed("127.0.0.1", "http://localhost:5173", allowed) is False
+    monkeypatch.setenv("ALLOWED_ORIGIN", "http://localhost:5173")
+    assert app_access.loopback_auto_bind_allowed("127.0.0.1", "http://localhost:5173", "http://localhost:5173") is True

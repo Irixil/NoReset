@@ -68,14 +68,53 @@ function harness({ media = false } = {}) {
   };
 }
 
-test('text fallback copy matches its actual create-a-new-event behavior', () => {
+test('document OCR remains a reviewable transcription rather than a promise of exact original text', () => {
+  const h = harness();
+  const html = h.run("detailHtml({source_kind:'document',raw_text:'HEB 130',state:'draft',draft:{summary:'检验表'}})");
+  assert.match(html, /资料文字（请对照原件）/);
+  assert.match(html, /核对前不会用于 AI 整理、事实或交接正文/);
+  assert.doesNotMatch(html, /id="organizeBtn"|id="reviewBtn"|整理摘要/);
+  assert.doesNotMatch(html, /AI 只做分类和归档，没有改写原文/);
+  assert.match(html, /HEB 130/);
+});
+
+test('text and voice share the same resumable conversation behavior', () => {
   const markup = fs.readFileSync(path.join(frontend, 'index.html'), 'utf8');
   const app = fs.readFileSync(path.join(frontend, 'app.js'), 'utf8');
-  assert.match(markup, /可以单独用文字记录/);
-  assert.match(markup, /会保存为一条新的记录，原话会保留/);
-  assert.doesNotMatch(markup, /不会另起一份档案/);
-  assert.match(app, /source_kind:'elder'/);
-  assert.match(app, /method:'POST'/);
+  assert.match(markup, /打字说，或者点麦克风/);
+  assert.match(markup, /退出也会自动留下报告/);
+  assert.match(app, /submitConversationText/);
+  assert.match(app, /source_kind:extra\.source_kind\|\|'elder'/);
+  assert.match(app, /\/api\/conversations\/\$\{encodeURIComponent\(activeConversation\.conversation_id\)\}\/turns/);
+});
+
+test('a saved elder turn without an assistant reply is resumed automatically', async () => {
+  const h = harness();
+  const pending = {
+    conversation_id: 'conversation_resume_test', version: 2,
+    turns: [
+      { turn_id: 'turn_assistant_open', role: 'assistant', text: '您今天最难受的是什么？', action: 'ask' },
+      { turn_id: 'turn_elder_leg', role: 'elder', text: '测试用：左腿疼得伸不直。', version: 1 },
+    ],
+    report: { report_id: 'report_test', status_label: '自动整理 · 本人未核对', source_turn_ids: ['turn_elder_leg'], body: '老人原话' },
+  };
+  const recovered = {
+    ...pending, version: 3,
+    turns: [...pending.turns, { turn_id: 'turn_assistant_followup', role: 'assistant', text: '这种不舒服大概什么时候开始的，后来有什么变化？', action: 'ask' }],
+  };
+  const calls = [];
+  h.setResponse(async route => {
+    calls.push(route);
+    if (route.startsWith('/api/conversations/current?')) return { r: { ok: true, status: 200 }, j: { conversation: pending, resume_choice_required: false } };
+    if (route.endsWith('/resume-assistant')) return { r: { ok: true, status: 200 }, j: { conversation: recovered, recovered: true, ai_failed: false } };
+    return { r: { ok: true, status: 200 }, j: {} };
+  });
+
+  await h.run('conversationLoading=false;activeConversation=null;loadConversation()');
+
+  assert.ok(calls.some(route => route.endsWith('/resume-assistant')));
+  assert.equal(h.run('activeConversation.turns.at(-1).text'), '这种不舒服大概什么时候开始的，后来有什么变化？');
+  assert.match(h.element('voiceConversationStatus').textContent, /已经接上刚才的话/);
 });
 
 test('event recents and media archive order newest first while retaining superseded filtering', () => {
@@ -163,4 +202,15 @@ test('reselecting the same photo or audio clears the file input value after reta
   audioInput.value = '/tmp/same.wav';
   await audioInput.onchange({ target: audioInput });
   assert.equal(audioInput.value, '');
+});
+
+test('renamed photos retain original bytes but use the detected image type', async () => {
+  const h = harness({ media: true });
+  const bytes = Uint8Array.from([137,80,78,71,13,10,26,10,1,2,3]);
+  h.context.renamedPhoto = new Blob([bytes], { type: 'image/jpeg' });
+  const retained = await h.run('retainSelectedFile(renamedPhoto)');
+  assert.equal(retained.type, 'image/png');
+  assert.deepEqual(new Uint8Array(await retained.arrayBuffer()), bytes);
+  h.run("mediaMessage('照片原件读取失败，请重新选择')");
+  assert.equal(h.element('photoStatus').textContent, '照片原件读取失败，请重新选择');
 });

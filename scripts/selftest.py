@@ -107,6 +107,7 @@ class SelfTest:
                 "This command does not restart the running server or verify physical microphone/camera capture.",
                 "Synthetic records remain in the target database; no existing data is deleted.",
                 "Software checks do not establish clinical safety.",
+                "Image OCR stays pending source comparison; this script never impersonates human source review.",
             ],
         }
         if allow_mock:
@@ -392,9 +393,14 @@ class SelfTest:
         event = self.event_detail(kind + ".event", rid)
         self.check(kind + ".event_provenance", event["raw_text"] == text and
                    event["source_kind"] == ("audio_transcript" if kind == "audio" else "document"))
-        self.organize_review(kind + "_event", event, text)
+        if kind == 'image':
+            denied = self.expect('image.unreviewed_organize_blocked', 'POST', f'/api/events/{rid}/organize', {'expected_version': event['version']}, statuses=(409,))
+            self.check('image.source_review_required', denied.get('error') == 'document_source_review_required')
+        else:
+            self.organize_review(kind + "_event", event, text)
         card = self.handoff(kind + ".handoff")
-        self.check(kind + ".handoff_link", any(item["record_id"] == rid for item in card["items"]) and
+        records = card.get('pending_documents', []) if kind == 'image' else card['items']
+        self.check(kind + ".handoff_link", any(item["record_id"] == rid for item in records) and
                    any(item["media_id"] == mid and item["record_id"] == rid for item in card.get("media_attachments", [])))
         listing = self.expect(kind + ".list", "GET", "/api/media")["media"]
         self.check(kind + ".list_no_duplicate", sum(item["media_id"] == mid for item in listing) == 1)

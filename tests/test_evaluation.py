@@ -320,6 +320,11 @@ def test_real_cli_public_dataset_retains_provenance_and_validated_output(tmp_pat
     evaluate_real = real_cli_setup(monkeypatch)
     dataset_path = Path(__file__).parents[1] / 'data/public_cases/cases.json'
     dataset = json.loads(dataset_path.read_text())
+    # Test-only attestation fixture, not a claim that this test inspected an image.
+    for c in dataset['cases']:
+        c['payload'] = {'source_review': {'method': 'original_comparison', 'text': c['input'], 'confirmed_at': '2026-10-01T00:00:00Z'}}
+    dataset_path = tmp_path / 'reviewed-fixture.json'
+    dataset_path.write_text(json.dumps(dataset, ensure_ascii=False))
     result_path = tmp_path / 'public-report.json'
     assert evaluate_real.main(['--dataset', str(dataset_path), '--out', str(result_path)]) == 0
     report = json.loads(result_path.read_text())

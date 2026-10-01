@@ -1,8 +1,10 @@
 """Offline protocol tests; no key, network call, or real-ASR claim."""
 import json
+import io
 import queue
 import subprocess
 import threading
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -249,8 +251,14 @@ def test_http_recognition_does_not_follow_real_redirect(monkeypatch):
     try:
         configure(monkeypatch, MEDIA_ASR_PROVIDER="openai_compatible", MEDIA_ASR_URL=f"http://127.0.0.1:{server.server_port}/source")
         provider = recognition._OpenAICompatibleProvider(recognition._config_for("audio", None))
+        audio = io.BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x01\x00" * 1600)
         with pytest.raises(recognition.RecognitionError) as exc:
-            provider.recognize(b"bytes", kind="audio", content_type="audio/webm", filename="original")
+            provider.recognize(audio.getvalue(), kind="audio", content_type="audio/wav", filename="original.wav")
         assert exc.value.code == "invalid_provider_response"
         assert hits == ["/source"]
     finally:

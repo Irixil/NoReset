@@ -4,7 +4,7 @@ import unicodedata
 
 RULE_VERSION = 'offline-danger-v2'
 CLINICAL_REVIEW_VERSION = 'offline-review-flags-v1'
-DANGER_REMINDER = '原始记录中出现需要及时人工或急救专业人员判断的描述，请联系当地急救服务或专业人员，不要自行改药。'
+DANGER_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。不要自行加药、减药或停药。'
 
 # These are description rules, not clinically validated triage criteria. Only
 # unambiguous, local negation is excluded; uncertain and historical mentions
@@ -138,3 +138,10 @@ def reconcile_safety(raw_text, saved=None):
                        review_role='emergency_services', danger_reminder=DANGER_REMINDER)
         current['matched_rules'] = list(dict.fromkeys(current['matched_rules'] + list(saved.get('matched_rules') or [])))
     return current
+def document_needs_review(event):
+    """Explicit source comparison is distinct from confirming an AI draft."""
+    review = event.get('source_review') or {}
+    return event.get('source_kind') == 'document' and not (
+        isinstance(review, dict) and review.get('method') == 'original_comparison'
+        and review.get('confirmed_at') and review.get('text') == event.get('raw_text')
+    )

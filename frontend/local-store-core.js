@@ -109,6 +109,12 @@
     async getDoc(key) { return this.docs.has(key) ? structuredClone(this.docs.get(key)) : undefined; }
     async putDoc(value) { this.docs.set(value.key, structuredClone(value)); }
     async deleteDoc(key) { this.docs.delete(key); }
+    async mutateDocs(puts = [], deletes = []) {
+      const next = new Map(this.docs);
+      for (const key of deletes) next.delete(key);
+      for (const value of puts) next.set(value.key, structuredClone(value));
+      this.docs = next;
+    }
     async listDocs(prefix = '') {
       return [...this.docs.values()].filter(item => item.key.startsWith(prefix)).map(item => structuredClone(item));
     }
@@ -148,7 +154,8 @@
         const store = transaction.objectStore(storeName);
         let request;
         try { request = run(store); } catch (error) { reject(error); return; }
-        request.onsuccess = () => resolve(request.result);
+        // A successful request can still be rolled back before transaction commit.
+        transaction.oncomplete = () => resolve(request.result);
         request.onerror = () => reject(request.error || new Error('indexeddb_request_failed'));
         transaction.onabort = () => reject(transaction.error || new Error('indexeddb_transaction_failed'));
       });
@@ -158,6 +165,33 @@
     getDoc(key) { return this.request('docs', 'readonly', store => store.get(key)); }
     putDoc(value) { return this.request('docs', 'readwrite', store => store.put(value)); }
     deleteDoc(key) { return this.request('docs', 'readwrite', store => store.delete(key)); }
+    async mutateDocs(puts = [], deletes = []) {
+      const db = await this.open();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction('docs', 'readwrite');
+        const store = transaction.objectStore('docs');
+        let settled = false;
+        const fail = error => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        };
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        transaction.onerror = () => fail(transaction.error || new Error('indexeddb_transaction_failed'));
+        transaction.onabort = () => fail(transaction.error || new Error('indexeddb_transaction_failed'));
+        try {
+          for (const key of deletes) store.delete(key);
+          for (const value of puts) store.put(value);
+        } catch (error) {
+          try { transaction.abort(); } catch {}
+          fail(error);
+        }
+      });
+    }
     async listDocs(prefix = '') {
       const docs = await this.request('docs', 'readonly', store => store.getAll());
       return docs.filter(item => item.key.startsWith(prefix));
@@ -257,6 +291,33 @@
       return Promise.all(docs.map(document => this.decode(document)));
     }
     async remove(key) { this.requireKey(); await this.driver.deleteDoc(key); }
+    async mutate({ puts = [], deletes = [] } = {}) {
+      const key = this.requireKey();
+      if (typeof this.driver.mutateDocs !== 'function') throw new Error('atomic_storage_unavailable');
+      const documents = await Promise.all(puts.map(async item => {
+        if (item.format === 'binary') {
+          const value = item.value;
+          const isArrayBuffer = value instanceof ArrayBuffer || Object.prototype.toString.call(value) === '[object ArrayBuffer]';
+          const bytes = isArrayBuffer ? Uint8Array.from(new Uint8Array(value)).buffer : ArrayBuffer.isView(value)
+            ? Uint8Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)).buffer : await value.arrayBuffer();
+          const metadata = item.metadata || {};
+          return {
+            key: item.key,
+            format: 'binary',
+            encrypted: await encryptBytes(key, bytes, `bingli:binary:${item.key}`),
+            meta: await encryptBytes(key, encoder.encode(JSON.stringify(metadata)), `bingli:binary-meta:${item.key}`),
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return {
+          key: item.key,
+          format: 'json',
+          encrypted: await encryptBytes(key, encoder.encode(JSON.stringify(item.value)), `bingli:doc:${item.key}`),
+          updatedAt: new Date().toISOString(),
+        };
+      }));
+      await this.driver.mutateDocs(documents, deletes);
+    }
     async exportArchive() {
       this.requireKey();
       const snapshot = this.driver.snapshot ? await this.driver.snapshot() : { vault: await this.driver.getMeta('vault'), docs: await this.driver.listDocs() };
@@ -275,12 +336,15 @@
       const vaultConfig = deserialise(archive.vault);
       const docs = deserialise(archive.docs);
       if (!vaultConfig || vaultConfig.version !== VAULT_VERSION || !Array.isArray(docs)) throw new Error('invalid_backup');
+      if (docs.some(doc => !doc || typeof doc.key !== 'string' || !doc.key)
+        || new Set(docs.map(doc => doc.key)).size !== docs.length) throw new Error('invalid_backup');
       const candidate = new EncryptedVault(new MemoryDocumentStore());
       await candidate.driver.replace([['vault', vaultConfig]], docs);
       await candidate.unlock(passphrase);
-      const events = await candidate.list('event:');
-      const media = await candidate.list('media:');
-      return { candidate, eventCount: events.length, mediaCount: media.length, exportedAt: archive.exportedAt };
+      // Validate every encrypted document before restore replaces the current vault.
+      for (const document of docs) await candidate.decode(document);
+      return { candidate, eventCount: docs.filter(doc => doc.key.startsWith('event:')).length,
+        mediaCount: docs.filter(doc => doc.key.startsWith('media:')).length, exportedAt: archive.exportedAt };
     }
     async restoreArchive(archive, passphrase) {
       const preview = await this.previewArchive(archive, passphrase);

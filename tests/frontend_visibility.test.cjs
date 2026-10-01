@@ -21,7 +21,6 @@ test('hidden utility always removes an element from layout', () => {
 
 test('conditional controls and panels are hidden in the initial markup', () => {
   const initiallyHiddenIds = [
-    'silenceNotice',
     'photoPreview',
     'savePhotoBtn',
     'retryVoiceUploadBtn',

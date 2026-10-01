@@ -163,7 +163,11 @@ export type Event = {
   household_id: string;
   local_safety: LocalSafety;
   confirmation_scope: "record_accuracy" | null;
+  /** Human source comparison of this exact version; never supplied by OCR. */
+  source_review?: { method: "original_comparison"; text: string; confirmed_at: string } | null;
 };
+
+export type SourceReviewRequest = { expected_version: number; compared_with_original: true };
 
 export type SaveEventRequest = {
   raw_text: string;
@@ -234,6 +238,25 @@ export type AppConfigResponse = {
   product_name: "病历不归零·内测版";
   data_location: "this_device";
   backup_mode: "encrypted_archive";
+  provider: string;
+  capabilities: {
+    text_ai: ConfiguredCapability;
+    audio_recognition: ConfiguredCapability;
+    image_recognition: ConfiguredCapability;
+  };
+};
+
+// Mock is unavailable. True is configuration readiness only, not connectivity or quality.
+export type ConfiguredCapability = { available: boolean; reason: string };
+
+export type ConversationAction = "ask" | "reply" | "finish" | "urgent";
+
+export type ConversationModelTurn = {
+  turn_id: string;
+  text: string;
+  version?: number;
+  // Previous assistant question or response; context only, never patient evidence.
+  responding_to?: { turn_id: string; text: string };
 };
 
 export type AppSessionResponse =
@@ -273,9 +296,10 @@ export type StatelessOrganizeRequest = {
   record_id: string;
   raw_text: string;
   source_kind: SourceKind;
+  source_review?: Event["source_review"];
   recorded_at: string;
   occurred_time?: string | null;
-  history?: Array<Pick<Event, "record_id" | "raw_text" | "source_kind" | "recorded_at" | "occurred_time">>;
+  history?: Array<Pick<Event, "record_id" | "raw_text" | "source_kind" | "source_review" | "recorded_at" | "occurred_time">>;
   consent: true;
 };
 
@@ -443,6 +467,7 @@ export type HandoffItem = Event & {
 };
 
 export type Handoff = {
+  pending_documents?: Array<{ record_id: string; recorded_at: string; reason: "document_source_review_required" }>;
   handoff_id: string;
   created_at: string;
   household_id: string | null;
@@ -507,6 +532,7 @@ export const MEDIA_RECOGNITION_ERROR_CODES = [
   "provider_auth_failed",
   "provider_rate_limited",
   "invalid_provider_response",
+  "incomplete_provider_response",
 ] as const;
 
 export type MediaRecognitionErrorCode =
@@ -742,6 +768,11 @@ export const MEDIA_HTTP_ERROR_CODES = [
   "provider_rate_limited",
   "invalid_provider_response",
   "no_text_detected",
+  "incomplete_provider_response",
+  "document_source_review_required",
+  "source_review_confirmation_required",
+  "source_review_not_available",
+  "conversation_source_invalid",
   "household_access_denied",
   "cross_household_reference_denied",
   "related_record_not_found",

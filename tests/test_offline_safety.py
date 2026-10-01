@@ -8,7 +8,7 @@ import pytest
 
 from backend import adapter
 from backend.safety import CLINICAL_REVIEW_VERSION, DANGER_REMINDER, RULE_VERSION, scan_danger
-from backend.store import SQLiteStore
+from backend.store import SQLiteStore, now
 
 
 @pytest.fixture
@@ -320,6 +320,66 @@ def test_revision_keeps_owner_and_rescans_raw_text(tmp_path):
     assert not new['local_safety']['danger_detected']
     assert store.get(event['record_id'])['local_safety']['danger_detected']
     assert [x['record_id'] for x in store.handoff(household['household_id'])['items']] == [new['record_id']]
+
+
+def test_historical_handoff_quarantines_document_revision_mislabeled_as_elder(tmp_path):
+    store = SQLiteStore(tmp_path / 'legacy-handoff.sqlite3')
+    household = store.create_household('虚构家庭', '虚构家属')
+    document, _ = store.create(
+        {'raw_text': '虚构原件内容', 'source_kind': 'document', 'actor_name': '虚构家属'},
+        'document-source', household_id=household['household_id'],
+    )
+    revised = store.revise(
+        document['record_id'], 1,
+        {'raw_text': '虚构 OCR 修订内容', 'source_kind': 'elder', 'actor_name': '虚构家属', 'reason': '历史修订'},
+        '虚构家属',
+    )
+    # Simulate an older database revision that persisted the inherited source
+    # incorrectly. _get must recover its source from the immutable ancestor.
+    with store.transaction() as conn:
+        conn.execute('DROP TRIGGER preserve_event_evidence')
+        conn.execute("UPDATE events SET source_kind='elder' WHERE record_id=?", (revised['record_id'],))
+    assert store.get(revised['record_id'])['source_kind'] == 'document'
+
+    created_at = now()
+    snapshot_item = {**revised, 'source_kind': 'elder', 'source_review': None}
+    handoff_id = 'handoff_legacy_document_revision'
+    snapshot = {
+        'handoff_id': handoff_id,
+        'created_at': created_at,
+        'household_id': household['household_id'],
+        'items': [snapshot_item],
+        'pending_documents': [],
+        'unresolved_count': 0,
+    }
+    with store.transaction() as conn:
+        conn.execute(
+            'INSERT INTO handoffs(handoff_id,created_at,snapshot_json,household_id) VALUES(?,?,?,?)',
+            (handoff_id, created_at, json.dumps(snapshot, ensure_ascii=False), household['household_id']),
+        )
+
+    # Later verification must not rewrite the historical handoff's point-in-time review state.
+    current = store.source_review(revised['record_id'], revised['version'], True, '虚构家属')
+    assert current['source_review']['confirmed_at']
+    historical = store.get_handoff(handoff_id)
+    assert historical['items'] == []
+    assert historical['created_at'] == created_at
+    assert historical['pending_documents'] == [{
+        'record_id': revised['record_id'],
+        'recorded_at': snapshot_item['recorded_at'],
+        'reason': 'document_source_review_required',
+    }]
+    assert snapshot_item['raw_text'] not in json.dumps(historical, ensure_ascii=False)
+
+    with store.connection() as conn:
+        persisted = json.loads(conn.execute(
+            'SELECT snapshot_json FROM handoffs WHERE handoff_id=?', (handoff_id,),
+        ).fetchone()['snapshot_json'])
+    assert persisted['created_at'] == created_at
+    assert persisted['items'][0]['raw_text'] == snapshot_item['raw_text']
+    assert persisted['items'][0]['recorded_at'] == snapshot_item['recorded_at']
+    assert persisted['items'][0]['source_kind'] == 'elder'
+    assert persisted['items'][0]['source_review'] is None
 
 
 @pytest.mark.parametrize('violation', ['schema', 'source_id', 'quote', 'occurred_time', 'recorded_time', 'medical_advice'])

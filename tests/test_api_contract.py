@@ -686,7 +686,7 @@ def test_record_can_be_organized_reviewed_revised_and_handed_off(api):
         "created_at",
         "household_id",
         "items",
-        "unresolved_count",
+        "unresolved_count", "pending_documents",
     } == handoff.keys()
     snapshot = next(item for item in handoff["items"] if item["record_id"] == record_id)
     assert snapshot["raw_text"] == original["raw_text"]

@@ -1,5 +1,7 @@
 # 拿到 Demo 后如何在线自测
 
+2026-10-01 更新：图片现在必须在详情中“对照照片原件”，修订错误、将看不清处标为 `[无法辨认]`，勾选后“保存原件核对结果”，才能执行整理与确认。HTTP 自测只验证未核对图片被拦截并作为待核对附件保留，不冒充人工完成原件核对；`passed/online_passed` 也不表示整页 OCR 准确或图片人工验收完成。通用文档评测若缺少显式来源核对数据会被拒绝，不自动给公开病例补核对声明。以下旧 Demo 命令适用服务端兼容模式；当前内测入口应按 README 使用 `scripts.start_app` 的本机加密模式。
+
 当前后端媒体候选在 `codex/backend-integration-2026-09-14`；main 合并前，请克隆该分支。此指南的命令会访问你配置的真实供应商，产生请求用量。测试数据明确为合成资料，测试记录会留在本地数据库中。
 
 ## 1. 安装并填配置
@@ -22,7 +24,7 @@ Windows PowerShell 用 `py -3.12 -m venv .venv` 和 `.venv\Scripts\Activate.ps1`
 | 能力 | 需要填写 |
 |---|---|
 | 文字整理 | `MODELSCOPE_ACCESS_TOKEN`；确认 `MODELSCOPE_MODEL` 是该账号可用的模型 ID |
-| 语音转写和照片识字 | `MEDIA_RECOGNITION_PROVIDER=aihubmix`、`AIHUBMIX_API_KEY`；默认分别使用 `gemini-2.5-flash-lite` 和 `qwen3.7-flash` |
+| 语音转写和照片识字 | `MEDIA_RECOGNITION_PROVIDER=aihubmix`、`AIHUBMIX_API_KEY`；默认分别使用 `gemini-2.5-flash-lite` 和 `qwen3.7-plus` |
 
 AIHubMix ASR 使用 Gemini 原生 `generateContent` 接口的内联音频；支持浏览器录制的 WebM 和项目合成 WAV，单文件上限 20MB。原件不会被覆盖，仅把机器转写作为待核对初稿，再执行危险扫描和记录关联。此版本是结束录音后转写，没有实现边说边显示字幕，也没有改 P2 VAD。原 DashScope WebSocket 与通用 OpenAI-compatible 配置仍保留为备选，详见 [模型接入说明](MODEL-CONNECTION.md)。
 

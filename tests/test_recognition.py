@@ -1,3 +1,5 @@
+import io
+import wave
 import json
 import urllib.error
 from pathlib import Path
@@ -14,8 +16,33 @@ def write_media(tmp_path: Path, name: str, content: bytes) -> Path:
     return path
 
 
+def pcm_wave(samples=b"\x01\x00" * 160, width=2):
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(width)
+        audio.setframerate(16000)
+        audio.writeframes(samples)
+    return stream.getvalue()
+
+
+@pytest.mark.parametrize("samples,width,code", [
+    (b"", 2, "invalid_media"),
+    (b"\x00\x00" * 160, 2, "no_text_detected"),
+    (b"\x80" * 160, 1, "no_text_detected"),
+])
+def test_empty_or_silent_wave_never_reaches_real_asr(tmp_path, monkeypatch, samples, width, code):
+    monkeypatch.setenv("AIHUBMIX_API_KEY", "synthetic-test-key")
+    monkeypatch.setattr(recognition, "_open_request", lambda *a, **kw: pytest.fail("silent audio must not reach provider"))
+    path = write_media(tmp_path, "silent.wav", pcm_wave(samples, width))
+    with pytest.raises(RecognitionError) as error:
+        recognize_file(path, kind="audio", content_type="audio/wav", attempt_id="empty-audio", provider="aihubmix")
+    assert error.value.code == code
+    assert path.read_bytes() == pcm_wave(samples, width)
+
+
 def test_explicit_mock_returns_transcript_without_changing_original(tmp_path):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     before = path.read_bytes()
     result = recognize_file(
         path,
@@ -36,7 +63,7 @@ def test_explicit_mock_returns_transcript_without_changing_original(tmp_path):
 
 
 def test_unconfigured_real_provider_does_not_silently_use_mock(tmp_path):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
 
     with pytest.raises(RecognitionError) as exc_info:
         recognize_file(
@@ -76,7 +103,7 @@ def test_aihubmix_uses_one_key_and_safe_media_defaults(monkeypatch):
     assert (image.name, image.url, image.model, image.api_key) == (
         "aihubmix",
         "https://aihubmix.com/v1/chat/completions",
-        "qwen3.7-flash",
+        "qwen3.7-plus",
         "shared-hubmix-secret",
     )
 
@@ -233,14 +260,17 @@ def test_aihubmix_image_request_uses_high_detail_and_shared_key(tmp_path, monkey
     image_part = body["messages"][0]["content"][1]["image_url"]
     assert request.full_url == "https://aihubmix.com/v1/chat/completions"
     assert request.get_header("Authorization") == "Bearer shared-hubmix-secret"
-    assert body["model"] == "qwen3.7-flash"
+    assert body["model"] == "qwen3.7-plus"
+    assert body["thinking_budget"] == 1024
+    assert body["enable_thinking"] is True
+    assert "每行保留" in body["messages"][0]["content"][0]["text"]
     assert image_part["detail"] == "high"
     assert image_part["url"].startswith("data:image/png;base64,")
     assert result["provider"] == "aihubmix"
 
 
 def test_aihubmix_audio_request_uses_low_cost_gemini_inline_audio(tmp_path, monkeypatch):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     monkeypatch.setenv("AIHUBMIX_API_KEY", "shared-hubmix-secret")
     captured = {}
 
@@ -281,7 +311,7 @@ def test_aihubmix_audio_request_uses_low_cost_gemini_inline_audio(tmp_path, monk
 
 
 def test_aihubmix_rejects_audio_over_provider_limit_before_request(tmp_path, monkeypatch):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     monkeypatch.setenv("AIHUBMIX_API_KEY", "shared-hubmix-secret")
     monkeypatch.setattr(recognition, "_AIHUBMIX_AUDIO_MAX_BYTES", 1)
     monkeypatch.setattr(
@@ -339,7 +369,7 @@ def test_empty_provider_text_is_a_non_retryable_recognition_failure(tmp_path, mo
     ],
 )
 def test_provider_failures_have_stable_safe_categories(tmp_path, monkeypatch, error, code, retryable):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     monkeypatch.setenv("MEDIA_ASR_URL", "https://recognizer.invalid/asr")
     monkeypatch.setenv("MEDIA_ASR_MODEL", "asr-test")
     monkeypatch.setenv("MEDIA_ASR_API_KEY", "secret")
@@ -364,7 +394,7 @@ def test_provider_failures_have_stable_safe_categories(tmp_path, monkeypatch, er
 
 
 def test_invalid_provider_response_is_not_exposed_or_treated_as_empty_success(tmp_path, monkeypatch):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     monkeypatch.setenv("MEDIA_ASR_URL", "https://recognizer.invalid/asr")
     monkeypatch.setenv("MEDIA_ASR_MODEL", "asr-test")
     monkeypatch.setenv("MEDIA_ASR_API_KEY", "secret")
@@ -389,7 +419,7 @@ def test_invalid_provider_response_is_not_exposed_or_treated_as_empty_success(tm
 
 
 def test_provider_response_is_bounded(tmp_path, monkeypatch):
-    path = write_media(tmp_path, "voice.wav", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, "voice.wav", pcm_wave())
     monkeypatch.setenv("MEDIA_ASR_URL", "https://recognizer.invalid/asr")
     monkeypatch.setenv("MEDIA_ASR_MODEL", "asr-test")
     monkeypatch.setenv("MEDIA_ASR_API_KEY", "secret")
@@ -412,7 +442,7 @@ def test_provider_response_is_bounded(tmp_path, monkeypatch):
 
 
 def test_real_audio_request_contains_only_a_safe_basename(tmp_path, monkeypatch):
-    path = write_media(tmp_path, '语音\r\n".wav', b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 24)
+    path = write_media(tmp_path, '语音\r\n".wav', pcm_wave())
     monkeypatch.setenv("MEDIA_ASR_URL", "https://recognizer.invalid/asr")
     monkeypatch.setenv("MEDIA_ASR_MODEL", "asr-test")
     monkeypatch.setenv("MEDIA_ASR_API_KEY", "secret")
@@ -431,7 +461,8 @@ def test_real_audio_request_contains_only_a_safe_basename(tmp_path, monkeypatch)
         provider="openai_compatible",
     )
 
-    body = captured["body"].decode("utf-8", errors="strict")
+    body = captured["body"].split(b"filename=", 1)[1].split(b"\r\n", 1)[0].decode("utf-8", errors="strict")
+    body = "filename=" + body
     assert 'filename="' in body
     filename = body.split('filename="', 1)[1].split('"', 1)[0]
     assert filename.endswith(".wav")
@@ -439,3 +470,52 @@ def test_real_audio_request_contains_only_a_safe_basename(tmp_path, monkeypatch)
     assert "\n" not in filename
     assert '"' not in filename
     assert str(tmp_path) not in body
+
+
+@pytest.mark.parametrize("audible", [False, True])
+def test_native_webm_is_decoded_before_asr(tmp_path, monkeypatch, audible):
+    import math
+    import struct
+    import subprocess
+    samples = b"".join(struct.pack("<h", int(5000 * math.sin(i * math.tau * 440 / 16000)) if audible else 0) for i in range(3200))
+    source = write_media(tmp_path, "input.wav", pcm_wave(samples))
+    encoded = tmp_path / "input.webm"
+    subprocess.run([recognition.ffmpeg_executable(), "-v", "error", "-i", str(source), "-c:a", "libopus", str(encoded)], check=True)
+    monkeypatch.setenv("AIHUBMIX_API_KEY", "synthetic-test-key")
+    calls = []
+    def opener(request, timeout):
+        calls.append(request)
+        return FakeResponse(b'{"candidates":[{"content":{"parts":[{"text":"test"}]}}]}')
+    monkeypatch.setattr(recognition, "_open_request", opener)
+    if audible:
+        assert recognize_file(encoded, kind="audio", content_type="audio/webm", attempt_id="webm-signal", provider="aihubmix")["text"] == "test"
+        assert len(calls) == 1
+    else:
+        with pytest.raises(RecognitionError, match="没有识别到可用文字"):
+            recognize_file(encoded, kind="audio", content_type="audio/webm", attempt_id="webm-silence", provider="aihubmix")
+        assert calls == []
+
+
+def test_empty_webm_container_never_reaches_real_asr(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIHUBMIX_API_KEY", "synthetic-test-key")
+    monkeypatch.setattr(recognition, "_open_request", lambda *a, **kw: pytest.fail("empty container reached ASR"))
+    path = write_media(tmp_path, "empty.webm", b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    with pytest.raises(RecognitionError) as error:
+        recognize_file(path, kind="audio", content_type="audio/webm", attempt_id="webm-empty", provider="aihubmix")
+    assert error.value.code == "invalid_media"
+@pytest.mark.parametrize('payload', [
+    {'choices': [{'message': {'content': 'MCV 9'}, 'finish_reason': 'length'}]},
+    {'candidates': [{'content': {'parts': [{'text': 'MCV 9'}]}, 'finishReason': 'MAX_TOKENS'}]},
+])
+def test_truncated_recognition_never_becomes_a_successful_medical_document(payload):
+    from backend.recognition import _text_from_response
+    with pytest.raises(RecognitionError) as error:
+        _text_from_response(payload)
+    assert error.value.code == 'incomplete_provider_response'
+    assert error.value.retryable is True
+
+
+def test_ocr_markup_preserves_unknown_labels_comparators_table_rows_and_exponents():
+    from backend.recognition import _clean_ocr_markup
+    assert _clean_ocr_markup('结果 <NEG>\n参考 <2.0E+01IU/ml\n另一项 >10') == '结果 <NEG>\n参考 <2.0E+01IU/ml\n另一项 >10'
+    assert _clean_ocr_markup('<table><tr><td>RBC</td><td>4.53</td><td>10<sup>12</sup>/L</td></tr><tr><td>结果</td><td>&lt;2.0E+01</td><td>&lt;NEG&gt;</td></tr></table>') == 'RBC\t4.53\t10^12/L\n结果\t<2.0E+01\t<NEG>'

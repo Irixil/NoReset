@@ -7,10 +7,10 @@
   <meta name="color-scheme" content="light">
   <meta name="description" content="加密保存在当前设备的健康记录与就诊交接工具。">
   <title>病历不归零·内测版｜陪你记下来</title>
-  <link rel="manifest" href="manifest.webmanifest?v=20260917-full-2">
-  <link rel="stylesheet" href="styles.css?v=20260917-full-2">
-  <link rel="stylesheet" href="ios.css?v=20260917-full-2">
-  <link rel="stylesheet" href="splash.css?v=20260917-full-2">
+  <link rel="manifest" href="manifest.webmanifest?v=20261001-predeploy-3">
+  <link rel="stylesheet" href="styles.css?v=20261001-predeploy-3">
+  <link rel="stylesheet" href="ios.css?v=20261001-predeploy-3">
+  <link rel="stylesheet" href="splash.css?v=20261001-predeploy-3">
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true">
@@ -24,10 +24,11 @@
     <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 2 1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2Z"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></symbol>
   </svg>
 
   <div id="splashScreen" class="splash-screen" role="dialog" aria-label="病历不归零启动页" aria-modal="true">
-    <div class="splash-mark" aria-hidden="true"><img src="assets/brand-mascot.png" alt=""></div>
+    <div class="splash-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=20261001-predeploy-3" alt=""></div>
     <div class="splash-copy"><p>病历不归零</p><h1>每一次不舒服，<br>都值得被好好记住。</h1></div>
     <button id="splashSkip" class="splash-skip" type="button">现在开始</button>
   </div>
@@ -35,7 +36,7 @@
 
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand" aria-label="病历不归零·内测版"><div class="brand-mark" aria-hidden="true"><img src="assets/brand-mascot.png" alt=""></div><div><strong>病历不归零·内测版</strong><span>陪你把每次不舒服记下来</span></div></div>
+      <div class="brand" aria-label="病历不归零·内测版"><div class="brand-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=20261001-predeploy-3" alt=""></div><div><strong>病历不归零·内测版</strong><span>陪你把每次不舒服记下来</span></div></div>
       <div class="topbar-actions"><div id="modePill" class="device-pill" role="status" aria-live="polite">等待解锁</div><button class="settings-button" type="button" data-view="settingsView" aria-label="打开设置"><svg aria-hidden="true"><use href="#i-settings"/></svg></button></div>
     </header>
 
@@ -60,37 +61,64 @@
       <section id="voiceView" class="view subview voice-conversation-view" aria-labelledby="voiceTitle" aria-hidden="true">
         <header class="conversation-top">
           <button class="back-btn" type="button" data-view="homeView" aria-label="返回首页"><svg aria-hidden="true"><use href="#i-back"/></svg><span>返回</span></button>
-          <div><h1 id="voiceTitle" tabindex="-1">语音记录</h1><p id="voiceConnectionLabel">原话和原录音都会保留</p></div>
+          <div><h1 id="voiceTitle" tabindex="-1">和小零聊聊</h1><p id="voiceConnectionLabel">退出也会自动留下报告</p></div>
+          <button id="openConversationReportBtn" class="conversation-report-button" type="button" disabled>报告</button>
         </header>
         <div class="conversation-shell">
+          <div class="conversation-tools">
+            <p id="voiceOnlineStatus" role="status" aria-live="polite">正在检查联网整理状态；原话会先保存在本机。</p>
+            <button id="openHealthContextPickerBtn" class="context-select-button" type="button" disabled>带上相关资料（可选）</button>
+            <button id="startSeparateConversationBtn" class="context-select-button" type="button">另记一件事</button>
+          </div>
           <div id="voiceConversation" class="conversation-stream" aria-live="polite">
-            <article class="chat-turn assistant-turn">
-              <img class="chat-avatar" src="assets/brand-mascot.png" alt="" aria-hidden="true">
-              <div class="chat-bubble assistant-bubble"><p>想到哪里就说到哪里。不方便录音时，也可以单独用文字记录；会保存为一条新的记录，原话会保留。</p><small>操作提示，不是实时问诊</small></div>
-            </article>
             <div id="voiceConversationTurns"></div>
           </div>
 
-          <section id="recorderTray" class="recorder-tray" aria-label="录音控制">
-            <div id="voiceHint" class="voice-hint" role="status" aria-live="polite">点右下角麦克风开始说<br><small>手机询问麦克风权限时，请选择允许</small></div>
+          <section id="conversationResumeChoice" class="conversation-choice hidden" aria-labelledby="resumeChoiceTitle">
+            <img src="assets/brand-mascot.png?v=20261001-predeploy-3" alt="" aria-hidden="true">
+            <h2 id="resumeChoiceTitle">上次的话还要接着说吗？</h2>
+            <p>继续会补到原来的报告里；新记录会单独保存。</p>
+            <button id="continueConversationBtn" class="primary" type="button">接着上次说</button>
+            <button id="newConversationBtn" class="outline" type="button">记录新的情况</button>
+          </section>
+
+          <section id="recorderTray" class="recorder-tray hidden" aria-label="录音控制">
+            <div id="voiceHint" class="voice-hint" role="status" aria-live="polite">按一下开始录音，说完按“结束这句话”</div>
             <div class="recording-meter">
               <div id="voiceTimer" class="timer" aria-label="录音时长">00:00</div>
               <div id="wave" class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
             </div>
-            <button id="finishVoiceBtn" class="finish-btn" type="button" disabled>说完了，保存原录音</button>
-            <div id="silenceNotice" class="silence-notice hidden" role="status"><b>录音已手动暂停</b><span>现在不会继续计时；原录音片段还保留在本页。</span><div><button id="resumeBtn" class="mini-primary" type="button">继续说</button><button id="pauseBtn" class="mini-quiet" type="button">保持暂停</button></div></div>
+            <button id="finishVoiceBtn" class="finish-btn" type="button" disabled>结束这句话</button>
             <button id="retryVoiceUploadBtn" class="outline retry-voice hidden" type="button">重试保存这段录音</button>
           </section>
 
-          <div id="voiceConversationStatus" class="conversation-status" role="status" aria-live="polite">可以先录音，也可以直接用文字记录。</div>
+          <div id="voiceConversationStatus" class="conversation-status" role="status" aria-live="polite">原话会先保存在本机，再由小零回复。</div>
           <div class="conversation-composer">
-            <label class="sr-only" for="voiceTextInput">直接记录或补充这次语音</label>
-            <textarea id="voiceTextInput" rows="1" placeholder="直接记录，或补充这次语音"></textarea>
-            <button id="voiceTextSend" class="composer-send" type="button" disabled>保存</button>
-            <button id="recordBtn" class="record-btn chat-mic" type="button" aria-label="开始语音记录"><svg aria-hidden="true"><use href="#i-mic"/></svg><span class="sr-only">开始说</span></button>
+            <label class="sr-only" for="voiceTextInput">想对小零说的话</label>
+            <textarea id="voiceTextInput" rows="1" placeholder="打字说，或者点麦克风"></textarea>
+            <button id="voiceTextSend" class="composer-send" type="button" disabled>发送</button>
+            <button id="recordBtn" class="record-btn chat-mic" type="button" aria-label="开始语音聊天"><svg aria-hidden="true"><use href="#i-mic"/></svg><span class="sr-only">开始说</span></button>
           </div>
-          <p class="privacy-note">只有显示“原件已保存”，才代表录音保存完成。整理结果不是诊断，也不会建议增减药物。</p>
+            <p class="privacy-note">我会根据您说的情况回应，帮您记清楚；不能诊断或提供用药、检查建议。</p>
         </div>
+
+        <section id="healthContextPickerPanel" class="conversation-report-panel hidden" role="dialog" aria-modal="true" aria-labelledby="healthContextPickerTitle" aria-describedby="healthContextPickerDescription">
+          <div class="conversation-report-card health-context-picker">
+            <div class="section-head report-header"><div><h2 id="healthContextPickerTitle">这次要带上哪些资料？</h2><p>可以一项也不选。</p></div><button id="closeHealthContextPickerBtn" class="view-btn" type="button">关闭</button></div>
+            <p id="healthContextPickerDescription" class="context-picker-explanation">勾选的内容会在这段对话后续每次发言时发送给联网 AI；不会另附未勾选的背景，本段问答仍用于回复。选择只保存在本机，最多 5 项。</p>
+            <p id="contextSelectionStatus" class="status" role="status" aria-live="polite">正在读取本机健康背景…</p>
+            <div id="healthContextPickerList" class="health-context-picker-list"></div>
+            <div class="context-picker-actions"><button id="saveHealthContextSelectionBtn" class="primary" type="button">保存这次选择</button><button id="cancelHealthContextSelectionBtn" class="outline" type="button">不带资料继续</button></div>
+          </div>
+        </section>
+
+        <section id="conversationReportPanel" class="conversation-report-panel hidden" role="dialog" aria-modal="true" aria-labelledby="conversationReportTitle">
+          <div class="conversation-report-card">
+            <div class="section-head report-header"><div><span id="conversationReportStatus" class="badge warn">自动整理 · 本人未核对</span><h2 id="conversationReportTitle">就诊沟通记录</h2><p>给接诊医生快速了解情况</p></div><button id="closeConversationReportBtn" class="view-btn" type="button">关闭</button></div>
+            <p class="report-disclaimer"><strong>记录边界</strong><span>用于和医生沟通，不是诊断，也不包含用药、治疗或具体检查建议。</span></p>
+            <div id="conversationReportBody" class="conversation-report-body"><p class="muted">说完第一句话后，这里会自动生成报告。</p></div>
+          </div>
+        </section>
       </section>
 
       <section id="photoCaptureView" class="view subview" aria-labelledby="photoTitle" aria-hidden="true">
@@ -98,22 +126,25 @@
         <div class="sub-hero"><div class="photo-orb" aria-hidden="true"><svg><use href="#i-camera"/></svg></div><h1 id="photoTitle" tabindex="-1">拍下来，就不会忘</h1><p>药盒、报告、检查单，都可以先保存原图。</p></div>
         <div class="photo-panel">
           <p id="photoCapabilityStatus" class="status" role="status" aria-live="polite"></p>
+          <p id="photoStatus" class="status" role="status" aria-live="polite"></p>
+          <p id="photoRecognitionStatus" class="status" role="status" aria-live="polite">正在检查照片识别状态；原件仍可保存在本机。</p>
           <button id="photoUploadLabel" class="upload-drop" type="button" aria-controls="photoInput"><svg aria-hidden="true"><use href="#i-camera"/></svg><b>拍一张照片</b><span>也可以从手机相册里选择</span></button>
           <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
           <div id="photoPreview" class="photo-preview hidden"></div>
-          <button id="savePhotoBtn" class="primary hidden" type="button">保存并识别</button>
-          <p class="privacy-note">原图会先加密保存在这台设备，然后自动发给 AIHubMix 及其上游模型识别。复杂图片仍以原图为准。</p>
+          <button id="savePhotoBtn" class="primary hidden" type="button">保存照片原件并尝试识别</button>
+          <p class="privacy-note">照片原件会先加密保存在这台设备；点击保存后会尝试联网识别。识别失败也不会删除原件，复杂图片仍以原图为准。</p>
         </div>
       </section>
 
       <section id="archiveView" class="view subview" aria-labelledby="archiveTitle" aria-hidden="true">
         <button class="back-btn" type="button" data-view="homeView"><svg aria-hidden="true"><use href="#i-back"/></svg> 返回首页</button>
-        <div class="records-head"><h1 id="archiveTitle" tabindex="-1">原话和原件都在</h1><span class="archive-avatar" aria-hidden="true">我</span></div>
-        <div class="archive-card"><div class="archive-card-head"><div><b>这台设备里的健康资料</b><span>症状原话、录音和照片放在一起</span></div><span class="archive-dot" aria-hidden="true"></span></div><div class="archive-stats"><div><b id="archiveEventCount">0</b><span>条记录</span></div><div><b id="archivePhotoCount">0</b><span>张资料照片</span></div></div></div>
-        <section class="archive-section" aria-labelledby="archiveEventTitle"><div class="section-title"><h2 id="archiveEventTitle">症状原话</h2><button type="button" data-view="recordsView" class="link-btn">查看详情 <svg aria-hidden="true"><use href="#i-arrow"/></svg></button></div><div id="archiveEvents" class="recent-list"><p class="muted">正在读取记录…</p></div></section>
+        <div class="records-head"><h1 id="archiveTitle" tabindex="-1">完整对话和原件都在</h1><span class="archive-avatar" aria-hidden="true">我</span></div>
+        <div class="archive-card"><div class="archive-card-head"><div><b>这台设备里的健康资料</b><span>完整对话、单独记录、录音和照片放在一起</span></div><span class="archive-dot" aria-hidden="true"></span></div><div class="archive-stats"><div><b id="archiveEventCount">0</b><span>份健康记录</span></div><div><b id="archivePhotoCount">0</b><span>张资料照片</span></div></div></div>
+        <section class="archive-section" aria-labelledby="archiveEventTitle"><div class="section-title"><h2 id="archiveEventTitle">健康记录</h2><button type="button" data-view="recordsView" class="link-btn">查看全部 <svg aria-hidden="true"><use href="#i-arrow"/></svg></button></div><div id="archiveEvents" class="recent-list"><p class="muted">正在读取记录…</p></div></section>
         <section class="archive-section" aria-labelledby="archiveMediaTitle">
           <div class="section-title"><h2 id="archiveMediaTitle">录音和照片原件</h2><button type="button" data-view="photoCaptureView" data-media-entry class="link-btn">添加照片 <svg aria-hidden="true"><use href="#i-arrow"/></svg></button></div>
           <p id="mediaCapabilityStatus" class="status align-left" role="status" aria-live="polite"></p>
+          <p id="mediaRecognitionStatus" class="status align-left" role="status" aria-live="polite"></p>
           <div class="archive-tools"><button id="audioUploadLabel" class="outline upload-button" type="button" aria-controls="audioUploadInput">上传已有录音</button><input id="audioUploadInput" type="file" accept="audio/*" hidden><button id="refreshMediaBtn" class="outline" type="button">刷新原件</button></div>
           <div id="mediaStatus" class="status align-left" role="status" aria-live="polite"></div>
           <div id="archivePhotos" class="archive-media"><p class="muted">还没有上传原件</p></div>
@@ -124,18 +155,38 @@
         <button class="back-btn" type="button" data-view="homeView"><svg aria-hidden="true"><use href="#i-back"/></svg> 返回首页</button>
         <div class="records-head"><h1 id="recordsTitle" tabindex="-1">每一次，都有留下</h1><button id="refreshBtn" class="refresh-btn" type="button">刷新</button></div>
         <aside class="verification-note"><b>核对记录，不等于诊断</b><span>“我核对过了”只确认文字准确，不代表医学风险已处理。</span></aside>
-        <div class="filter-panel" aria-label="记录筛选"><label>关键词<input id="filterKeyword" type="search" placeholder="搜原话或整理摘要"></label><label>记录类型<select id="filterKind"><option value="">全部</option><option value="symptom">症状</option><option value="measurement">指标</option><option value="medication">用药</option><option value="instruction">医嘱</option><option value="document">资料</option><option value="other">其他</option></select></label><label>处理状态<select id="filterState"><option value="">全部</option><option value="inbox">待整理</option><option value="draft">待核对</option><option value="recorded">已核对记录</option><option value="needs_review">需重新整理</option></select></label><label>开始日期<input id="filterStart" type="date"></label><label>结束日期<input id="filterEnd" type="date"></label><button id="clearFilters" class="outline" type="button">清除筛选</button></div>
-        <div id="dangerBanner" class="danger hidden" role="alert"></div>
-        <div id="eventsList" class="events"><p class="muted">正在读取记录…</p></div>
+        <form id="recordFilters" class="filter-panel" aria-label="搜索和筛选记录"><label>关键词<input id="filterKeyword" type="search" placeholder="搜完整对话或情况简介"></label><label>记录类型<select id="filterKind"><option value="">全部</option><option value="conversation">完整对话</option><option value="symptom">单独症状记录</option><option value="measurement">指标</option><option value="medication">用药</option><option value="instruction">医嘱</option><option value="document">资料</option><option value="other">其他</option></select></label><label>处理状态<select id="filterState"><option value="">全部</option><option value="active">继续记录中</option><option value="paused">已暂停</option><option value="finished">已结束</option><option value="inbox">单独记录待整理</option><option value="draft">单独记录待核对</option><option value="recorded">单独记录已核对</option><option value="needs_review">单独记录需重新整理</option></select></label><label>开始日期<input id="filterStart" type="date"></label><label>结束日期<input id="filterEnd" type="date"></label><div class="filter-actions"><button id="applyFilters" class="primary" type="submit">搜索记录</button><button id="clearFilters" class="outline" type="button">清除筛选</button></div></form>
+        <p id="filterResultsStatus" class="filter-results-status" role="status" aria-live="polite"></p>
+        <div id="eventsList" class="events" tabindex="-1"><p class="muted">正在读取记录…</p></div>
         <div class="handoff-controls"><h2>就诊交接材料</h2><p>选择记录和日期范围，预览后可用浏览器打印或导出 PDF，不会自动对外分享。</p><div><label>开始日期<input id="handoffStart" type="date"></label><label>结束日期<input id="handoffEnd" type="date"></label></div><button id="handoffBtn" class="handoff-btn" type="button">生成就诊交接材料</button></div>
-        <section id="detail" class="detail hidden"></section>
         <section id="handoff" class="handoff hidden"></section>
+      </section>
+
+      <section id="recordDetailView" class="view subview" aria-labelledby="detailPageTitle" aria-hidden="true">
+        <button class="back-btn" type="button" data-view="recordsView"><svg aria-hidden="true"><use href="#i-back"/></svg> 返回我的记录</button>
+        <div class="records-head"><h1 id="detailPageTitle" tabindex="-1">记录详情</h1></div>
+        <div id="dangerBanner" class="danger hidden" role="alert"></div>
+        <section id="detail" class="detail hidden" aria-live="polite"></section>
       </section>
 
       <section id="settingsView" class="view subview" aria-labelledby="settingsTitle" aria-hidden="true">
         <button class="back-btn" type="button" data-view="homeView"><svg aria-hidden="true"><use href="#i-back"/></svg> 返回首页</button>
         <div class="records-head"><h1 id="settingsTitle" tabindex="-1">数据与内测设置</h1></div>
         <div class="settings-grid">
+          <section class="settings-card health-context-card">
+            <div class="settings-card-head"><div><span class="settings-kicker">问诊背景</span><h2>让小零了解已经确认的情况</h2></div><span class="local-only-badge">仅存本机</span></div>
+            <p>每行写一项，确认过的再填。保存后不会自动发送；每段对话都由你选择是否带上，最多 5 项。勾选的内容会在后续发言整理时发送给联网 AI，直到取消选择。</p>
+            <div class="health-context-grid">
+              <label>已经确认的疾病或长期问题<textarea id="healthConditions" rows="3" placeholder="例如：医生曾确认的长期问题，一行一项"></textarea></label>
+              <label>正在使用的药物<textarea id="healthMedications" rows="3" placeholder="药名和已知用法，一行一项；不要在这里自行改药"></textarea></label>
+              <label>药物或食物过敏<textarea id="healthAllergies" rows="3" placeholder="没有可留空；不确定时写“不确定”"></textarea></label>
+              <label>手术、住院或受伤经历<textarea id="healthProcedures" rows="3" placeholder="只写已经发生并确认的经历"></textarea></label>
+              <label>已有检查、报告或日常测量<textarea id="healthTests" rows="3" placeholder="只写已有结果，不需要为了填写去做检查"></textarea></label>
+              <label>以前出现过的类似情况<textarea id="healthSimilarEpisodes" rows="3" placeholder="什么时候发生、当时是什么感觉"></textarea></label>
+            </div>
+            <button id="saveHealthContextBtn" class="primary" type="button">保存健康背景</button>
+            <p id="healthContextStatus" class="status" role="status" aria-live="polite"></p>
+          </section>
           <section class="settings-card"><h2>加密备份</h2><p>下载文件包含记录和原件的密文，不包含 API 密钥。恢复时需要本机恢复口令。</p><button id="downloadBackupBtn" class="primary" type="button">下载加密备份</button><label class="file-label" for="restoreBackupInput">选择备份文件恢复</label><input id="restoreBackupInput" type="file" accept=".bingli,application/json"><p id="backupStatus" class="status" role="status"></p></section>
           <section class="settings-card"><h2>当前设备</h2><p id="storageStatus">正在检查本机存储状态…</p><button id="lockVaultBtn" class="outline" type="button">立即锁定本机资料</button></section>
           <section class="settings-card"><h2>提交内测问题</h2><p>只保存你主动填写的描述、当前页面和时间；不默认附带健康原文或密钥。</p><textarea id="feedbackText" rows="5" placeholder="遇到了什么？你期望发生什么？"></textarea><button id="saveFeedbackBtn" class="primary" type="button">保存内测问题</button><p id="feedbackStatus" class="status" role="status"></p></section>
@@ -150,15 +201,16 @@
     </nav>
   </div>
 
-  <template id="eventTpl"><article class="event-item"><label class="handoff-choice"><input class="handoff-select" type="checkbox" checked><span>用于就诊交接</span></label><div class="event-main"><div class="event-date"></div><div class="event-raw"></div><div class="badges"></div></div><button class="view-btn" type="button">查看</button></article></template>
+  <template id="conversationRecordTpl"><article class="event-item conversation-record"><label class="handoff-choice"><input class="handoff-select" type="checkbox" checked><span>用于就诊交接</span></label><div class="event-main"><div class="event-date"></div><h2 class="conversation-record-title"></h2><div class="event-raw"></div><div class="badges"></div></div><div class="record-actions"><button class="view-btn" type="button">查看完整对话</button><button class="record-delete-btn" type="button" aria-label="删除这条完整对话"><svg aria-hidden="true"><use href="#i-trash"/></svg></button></div></article></template>
+  <template id="eventTpl"><article class="event-item standalone-record"><label class="handoff-choice"><input class="handoff-select" type="checkbox" checked><span>用于就诊交接</span></label><div class="event-main"><div class="event-date"></div><div class="event-raw"></div><div class="badges"></div></div><div class="record-actions"><button class="view-btn" type="button">查看单条记录</button><button class="record-delete-btn" type="button" aria-label="删除这条记录"><svg aria-hidden="true"><use href="#i-trash"/></svg></button></div></article></template>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="runtime-config.js?v=20260918-minimal-2"></script>
-  <script src="config.js?v=20260918-minimal-2"></script>
-  <script src="local-store-core.js?v=20260918-minimal-2"></script>
-  <script src="safety.js?v=20260918-minimal-2"></script>
-  <script src="local-store.js?v=20260918-minimal-2"></script>
-  <script src="splash.js?v=20260918-minimal-2"></script>
-  <script src="app.js?v=20260918-minimal-2"></script>
-  <script src="media.js?v=20260918-minimal-2"></script>
+  <script src="runtime-config.js?v=20261001-predeploy-3"></script>
+  <script src="config.js?v=20261001-predeploy-3"></script>
+  <script src="local-store-core.js?v=20261001-predeploy-3"></script>
+  <script src="safety.js?v=20261001-predeploy-3"></script>
+  <script src="local-store.js?v=20261001-predeploy-3"></script>
+  <script src="splash.js?v=20261001-predeploy-3"></script>
+  <script src="app.js?v=20261001-predeploy-3"></script>
+  <script src="media.js?v=20261001-predeploy-3"></script>
 </body>
 </html>

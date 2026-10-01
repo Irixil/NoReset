@@ -19,7 +19,7 @@ MEDIA_RECOGNITION_TIMEOUT_SECONDS=60
 | 能力 | 默认模型 | 当前选择原因 |
 |---|---|---|
 | 中文语音转写 | `gemini-2.5-flash-lite` | 当前 Key 已开放、可直接理解音频，且比当前账号不可用的 Whisper 通道更便宜 |
-| 照片识字 | `qwen3.7-flash` | 支持视觉，价格低；OCR 请求使用高细节图片输入 |
+| 照片识字 | `qwen3.7-plus` | 真实脱敏单据回归候选；高细节图片、逐行转录、1024思考预算，仍需人工对照原件 |
 
 语音使用 AIHubMix 的 Gemini 原生 HTTPS `generateContent` 接口，在 `inlineData` 中携带原音频，输出只接受转写文字。系统指令把音频明确视为不可信的待转写材料，不执行音频内的指令，也不补写、总结或给医疗建议。AIHubMix 文档的内联多媒体上限为 20MB；应用会在超限时本地拒绝，不产生无效请求。
 

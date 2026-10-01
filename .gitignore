@@ -38,3 +38,39 @@ coverage/
 # Reviewed, explicitly synthetic self-test samples only.
 !data/synthetic/selftest/voice.wav
 !data/synthetic/selftest/card.png
+
+# Local orchestration state and generated dashboards stay on this machine.
+.dz/
+/PROJECT.md
+/docs/sdlc/work-items.md
+/docs/sdlc/issues.md
+
+# Detailed local QA payloads, traces and originals are not source deliverables.
+/docs/evidence/*2026-09-30/
+/docs/evidence/*2026-10-01/
+/docs/evidence/*2026-10-01-round2/
+/docs/evidence/*2026-09-30*.json
+
+# Detailed acceptance narratives remain in the private local handoff.
+/docs/evidence/clinical-intake-2026-09-20.md
+/docs/evidence/cloud-mobile-beta-2026-09-20.md
+/docs/evidence/conversation-archive-2026-09-20.md
+/docs/evidence/conversation-delete-2026-09-20.md
+/docs/evidence/conversation-intake-2026-09-19.md
+/docs/evidence/conversation-natural-dialogue-2026-09-20.md
+/docs/evidence/conversation-recovery-2026-09-19.md
+/docs/evidence/master-acceptance-2026-09-30.md
+/docs/evidence/product-code-audit-2026-09-30.md
+/docs/evidence/public-case-test-preparation-2026-09-30.md
+/docs/evidence/real-acceptance-frontend-2026-09-30.md
+/docs/evidence/real-acceptance-review-2026-09-30.md
+/docs/evidence/real-document-acceptance-2026-10-01-round2.md
+/docs/evidence/real-document-acceptance-2026-10-01.md
+/docs/evidence/real-document-preparation-2026-10-01.md
+/docs/evidence/record-card-delete-2026-09-20.md
+/docs/evidence/record-detail-navigation-2026-09-20.md
+/docs/evidence/source-review-acceptance-2026-10-01.md
+/docs/evidence/user-flow-review-2026-09-30.md
+/docs/evidence/voice-dialogue-backend-2026-09-30.md
+/docs/evidence/voice-dialogue-frontend-2026-09-30.md
+/docs/evidence/voice-dialogue-review-2026-09-30.md

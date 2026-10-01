@@ -1,5 +1,15 @@
 # 前后端接口合同 v0.5
 
+## 2026-10-01 照片来源核对门槛
+
+照片 OCR 只生成候选文字。`source_kind:document` 的记录必须有绑定当前完整 `raw_text` 的 `source_review:{method:"original_comparison",text,confirmed_at}`，才能进入整理、记录确认和交接正文。它表示使用者对照原件后的声明，不代表系统证明视觉识别准确或医学确认。创建、OCR 和修订不能自行设置该声明；修订清空声明，历史 `recorded` 状态不替代原件核对，旧修订即使误标为自述也继承照片来源。
+
+本机 `POST /api/events/:id/source-review` 请求 `{expected_version,compared_with_original:true}`；界面先展示原件，再允许逐行核对和明确勾选。看不清、遮挡、裁切处应修订为 `[无法辨认]`。该动作清除旧 AI 草稿，保留原件、原识别和修订历史。SQLite 兼容接口执行同一门槛。无状态 `/api/ai/organize` 也检查当前记录与历史中的照片声明；缺失或文字版本不一致时在模型请求前返回 `409 document_source_review_required`。原件核对只能防止未经确认的自动流转，不能阻止使用者错误确认。
+
+交接 `items` 不含未核对照片文字、旧 AI 摘要或风险结论，另以 `pending_documents:[{record_id,recorded_at,reason:"document_source_review_required"}]` 提醒查看原件。附件只含状态，不再夹带整份识别内容。恢复加密备份后使用相同判断。照片记录不能通过修订改成患者自述，也不能作为语音对话回合提交。
+
+供应商明确表示输出被截断/未正常结束时，返回可重试的 `incomplete_provider_response`，不把半截文字关联为成功记录。HTML 清理保留表格行列分隔、比较符和上下标，不推测单位或缺失项。已核对资料再进入整理时，原有完整原文约束仍阻断模型补写未知项。
+
 ## 内测版的正式边界
 
 `APP_MODE=local_first` 是内测版的正式运行模式。记录、修订历史、媒体原件和备份由浏览器的 Web Crypto + IndexedDB 处理，后端不创建 SQLite 健康数据库，并对旧 `/api/events`、`/api/media`、`/api/handoffs` 服务端路由返回 `404 legacy_api_disabled`。前端保留同形本地请求层，用于降低旧界面迁移风险；这些本地请求不会离开浏览器。
@@ -7,17 +17,24 @@
 函数服务只提供以下无状态能力：
 
 - `GET /health`：返回 `mode:"local_first"` 和 `storage:"encrypted_on_device"`，不返回旧 `session_token`。
-- `GET /api/app/config`：返回产品名、数据位置、访问保护和私有云备份是否配置。
+- `GET /api/app/config`：返回产品名、数据位置、访问保护、私有云备份配置，以及 `provider` 和 `capabilities.text_ai/audio_recognition/image_recognition`。每项含 `available` 与 `reason`；`provider_mock` 表示模拟且 `available:false`；`provider_configured_connection_unverified` 仅表示配置校验通过，不保证网络连通和识别质量。
 - `GET /api/app/session`：返回当前浏览器是否已登录；已登录时同时返回 CSRF 令牌和过期时间。
 - `POST /api/app/login`：请求 `{"password":"..."}`，成功设置已签名、HttpOnly、SameSite=Strict 的 Cookie。
 - `POST /api/app/logout`：需 Cookie + `X-CSRF-Token`，清除当前 Cookie。
 - `POST /api/ai/organize`：需 Cookie + CSRF + `consent:true`；只返回经验证的草稿和本地安全字段，不写数据库。
+- `POST /api/ai/conversation-turn`：需精确 Origin、签名 Cookie 和 CSRF。`turns` 为 1–40 条老人原话，每条 `{turn_id,text,version?,responding_to?:{turn_id,text}}`；`responding_to` 只解释回答语境，助手 ID 不能作为患者事实来源。`health_context` 在客户端发送前限制为本次显式勾选的最多 5 项；未勾选内容不外发。完整对话仍保存在本机。`action` 可为 `ask / reply / finish / urgent`：`reply` 表示本轮仅回应、不结束、不新增追问计数；`assistant_text` 是已经验证的完整回应，模型内部 `reply_text` 不作为患者事实。
 - `POST /api/ai/media/recognize`：需 Cookie + CSRF，`multipart/form-data` 严格包含 `kind` / `content_type` / `attempt_id` / `file`；原件只写入临时文件，请求完成或失败后删除。
 - `GET /api/backups`：需登录 Cookie；只列出私有 TOS 中 `backups/` 下密文对象的名称、大小和时间，不返回内容。
 - `POST /api/backups/upload-grant`：需 Cookie + CSRF，请求 `size` 与 64 位十六进制 `sha256`；返回服务端生成对象名及最多 15 分钟、默认 5 分钟有效的 TOS `PUT` 地址。浏览器直接上传已经加密的 `.bingli` 包。
 - `POST /api/backups/download-grant`：需 Cookie + CSRF，请求 `object_key`；只允许当前备份前缀内的 `.bingli` 对象，返回短时 `GET` 地址。下载后仍须在浏览器验证恢复口令并预览，不能静默覆盖当前设备。
 
 `POST /api/ai/organize` 的文字请求最多 10000 字符，历史证据最多 20 条；媒体默认最大 20 MiB，可用 `APP_AI_MEDIA_MAX_BYTES` 下调，不可超过 25 MiB。付费 AI 失败后不在函数内自动重试。密文备份最大 100 MiB；签名地址属于短时持有者权限，不能写入日志、反馈或长期存储。
+
+2026-09-30 本地实现：所有 `/api/ai/*` 在调用供应商前检查来源、签名会话与 CSRF。缺配置返回 503，未授权 401，来源/CSRF 不符 403；单进程频率或并发超限返回 429 和 `Retry-After`，不会触发模型。默认每会话每分钟 12 次、全进程 120 次，并发分别 2/8；它不是跨实例或可持久化的费用上限，公开部署还需网关/供应商总预算控制。`scripts.start_app` 仅在回环监听和回环前端时启用静默本地会话；无第二个老人端密码。公网不自动签发该会话。
+
+本地优先公开 AI 接口拒绝 Mock：文字接口返回 `503 provider_mock_unavailable`，媒体识别返回 `503 media_mock_unavailable`，均可在真实服务恢复后重试。直接引擎的显式 Mock 仍供隔离自动化测试使用，不能作为用户功能验收。客户端也拒绝 `recognition.is_mock` 或旧 `[Mock ASR/OCR]` 占位文字进入患者事实，并保留录音。历史模拟回合标记 `is_mock:true`，从模型输入与报告事实中排除，历史不静默删除。
+
+本机接口 `POST /api/conversations/:id/context {context_ids:[...]}` 只保存这次选择，不请求 AI；下次发言或主动重试才发送。`POST /api/conversations/:id/resume-assistant` 可重试未完成回复或失败提示，保留同一条老人原话。交接材料带记录/日期筛选时只附所选记录关联的原件；未关联原件仍在“看病资料”。首次空库可直接从已验证加密备份恢复，已有库覆盖恢复仍需明确确认。
 
 生产环境的 TOS 签名使用函数所绑定 IAM 角色的请求级 STS 凭据（`X-Faas-Access-Key-Id`、`X-Faas-Secret-Access-Key`、`X-Faas-Session-Token`），不配置长期 TOS AK/SK。角色策略必须限制到目标私有 Bucket 的 `backups/` 前缀。函数到 TOS 的列表请求使用同地域内网 Endpoint；签发给浏览器的短链接使用公网 HTTPS Endpoint。
 
