@@ -1,4 +1,4 @@
-# 病历不归零·内测版
+# NoReset · 病历不归零
 
 一个面向个人和家庭的健康记录工具：保存文字、录音和照片，自动识别媒体内容，再生成能直接给医生查看的就诊交接材料。AI 输出始终是待核对草稿，不是诊断、医嘱或用药决定。
 
@@ -34,8 +34,8 @@ flowchart LR
 需要 Python 3.12 和 Node.js 22+。
 
 ```bash
-git clone https://github.com/Irixil/bing-li-bu-gui-ling.git
-cd bing-li-bu-gui-ling
+git clone https://github.com/Irixil/NoReset.git
+cd NoReset
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
