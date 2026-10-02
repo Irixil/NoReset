@@ -297,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
   if app_access.local_first_enabled() and p=='/':return self.send_json(200,{'ok':True,'service':'bingli-beta-api','kind':'api','frontend_hosted':False})
   if p=='/api/app/config':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
-   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'病历不归零·内测版','data_location':'this_device','backup_mode':'encrypted_archive',**local_first_capabilities()})
+   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive',**local_first_capabilities()})
   if p=='/api/app/session':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
    session=app_access.request_authorized(self.headers.get('Cookie'),write=False)

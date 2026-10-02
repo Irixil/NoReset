@@ -2,7 +2,7 @@
 
 项目所有者明确要求先把当前版本上传 GitHub，其他验证随后自行进行。本次交付代码、测试、说明和规格，不部署线上、不创建新云资源，不代表产品全部验收通过。
 
-当前整合分支为 `codex/backend-integration-2026-09-14`。有效规格为 `docs/sdlc/spec-contextual-dialogue-v9.md`，实施方案为 `docs/sdlc/plan-contextual-dialogue-v10.md`。旧版本文档保留为历史，不能覆盖这里的新决定。
+当前整合分支为 `codex/backend-integration-2026-09-14`。有效规格为 `docs/sdlc/spec-contextual-dialogue-v10.md`，实施方案为 `docs/sdlc/plan-contextual-dialogue-v11.md`。旧版本文档保留为历史，不能覆盖这里的新决定。
 
 ## 当前实现
 
@@ -29,8 +29,8 @@
 ## 获取和运行
 
 ```bash
-git clone --branch codex/backend-integration-2026-09-14 https://github.com/Irixil/bing-li-bu-gui-ling.git
-cd bing-li-bu-gui-ling
+git clone --branch codex/backend-integration-2026-09-14 https://github.com/Irixil/NoReset.git
+cd NoReset
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt

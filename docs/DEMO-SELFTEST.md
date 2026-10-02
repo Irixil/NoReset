@@ -9,8 +9,8 @@
 需要 Python 3.12 和 Git。无需前端构建工具。安装项目依赖后，系统没有 FFmpeg 时会使用固定版本的项目备用二进制，供浏览器 WebM 录音转换。
 
 ```bash
-git clone --branch codex/backend-integration-2026-09-14 https://github.com/Irixil/bing-li-bu-gui-ling.git
-cd bing-li-bu-gui-ling
+git clone --branch codex/backend-integration-2026-09-14 https://github.com/Irixil/NoReset.git
+cd NoReset
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt

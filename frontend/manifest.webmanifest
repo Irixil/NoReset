@@ -1,6 +1,6 @@
 {
-  "name": "病历不归零·内测版",
-  "short_name": "病历不归零",
+  "name": "NoReset·内测版",
+  "short_name": "NoReset",
   "description": "设备本地加密的健康记录与就诊交接工具",
   "start_url": "/",
   "display": "standalone",

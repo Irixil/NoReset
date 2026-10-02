@@ -8,7 +8,7 @@ claim: "具体要证明的行为"
 scope: "T0/T1/T2/T3/T4/T5/T6"
 status: "通过 | 失败 | 阻塞 | 待确认"
 baseline:
-  repository: "bing-li-bu-gui-ling"
+  repository: "NoReset"
   branch: "main"
   commit: "完整 commit"
   working_tree: "clean | has-untracked | has-changes"

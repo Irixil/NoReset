@@ -71,7 +71,7 @@ def prepare_app_environment(root: Path = ROOT, *, environ: MutableMapping[str, s
 
 
 def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
-    parser = argparse.ArgumentParser(description="病历不归零·内测版：本地加密主数据 + 无状态 AI 接口")
+    parser = argparse.ArgumentParser(description="NoReset·内测版：本地加密主数据 + 无状态 AI 接口")
     parser.add_argument("--check-config", action="store_true", help="只检查配置，不启动、不调用 AI")
     args = parser.parse_args(argv)
     try:

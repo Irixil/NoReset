@@ -19,7 +19,7 @@ def create_link(frontend_url: str, *, root: Path = ROOT) -> tuple[str, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="生成病历不归零设备绑定链接")
+    parser = argparse.ArgumentParser(description="生成NoReset设备绑定链接")
     parser.add_argument(
         "--frontend-url",
         default=os.getenv("APP_FRONTEND_URL") or os.getenv("ALLOWED_ORIGIN") or "http://127.0.0.1:5173",

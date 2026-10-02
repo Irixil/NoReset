@@ -1,4 +1,4 @@
-const CACHE = 'bingli-beta-shell-v47-predeploy';
+const CACHE = 'bingli-beta-shell-v48-noreset';
 const CACHE_PREFIX = 'bingli-beta-shell-';
 const SHELL = ['/', '/styles.css', '/ios.css', '/splash.css', '/runtime-config.js', '/config.js', '/local-store-core.js', '/safety.js', '/local-store.js', '/app.js', '/media.js', '/splash.js', '/assets/brand-mascot.png', '/manifest.webmanifest'];
 const SHELL_PATHS = new Set(SHELL);

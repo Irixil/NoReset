@@ -317,7 +317,7 @@ def test_offline_entry_serves_same_origin_ui_and_accepts_write(tmp_path):
             pytest.fail("offline demo did not start")
         assert health["provider"] == "mock"
         with urllib.request.urlopen(base + "/", timeout=2) as response:
-            assert "病历不归零" in response.read().decode()
+            assert "<title>NoReset·内测版｜陪你记下来</title>" in response.read().decode()
         with urllib.request.urlopen(base + "/api/media/capabilities", timeout=2) as response:
             assert json.load(response)["capabilities"]["enabled"] is True
         request = urllib.request.Request(base + "/api/events", data=json.dumps({"raw_text": "演示启动测试", "source_kind": "elder", "actor_name": "测试"}).encode(), headers={"Content-Type": "application/json", "Origin": base, "X-Session-Token": health["session_token"], "Idempotency-Key": "same-origin-demo-test"})

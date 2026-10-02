@@ -1,4 +1,4 @@
-# 病历不归零·内测版
+# NoReset · 病历不归零
 
 > 2026-10-01 源码交付候选。最近本地回归为后端 845 项、前端 126 项通过，并已实测保存失败恢复、修订链删除和原件核对门禁。整页识别准确率、云端服务连接、线上完整流程、真机和临床审查仍未全通过。本次只上传源码，不更新线上服务。详见 [当前交接与验证范围](docs/GITHUB-STATUS-2026-10-01.md)。
 
@@ -47,8 +47,8 @@ flowchart LR
 需要 Python 3.12 和 Node.js 22+。
 
 ```bash
-git clone https://github.com/Irixil/bing-li-bu-gui-ling.git
-cd bing-li-bu-gui-ling
+git clone https://github.com/Irixil/NoReset.git
+cd NoReset
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
