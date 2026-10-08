@@ -218,7 +218,7 @@ def evaluate_assertions(case, dataset, output):
             check(field, '160/90' not in prose, prohibition)
         elif '具体时间' in prohibition or '具体日期' in prohibition or '录入时间当成' in prohibition or '上传日期' in prohibition or '发生日期' in prohibition:
             occurred = output.get('time', {}).get('occurred')
-            supported = occurred is None or occurred == payload.get('occurred_time') or str(occurred) in raw
+            supported = occurred is None or occurred == payload.get('occurred_time')
             check(field, supported, prohibition, partial=True)
         elif any(word in prohibition for word in ('诊断', '药物副作用', '疗效', '病因', '药物有效')):
             check(field, not re.search(r'(?:确诊|诊断)(?:为|是)|(?:就是|患有)(?:心肌梗死|脑卒中|失眠)|(?:是|为)药物副作用|药物(?:有效|起效)|病因(?:已经|已)?解决', prose), prohibition, partial=True)
