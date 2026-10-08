@@ -76,6 +76,38 @@ function harness() {
 const saved = () => ({ media_id: 'media_test', kind: 'audio', content_type: 'audio/webm',
   version: 1, save_status: 'saved', recognition_status: 'not_started', link_status: 'not_linked' });
 
+for (const scenario of ['deleted original', 'another conversation']) test(`same media bytes can be saved after ${scenario}`, async () => {
+  const h = harness();
+  let creates = 0, exists = true;
+  const associated = [];
+  h.run('globalThis.HealthLocal={active:true}');
+  h.context.fixture = new Blob(['synthetic-media'], { type: 'audio/webm' });
+  h.setApi(async (route, options) => {
+    if (route === '/api/media/capabilities') return { r: { ok: true }, j: { capabilities: {
+      enabled: true, audio_content_types: ['audio/webm'], image_content_types: ['image/png'],
+      max_total_bytes: 1000, max_part_bytes: 1000, max_parts: 2,
+    } } };
+    if (route === '/api/media') return { r: { ok: true }, j: { media: [] } };
+    if (route === '/api/media/uploads') {
+      creates++; associated.push(options.body.get('conversation_id'));
+      return { r: { ok: true }, j: { upload: { media_id: `media_${creates}`, upload_id: `upload_${creates}` } } };
+    }
+    if (/\/parts\//.test(route)) return { r: { ok: true }, j: {} };
+    if (/\/complete$/.test(route)) return { r: { ok: true }, j: { media: { ...saved(), media_id: `media_${creates}` } } };
+    if (/^\/api\/media\/media_/.test(route)) return exists
+      ? { r: { ok: true }, j: { media: { ...saved(), media_id: 'media_1' } } }
+      : { r: { ok: false, status: 404 }, j: { error: 'media_not_found' } };
+    throw new Error('unexpected route ' + route);
+  });
+  const first = await h.run('uploadMedia(fixture,"audio",{temporary:true,conversationId:"conversation_first"})');
+  assert.equal(first.media_id, 'media_1');
+  if (scenario === 'deleted original') exists = false;
+  const second = await h.run(`uploadMedia(fixture,"audio",{temporary:true,conversationId:"${scenario==='deleted original'?'conversation_first':'conversation_second'}"})`);
+  assert.equal(second?.media_id, 'media_2');
+  assert.equal(creates, 2);
+  assert.equal(associated[1], scenario === 'deleted original' ? 'conversation_first' : 'conversation_second');
+});
+
 test('unavailable or Mock recognition is visible but does not disable saving the local original', async () => {
   const h = harness();
   h.setApi(async route => route === '/api/media/capabilities'

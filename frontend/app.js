@@ -643,7 +643,8 @@ function renderDetail(e,options={}){
   if($('rejectBtn'))$('rejectBtn').onclick=()=>review(e,'reject');
   if($('reviseBtn'))$('reviseBtn').onclick=()=>revise(e);$('historyBtn').onclick=()=>historyView(e);
 }
-async function loadRelatedHistory(e){const ids=Array.isArray(e.related_record_ids)?e.related_record_ids.slice(0,10):[];if(!ids.length)return;const records=[];for(const id of ids){const x=await api('/api/events/'+encodeURIComponent(id));if(x.r.ok&&x.j.event)records.push(x.j.event)}if(current?.record_id===e.record_id)renderDetail(e,{relatedRecords:records,focus:false})}
+function detailStillCurrent(e,request){return request===detailRequestSerial&&current?.record_id===e.record_id&&current?.version===e.version}
+async function loadRelatedHistory(e){const request=detailRequestSerial,ids=Array.isArray(e.related_record_ids)?e.related_record_ids.slice(0,10):[];if(!ids.length)return;const records=[];for(const id of ids){const x=await api('/api/events/'+encodeURIComponent(id));if(x.r.ok&&x.j.event)records.push(x.j.event)}if(detailStillCurrent(e,request))renderDetail(e,{relatedRecords:records,focus:false})}
 function conversationTurnTime(turn){return turn?.created_at?new Date(turn.created_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function conversationTranscriptTurnHtml(turn){
   const assistant=turn.role==='assistant',mock=isMockContent(turn),speaker=assistant?'小零':'我',time=conversationTurnTime(turn),history=!assistant&&!mock&&turn.versions?.length?`<details class="turn-history"><summary>查看修改前文字</summary>${turn.versions.map(version=>`<p>第 ${escapeHtml(version.version)} 版：${escapeHtml(version.text||'')}</p>`).join('')}</details>`:'';
@@ -673,7 +674,9 @@ async function showDetail(id){if(!showView('recordDetailView'))return;const requ
 function closeDetail(){showView('recordsView')}
 async function organize(e){
   const b=$('organizeBtn');if(!b||b.disabled)return;b.disabled=true;b.textContent='整理中…';
+  const request=detailRequestSerial;
   const x=await api('/api/events/'+e.record_id+'/organize',{method:'POST',body:JSON.stringify({expected_version:e.version})});
+  if(!detailStillCurrent(e,request)){await loadEvents();return}
   // A successful POST or 422 already carries the saved evidence. Render it
   // without a second GET, so losing the connection cannot hide the original.
   if(x.j.event||x.r.status===422){
@@ -688,9 +691,10 @@ async function organize(e){
 }
 async function review(e,action='confirm'){
   const b=$(action==='reject'?'rejectBtn':'reviewBtn');b.disabled=true;
+  const request=detailRequestSerial;
   const x=await api('/api/events/'+e.record_id+'/review',{method:'POST',body:JSON.stringify({expected_version:e.version,action,note:action==='confirm'?'仅确认记录准确，不代表医生确认或风险消失':'退回重新整理'})});
-  if(x.r.ok){toast(action==='confirm'?'已记录“记录准确”':'已退回重新整理');await loadEvents();await showDetail(e.record_id);}
-  else {b.disabled=false;toast('核对未确认，请刷新后重试');}
+  if(x.r.ok){toast(action==='confirm'?'已记录“记录准确”':'已退回重新整理');await loadEvents();if(detailStillCurrent(e,request))await showDetail(e.record_id);}
+  else if(detailStillCurrent(e,request)){b.disabled=false;toast('核对未确认，请刷新后重试');}
 }
 async function deleteRecord(e,button=null){
   if(!confirm('确定删除这条记录吗？删除后，这条记录、修订历史和关联原件会从当前设备移除；其他记录和旧备份不受影响。'))return false;
@@ -698,7 +702,7 @@ async function deleteRecord(e,button=null){
   const x=await api('/api/events/'+encodeURIComponent(e.record_id),{method:'DELETE',body:JSON.stringify({delete_scope_confirmed:true})});
   if(x.r.ok){handoffSelection.delete(e.record_id);await loadEvents();toast(`已删除这条记录${x.j.deleted.local_media_count?`和 ${x.j.deleted.local_media_count} 份关联原件`:''}；其他记录未改变`);return true}
   if(button){button.disabled=false;button.setAttribute('aria-label','删除这条记录')}
-  toast('删除未完成，这条记录仍然保留');return false;
+  toast(x.j.error==='conversation_source_changed'?'这条原话属于完整对话，请从就诊记录删除该对话；资料仍保留':'删除未完成，这条记录仍然保留');return false;
 }
 async function deleteConversation(conversation,button=null){
   if(!confirm('确定删除这条完整对话吗？删除后，这次对话、关联原话和本机临时录音会从当前设备移除；其他记录、健康背景和旧备份不受影响。'))return false;
@@ -706,7 +710,7 @@ async function deleteConversation(conversation,button=null){
   const x=await api('/api/conversations/'+encodeURIComponent(conversation.conversation_id),{method:'DELETE',body:JSON.stringify({delete_scope_confirmed:true,expected_version:conversation.version})});
   if(x.r.ok){if(activeConversation?.conversation_id===conversation.conversation_id)activeConversation=null;conversationRecordIds(conversation).forEach(recordId=>handoffSelection.delete(recordId));await loadEvents();toast(`已删除这条完整对话${x.j.deleted.local_media_count?`和 ${x.j.deleted.local_media_count} 份关联原件`:''}；其他记录未改变`);return true}
   if(button){button.disabled=false;button.setAttribute('aria-label','删除这条完整对话')}
-  toast(x.r.status===409?'这条对话已有新内容，请刷新后再删除':'删除未完成，这条对话仍然保留');return false;
+  toast(x.j.error==='conversation_source_shared'?'这条对话与其他对话共用原话，暂时不能单独删除；资料仍保留':x.r.status===409?'这条对话已有新内容，请刷新后再删除':'删除未完成，这条对话仍然保留');return false;
 }
 function revise(e){
   $('subview').innerHTML=`<h3 id="reviseTitle" tabindex="-1">修订记录</h3><label class="field-label" for="revText">修订后的原话</label><textarea id="revText" rows="4" aria-describedby="reviseStatus">${escapeHtml(e.raw_text)}</textarea><label class="field-label" for="revReason">修订原因（必填）</label><input id="revReason" required aria-describedby="reviseStatus"><button class="primary" id="submitRev">保存修订</button><div id="reviseStatus" role="status" aria-live="polite"></div>`;
@@ -827,12 +831,16 @@ async function refreshStorageStatus(){if(!localMode||!$('storageStatus'))return;
 const HEALTH_CONTEXT_FIELDS={conditions:'healthConditions',medications:'healthMedications',allergies:'healthAllergies',procedures:'healthProcedures',tests:'healthTests',similar_episodes:'healthSimilarEpisodes'};
 async function loadHealthContext(){
   if(!localMode||!$('healthContextStatus'))return;
+  const controls=[...Object.values(HEALTH_CONTEXT_FIELDS).map(id=>$(id)),$('saveHealthContextBtn')].filter(Boolean);
+  controls.forEach(control=>control.disabled=true);
   const status=$('healthContextStatus');status.textContent='正在读取本机健康背景…';
-  const x=await api('/api/health-context');
-  if(!x.r.ok){status.textContent='健康背景暂时无法读取，原有内容不会删除。';return}
-  const entries=x.j.health_context?.entries||[];
-  for(const [category,id] of Object.entries(HEALTH_CONTEXT_FIELDS)){const input=$(id);if(input)input.value=entries.filter(item=>item.category===category).map(item=>item.text).join('\n')}
-  status.textContent=entries.length?`已在本机保存 ${entries.length} 项确认背景。不会自动发送；请在每段对话中自行选择。`:'还没有保存健康背景；可以先空着。';
+  try{
+    const x=await api('/api/health-context');
+    if(!x.r.ok){status.textContent='健康背景暂时无法读取，原有内容不会删除。';return}
+    const entries=x.j.health_context?.entries||[];
+    for(const [category,id] of Object.entries(HEALTH_CONTEXT_FIELDS)){const input=$(id);if(input)input.value=entries.filter(item=>item.category===category).map(item=>item.text).join('\n')}
+    status.textContent=entries.length?`已在本机保存 ${entries.length} 项确认背景。不会自动发送；请在每段对话中自行选择。`:'还没有保存健康背景；可以先空着。';
+  }finally{controls.forEach(control=>control.disabled=false);}
 }
 async function saveHealthContext(){
   const button=$('saveHealthContextBtn'),status=$('healthContextStatus');if(!button||!status)return;
@@ -843,7 +851,7 @@ async function saveHealthContext(){
   const error=x.j?.error;
   status.textContent=x.r.ok?`已加密保存在本机，共 ${x.j.health_context?.entries?.length||0} 项。不会自动发送；每段对话可单独选择。`:error==='health_context_too_many'?'保存没有完成：每类最多 12 项，总共最多 30 项；每项最多 500 字。输入仍保留，请删减后重试。':error==='health_context_text_too_long'?'保存没有完成：每项最多 500 字。输入仍保留，请缩短后重试。':'保存没有完成，输入仍保留，可以重试。';
 }
-async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);status.textContent='恢复完成，正在重新读取记录。';await loadEvents();return true}catch{status.textContent='备份无法验证或已损坏，当前数据未被覆盖。';return false}}
+async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);status.textContent='恢复完成，正在重新读取记录。';await loadEvents();return true}catch(error){status.textContent=['local_operations_busy','vault_restore_in_progress'].includes(error.message)?'还有记录正在保存、回复或识别，请等完成后再恢复。当前资料未被替换。':['vault_changed_requires_unlock','vault_locked'].includes(error.message)?'这份资料库已在其他页面恢复，请刷新并重新解锁后再操作。':'备份无法验证或已损坏，当前数据未被覆盖。';return false}}
 if($('downloadBackupBtn'))$('downloadBackupBtn').onclick=async()=>{const s=$('backupStatus');try{await HealthLocal.downloadBackup();s.textContent='加密备份已生成，请确认浏览器的下载位置。'}catch{s.textContent='备份生成失败，本机数据未改变。'}};
 if($('restoreBackupInput'))$('restoreBackupInput').onchange=async e=>{const file=e.target.files?.[0],s=$('backupStatus');e.target.value='';if(file)await restoreEncryptedBackup(file,s)};
 if($('lockVaultBtn'))$('lockVaultBtn').onclick=()=>{HealthLocal.lock();location.reload()};

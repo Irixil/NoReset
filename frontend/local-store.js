@@ -16,6 +16,8 @@
   const RECOVERABLE_MEDIA_ERRORS = new Set(['media_mock_unavailable', 'provider_not_configured', 'media_configuration_invalid', 'session_unavailable', 'authentication_required', 'access_not_configured', 'ai_rate_limited', 'configuration_missing', 'network_unavailable', 'provider_timeout', 'provider_unavailable', 'provider_rate_limited']);
   let initialisePromise;
   let active = false;
+  let pendingLocalOperations = 0;
+  let restoringBackup = false;
   const conversationWrites = new Map();
   const eventWrites = new Map();
   const mediaWrites = new Map();
@@ -116,6 +118,22 @@
     const ids = [...new Set(recordIds.filter(Boolean))].sort();
     const run = index => index >= ids.length ? task() : withEventLock(ids[index], () => run(index + 1));
     return run(0);
+  }
+  async function withConversationLocks(conversationIds, task) {
+    const ids = [...new Set(conversationIds.filter(Boolean))].sort();
+    const run = index => index >= ids.length ? task() : withConversationLock(ids[index], () => run(index + 1));
+    return run(0);
+  }
+  async function conversationsUsingRecords(recordIds) {
+    const ids = new Set(recordIds);
+    const owners = new Set((await Promise.all(recordIds.map(readEvent))).map(event => event?.source_conversation_id).filter(Boolean));
+    return (await listConversations()).filter(conversation => owners.has(conversation.conversation_id)
+      || conversation.turns.some(turn => turn.role === 'elder' && ids.has(turn.record_id)));
+  }
+  function linkedSourceConflict() {
+    return fail(409, 'conversation_source_changed', {
+      message: '这条原话仍属于一段对话，请在历史对话中删除整段对话，避免报告失去来源。',
+    });
   }
 
   function validLocalDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value); }
@@ -299,12 +317,14 @@
     };
   }
   function unsafeAssistantText(text) {
-    const value = String(text || '').replace(/\s+/g, '')
+    const value = String(text || '').normalize('NFKC').replace(/[\s\u200b-\u200f\ufeff]/g, '')
       .replace(/(?:我|小零)(?:不能|无法)(?:替您|为您)?(?:提供|作出|做出)?(?:诊断、用药或治疗建议|诊断|治疗建议|用药建议)/g, '能力边界')
       .replace(/(?:这份|这些)?(?:报告|记录)(?:不是|不代表)诊断/g, '记录用途')
       .replace(/(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)(?:吃|服|用)(?:过)?药/g, '已核对既往用药')
       .replace(/(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)做(?:过)?(?:任何)?(?:核磁|CT|彩超|B超|化验|检查)/gi, '已核对既往资料');
-    return /诊断|确诊|患有|可能是|考虑为|怀疑是|建议|应该|应当|最好|就医|去医院|看医生|做检查|治疗|处方|剂量|药量|加药|减药|停药|换药|加量|减量|服药|吃药|改药|拨打120/.test(value);
+    const directInstruction = /(?:服用|口服|注射|吃|用)[^，。！？;；!?]{0,12}[0-9一二三四五六七八九十百两半]+(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|(?:增加|减少|增至|减至|调整到|改为)[^，。！？;；!?]{0,8}[0-9一二三四五六七八九十百两半]+(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|(?:建议|应该|应当|最好|可以|需要|请|先|直接|去)[^，。！？;；!?]{0,8}(?:血常规|血生化|心电图|脑电图|胃镜|肠镜|胸片|X光|MRI|CT|核磁|彩超|B超)|(?:您|你|情况|身体|目前|现在)[^，。！？;；!?]{0,8}(?:很安全|没有问题|没事)|没有.{0,3}(?:危险|风险)|(?:不用|无需|不需要|不必).{0,6}(?:就医|去医院|急救|120|看医生)/i;
+    const diagnosis = /(?:您|你)(?:已经)?得了|(?:这是|就是|属于|判断为|表现为)[^，。！？;；!?]{0,16}(?:病|炎|症|癌|感染|梗|卒中|结石)(?=[，。！？;；!?]|$)/;
+    return directInstruction.test(value) || diagnosis.test(value) || /诊断|确诊|患有|可能是|考虑为|怀疑是|建议|应该|应当|最好|就医|去医院|看医生|做检查|治疗|处方|剂量|药量|加药|减药|停药|换药|加量|减量|服药|吃药|改药|拨打120/.test(value);
   }
   async function saveConversation(conversation) {
     const saved = { ...conversation, version: (conversation.version || 0) + 1, updated_at: now() };
@@ -533,6 +553,7 @@
       const children = graph.children.get(recordIds[index]) || [];
       if (children.length !== 1 || children[0] !== expected) return { error: 'revision_chain_conflict' };
     }
+    if ((await conversationsUsingRecords(recordIds)).length) return { error: 'conversation_source_changed' };
     return collectDeletionPlan(recordIds);
   }
   async function createEvent(body, idempotencyKey) {
@@ -545,7 +566,8 @@
       if (replay) return ok(200, { ok: true, created: false, event: await readEvent(replay.record_id) });
     }
     const relatedRecordIds = Array.isArray(body.related_record_ids) ? [...new Set(body.related_record_ids.filter(value => typeof value === 'string' && value.startsWith('rec_')))].slice(-10) : [];
-    const event = { record_id: id('rec'), raw_text: body.raw_text, source_kind: body.source_kind, actor_name: body.actor_name || '本地用户', occurred_time: body.occurred_time || null, recorded_at: now(), updated_at: now(), state: 'inbox', version: 1, local_safety: safety.scanDanger(body.raw_text), draft: null, related_record_ids: relatedRecordIds };
+    const event = { record_id: id('rec'), raw_text: body.raw_text, source_kind: body.source_kind, actor_name: body.actor_name || '本地用户', occurred_time: body.occurred_time || null, recorded_at: now(), updated_at: now(), state: 'inbox', version: 1, local_safety: safety.scanDanger(body.raw_text), draft: null, related_record_ids: relatedRecordIds,
+      ...(body.source_conversation_id ? { source_conversation_id: body.source_conversation_id } : {}) };
     await vault.put(eventKey(event.record_id), event); await saveHistory(event, 'created');
     if (idempotencyKey) await vault.put(`operation:event:${idempotencyKey}`, { record_id: event.record_id });
     return ok(201, { ok: true, created: true, event });
@@ -558,6 +580,18 @@
 
   async function eventRequest(path, options, locked = false) {
     const method = options?.method || 'GET'; const parts = path.split('/').filter(Boolean);
+    if (!locked && method === 'POST' && parts[3] === 'revise') {
+      // Corrections take the same conversation -> event lock order as chat
+      // edits. Never wait for a conversation while already holding its event.
+      const recordId = decodeURIComponent(parts[2]);
+      const linked = await conversationsUsingRecords([recordId]);
+      return withConversationLocks(linked.map(item => item.conversation_id), () =>
+        withEventLock(recordId, async () => {
+          const latest = await conversationsUsingRecords([recordId]);
+          if (latest.some(item => !linked.some(before => before.conversation_id === item.conversation_id))) return linkedSourceConflict();
+          return eventRequest(path, options, true);
+        }));
+    }
     if (!locked && method !== 'GET' && parts[0] === 'api' && parts[1] === 'events' && parts[2] && parts[3] !== 'organize') {
       const recordId = decodeURIComponent(parts[2]);
       return withEventLock(recordId, () => eventRequest(path, options, true));
@@ -570,9 +604,11 @@
     if (parts.length === 3 && method === 'DELETE') {
       if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
       const plan = await eventDeletionPlan(recordId);
+      if (plan.error === 'conversation_source_changed') return linkedSourceConflict();
       if (plan.error) return fail(plan.error === 'event_not_found' ? 404 : 409, plan.error);
       return withMediaLocks(plan.mediaIds, async () => {
         const latest = await eventDeletionPlan(recordId);
+        if (latest.error === 'conversation_source_changed') return linkedSourceConflict();
         if (latest.error) return fail(latest.error === 'event_not_found' ? 404 : 409, latest.error);
         if (latest.mediaIds.some(mediaId => !plan.mediaIds.includes(mediaId))) return fail(409, 'stale_media_links');
         await vault.mutate({ deletes: latest.deletes });
@@ -626,12 +662,33 @@
       const replacement = { ...superseded, record_id: id('rec'), raw_text: body.raw_text, source_kind: event.source_kind === 'document' ? 'document' : body.source_kind || event.source_kind, actor_name: body.actor_name || event.actor_name, recorded_at: now(), updated_at: now(), occurred_time: event.occurred_time, state: 'inbox', version: 1, supersedes_id: event.record_id, local_safety: safety.scanDanger(body.raw_text), draft: null, ai_metadata: null, source_review: null, confirmation_scope: null };
       const supersededHistory = historyDocument(event, 'superseded', body.reason);
       const replacementHistory = historyDocument(replacement, 'created_from_revision', body.reason);
-      await vault.mutate({ puts: [
+      const puts = [
         { key: eventKey(superseded.record_id), value: superseded },
         { key: eventKey(replacement.record_id), value: replacement },
         supersededHistory,
         replacementHistory,
-      ] });
+      ];
+      for (const conversation of await conversationsUsingRecords([recordId])) {
+        const firstIndex = conversation.turns.findIndex(turn => turn.role === 'elder' && turn.record_id === recordId);
+        if (firstIndex < 0) return linkedSourceConflict();
+        const editedAt = now();
+        const turns = conversation.turns.map((turn, index) => {
+          if (turn.role === 'elder' && turn.record_id === recordId) return { ...turn,
+            text: replacement.raw_text, record_id: replacement.record_id, source_kind: replacement.source_kind,
+            is_mock: false, local_safety: replacement.local_safety, version: turn.version + 1, edited_at: editedAt,
+            versions: [...(turn.versions || []), { version: turn.version, text: turn.text,
+              record_id: turn.record_id, replaced_at: editedAt }],
+          };
+          if (index > firstIndex && turn.role === 'assistant') return { ...turn, superseded: true };
+          return turn;
+        });
+        const updated = { ...conversation, turns, version: conversation.version + 1, updated_at: editedAt,
+          controller: openingConversationController(), completeness: null, relevant_health_context: [],
+          last_ai_metadata: null };
+        updated.report = buildConversationReport(updated, conversation.report);
+        puts.push({ key: conversationKey(conversation.conversation_id), value: updated });
+      }
+      await vault.mutate({ puts });
       return ok(201, { ok: true, event: replacement });
     }
     return fail(404, 'not_found');
@@ -716,7 +773,7 @@
     return cloudRequest('/api/ai/conversation-turn', { method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)) });
   }
 
-  async function conversationRequest(path, options, locked = false) {
+  async function conversationRequest(path, options, locked = false, sourceLocked = false) {
     const method = options?.method || 'GET';
     const pathname = path.split('?')[0];
     const parts = pathname.split('/').filter(Boolean);
@@ -724,6 +781,11 @@
       return withConversationLock(parts[2], () => conversationRequest(path, options, true));
     }
     const body = parseBody(options);
+    if (!sourceLocked && method === 'POST' && parts[3] === 'turns' && parts.length === 4 && body.record_id) {
+      // Existing-source linking participates in archive correction/deletion
+      // locks so a new conversation cannot acquire a source midway through it.
+      return withEventLock(body.record_id, () => conversationRequest(path, options, true, true));
+    }
     if (pathname === '/api/conversations' && method === 'GET') {
       const conversations = (await listConversations()).filter(item => item.turns.some(turn => turn.role === 'elder' && !turn.superseded)).map(conversationArchiveView);
       return ok(200, { ok: true, conversations });
@@ -767,6 +829,9 @@
         const result = await withEventLocks([...lockedRecords], async () => {
           const currentComponent = await eventRevisionComponent(recordIds);
           if (currentComponent.recordIds.some(id => !lockedRecords.has(id))) return { retryRecords: currentComponent.recordIds };
+          if ((await conversationsUsingRecords(currentComponent.recordIds)).some(item => item.conversation_id !== conversationId)) {
+            return { error: 'conversation_source_shared' };
+          }
           const initialPlan = await collectDeletionPlan(currentComponent.recordIds, conversationId);
           if (initialPlan.mediaIds.some(id => !lockedMedia.has(id))) return { retryMedia: initialPlan.mediaIds };
           return withMediaLocks([...lockedMedia], async () => {
@@ -786,6 +851,9 @@
           for (const id of result.retryMedia) lockedMedia.add(id);
           continue;
         }
+        if (result.error === 'conversation_source_shared') return fail(409, result.error, {
+          message: '这段对话的原话还被其他对话引用，暂不能删除，以免其他报告失去来源。当前资料未被删除。',
+        });
         if (!result.ok) return fail(409, 'stale_delete_scope');
         return ok(200, { ok: true, deleted: { conversation_id: conversationId, record_count: result.plan.recordIds.length,
           local_media_count: result.plan.mediaIds.length, pending_upload_count: result.plan.uploadIds.length, encrypted_backups_unchanged: true } });
@@ -840,6 +908,7 @@
       if (Number(body.expected_version) !== conversation.version) return fail(409, 'stale_conversation');
       let event;
       if (body.record_id) event = await readEvent(body.record_id);
+      if (body.record_id && !event) return fail(409, 'conversation_source_invalid');
       if (event && (!['elder', 'audio_transcript'].includes(event.source_kind) || event.raw_text !== text || event.state === 'superseded')) return fail(409, 'conversation_source_invalid');
       if (!event) {
         const created = await createEvent({ raw_text: text, source_kind: body.source_kind === 'audio_transcript' ? 'audio_transcript' : 'elder', actor_name: '老人', related_record_ids: elderTurns(conversation).map(turn => turn.record_id).filter(Boolean).slice(-10) }, `conversation-event:${operationKey}`);
@@ -880,22 +949,6 @@
       if (Number(body.expected_version) !== current.version) return fail(409, 'stale_version');
       if (Number(body.expected_conversation_version) !== conversation.version) return fail(409, 'stale_conversation');
       const revisedSafety = safety.scanDanger(text);
-      if (current.record_id) {
-        const event = await readEvent(current.record_id);
-        if (event && event.raw_text !== text) {
-          await saveHistory(event, 'conversation_turn_corrected', '聊天原话已由使用者修改');
-          await vault.put(eventKey(event.record_id), {
-            ...event,
-            raw_text: text,
-            updated_at: now(),
-            version: event.version + 1,
-            state: 'inbox',
-            local_safety: revisedSafety,
-            draft: null,
-            ai_metadata: null,
-          });
-        }
-      }
       const turns = conversation.turns.map((turn, turnIndex) => {
         if (turnIndex === index) return { ...turn, text, is_mock: false, local_safety: revisedSafety, version: turn.version + 1, edited_at: now(), versions: [...(turn.versions || []), { version: turn.version, text: turn.text, replaced_at: now() }] };
         if (turnIndex > index && turn.role === 'assistant') return { ...turn, superseded: true };
@@ -903,7 +956,31 @@
       });
       const edited = { ...conversation, turns, controller: openingConversationController(), completeness: null, relevant_health_context: [] };
       edited.report = buildConversationReport(edited, conversation.report);
-      conversation = await saveConversation(edited);
+      const persistCorrection = async () => {
+        const puts = [];
+        if (current.record_id) {
+          // Chat corrections and archive edits/deletion share the event lock.
+          // Re-read after taking it rather than reviving a deleted/superseded
+          // source or overwriting a correction made on the archive page.
+          const event = await readEvent(current.record_id);
+          if (!event || event.state === 'superseded' || event.raw_text !== current.text) return fail(409, 'conversation_source_changed');
+          if (event.raw_text !== text) {
+            puts.push(historyDocument(event, 'conversation_turn_corrected', '聊天原话已由使用者修改'));
+            puts.push({ key: eventKey(event.record_id), value: { ...event,
+              raw_text: text, updated_at: now(), version: event.version + 1,
+              state: 'inbox', local_safety: revisedSafety, draft: null, ai_metadata: null } });
+          }
+        }
+        const saved = { ...edited, version: conversation.version + 1, updated_at: now() };
+        puts.push({ key: conversationKey(conversationId), value: saved });
+        // Both representations and the history commit together, including when
+        // IndexedDB runs out of space or the page closes during a correction.
+        await vault.mutate({ puts });
+        return ok(200, { conversation: saved });
+      };
+      const persisted = current.record_id ? await withEventLock(current.record_id, persistCorrection) : await persistCorrection();
+      if (!persisted.r.ok) return persisted;
+      conversation = persisted.j.conversation;
       const result = await conversationReply(conversation);
       conversation = await appendAssistantResult(conversation, result);
       return ok(200, { ok: true, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation });
@@ -1035,6 +1112,7 @@
   }
 
   async function processRecognition(media) {
+    pendingLocalOperations += 1;
     try {
       const original = await vault.get(mediaBinaryKey(media.media_id));
       if (!original?.bytes) throw Object.assign(new Error('original_unavailable'), { code: 'original_unavailable' });
@@ -1051,16 +1129,20 @@
           conversation = await vault.get(conversationKey(media.conversation_id));
           if (!conversation) return;
         }
-        const created = await createEvent({ raw_text: result.j.recognition.text, source_kind: media.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户' }, `media-real-link:${media.media_id}`);
+        const created = await createEvent({ raw_text: result.j.recognition.text, source_kind: media.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户',
+          ...(media.temporary === true && media.conversation_id ? { source_conversation_id: media.conversation_id } : {}) }, `media-real-link:${media.media_id}`);
         if (!created.r.ok) throw Object.assign(new Error(created.j.error), { code: created.j.error });
         let updated = { ...current, recognition_status: 'succeeded', recognition: result.j.recognition, local_safety: created.j.event.local_safety, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', link_pending_reason: media.temporary === true && media.conversation_id ? 'conversation_link_pending' : null, conversation_link_error: null, version: current.version + 1, updated_at: now() };
         await vault.put(mediaKey(media.media_id), updated);
         if (updated.temporary === true && updated.conversation_id) {
+          // This internal source is already owned by the conversation lock.
+          // Its local owner pointer makes archive mutations take that lock too;
+          // avoid taking event after media, which would invert delete's order.
           const linked = await conversationRequest(`/api/conversations/${updated.conversation_id}/turns`, {
             method: 'POST',
             headers: { 'Idempotency-Key': `media-conversation:${updated.media_id}` },
             body: JSON.stringify({ text: result.j.recognition.text, source_kind: 'audio_transcript', record_id: created.j.event.record_id, media_id: updated.media_id, expected_version: conversation.version, keep_media_until_pause: true }),
-          }, true);
+          }, true, true);
           if (linked.r.ok && linked.j.turn_id) {
             updated = { ...updated, conversation_turn_id: linked.j.turn_id, version: updated.version + 1, updated_at: now() };
           } else updated = { ...updated, conversation_link_error: linked.j.error || 'conversation_link_failed' };
@@ -1069,6 +1151,10 @@
         }
       });
     } catch (error) {
+      if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
+        active = false; initialisePromise = null;
+        return;
+      }
       await withRecognitionLocks(media, async () => {
         const current = await vault.get(mediaKey(media.media_id));
         if (!current || current.version !== media.version || current.recognition_status !== 'processing') return;
@@ -1080,7 +1166,7 @@
         const updated = { ...current, recognition_status: 'failed', recognition: { error_message: message, error: { code: error.code || 'recognition_failed', retryable }, retryable }, version: current.version + 1, updated_at: now() };
         await vault.put(mediaKey(media.media_id), updated);
       });
-    }
+    } finally { pendingLocalOperations -= 1; }
   }
 
   async function withRecognitionLocks(media, task) {
@@ -1089,8 +1175,11 @@
   }
 
   async function request(path, options = {}) {
+    let counted = false;
     try {
       await initialise();
+      if (restoringBackup) return fail(409, 'vault_restore_in_progress');
+      pendingLocalOperations += 1; counted = true;
       if (path === '/api/health-context' && (options.method || 'GET') === 'GET') {
         return ok(200, { ok: true, health_context: await healthContext() });
       }
@@ -1136,7 +1225,13 @@
       if (path.startsWith('/api/events')) return await eventRequest(path, options);
       if (path.startsWith('/api/media')) return await mediaRequest(path, options);
       return fail(404, 'not_found');
-    } catch (error) { return fail(400, error.message || 'local_request_failed'); }
+    } catch (error) {
+      if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
+        active = false; initialisePromise = null;
+        return fail(409, error.message);
+      }
+      return fail(400, error.message || 'local_request_failed');
+    } finally { if (counted) pendingLocalOperations -= 1; }
   }
 
   async function originalObjectUrl(mediaId) {
@@ -1164,14 +1259,23 @@
 
   async function restoreBackup(preview, passphrase) {
     if (!preview?.archive) throw new Error('backup_not_previewed');
-    return vault.restoreArchive(preview.archive, passphrase);
+    await initialise();
+    // Restoring replaces the complete vault. A still-running reply/recognition
+    // must finish before replacement, and new operations cannot start midway.
+    if (restoringBackup || pendingLocalOperations) throw new Error('local_operations_busy');
+    restoringBackup = true;
+    try { return await vault.restoreArchive(preview.archive, passphrase); }
+    finally { restoringBackup = false; }
   }
 
   async function saveFeedback(description, page) {
     await initialise();
+    if (restoringBackup) throw new Error('vault_restore_in_progress');
     if (typeof description !== 'string' || !description.trim() || description.length > 2000) throw new Error('feedback_invalid');
     const feedback = { feedback_id: id('feedback'), description: description.trim(), page: String(page || location.hash || 'home').slice(0, 120), occurred_at: now(), includes_health_content: false, status: 'saved_on_device' };
-    await vault.put(`feedback:${feedback.feedback_id}`, feedback); return feedback;
+    pendingLocalOperations += 1;
+    try { await vault.put(`feedback:${feedback.feedback_id}`, feedback); return feedback; }
+    finally { pendingLocalOperations -= 1; }
   }
 
   async function storageStatus() {

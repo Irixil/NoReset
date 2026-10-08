@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 import uuid
 from typing import Any
 
@@ -114,10 +115,23 @@ _PATTERNS = {
 }
 _QUESTION_SCOPE = re.compile(r"哪里|哪儿|部位|感觉|怎么|什么时候|多久|开始|变化|后来|突然|逐渐|加重|减轻|反复|程度|影响|走|站|起|拿|抬|吃|睡|活动|发生|之前|前后|还有|伴随|同时|以前|类似|用药|过敏|手术|住院|量过|测过|做过|结果|资料|报告")
 _UNSAFE_REPLY = re.compile(
+    r"诊断为|确诊为|患有|(?:您|你)(?:已经)?得了|"
+    r"(?:这是|就是|属于|判断为|表现为)[^，。！？;；!?]{0,16}(?:病|炎|症|癌|感染|梗|卒中|结石)(?=[，。！？;；!?]|$)|"
     r"(?:可能|考虑|怀疑|应当|应该|建议|最好).{0,12}(?:是|病|炎|癌|症|就医|检查|治疗|服用|用药)|"
     r"(?:建议|应该|应当|最好|可以|需要|请|先|自行|直接).{0,8}(?:吃药|服药|用药|做(?:核磁|CT|彩超|B超|化验|检查))|"
     r"加药|减药|停药|换药|加量|减量|改药|处方|剂量|药量|治疗方案|"
     r"去医院|去急诊|拨打\s*120|做(?:核磁|CT|彩超|B超|化验|检查)",
+    re.IGNORECASE,
+)
+_DIRECT_MEDICAL_INSTRUCTION = re.compile(
+    r"(?:服用|口服|注射|吃|用)[^，。！？;；!?]{0,12}[0-9一二三四五六七八九十百两半]+"
+    r"(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|"
+    r"(?:增加|减少|增至|减至|调整到|改为)[^，。！？;；!?]{0,8}[0-9一二三四五六七八九十百两半]+"
+    r"(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|"
+    r"(?:建议|应该|应当|最好|可以|需要|请|先|直接|去)[^，。！？;；!?]{0,8}"
+    r"(?:血常规|血生化|心电图|脑电图|胃镜|肠镜|胸片|X光|MRI|CT|核磁|彩超|B超)|"
+    r"(?:您|你|情况|身体|目前|现在)[^，。！？;；!?]{0,8}(?:很安全|没有问题|没事)|"
+    r"没有.{0,3}(?:危险|风险)|(?:不用|无需|不需要|不必).{0,6}(?:就医|去医院|急救|120|看医生)",
     re.IGNORECASE,
 )
 _NON_HEALTH_ACTION = re.compile(r"银行卡|支付|付款|转账|密码|验证码|身份证|手机号|下载|打开链接|点击链接|扫码")
@@ -126,8 +140,10 @@ _CONTEXT_CATEGORIES = {"conditions", "medications", "allergies", "procedures", "
 
 def _unsafe_reply(text: str) -> bool:
     """Allow recording past facts while still blocking new medical advice."""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\s\u200b-\u200f\ufeff]", "", text)
     factual = re.sub(
-        r"(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)?做(?:过)?(?:核磁|CT|彩超|B超|化验|检查)",
+        r"(?:(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)做(?:过)?|做过)(?:核磁|CT|彩超|B超|化验|检查)",
         "已核对既往资料",
         text,
         flags=re.IGNORECASE,
@@ -137,7 +153,7 @@ def _unsafe_reply(text: str) -> bool:
         "已核对既往用药",
         factual,
     )
-    return bool(_UNSAFE_REPLY.search(factual))
+    return bool(_UNSAFE_REPLY.search(factual) or _DIRECT_MEDICAL_INSTRUCTION.search(factual))
 
 
 class ConversationError(RuntimeError):
@@ -309,7 +325,8 @@ def _source_summary(
 
 def _ground_clinical_state(
         state: dict[str, dict[str, Any]], turns: list[dict[str, Any]],
-        health_context: list[dict[str, str]], controller: dict[str, Any]) -> None:
+        health_context: list[dict[str, str]], controller: dict[str, Any],
+        model_intent: str) -> None:
     """Only raw words that actually answer a category may close that category."""
     turn_text = {row["turn_id"]: row["text"] for row in turns}
     latest = turns[-1]
@@ -349,11 +366,26 @@ def _ground_clinical_state(
             continue
 
         if item["status"] == "known":
+            # A source-checked model may identify a complaint outside the
+            # legacy keyword inventory. Preserve only its complete literal
+            # source, never an inferred medical meaning or an unsourced recap.
+            literal_complaint_refs = []
+            if category == "main_complaint" and model_intent in {"health_fact", "answer", "correction"}:
+                literal_complaint_refs = [
+                    ref for ref in refs
+                    if item["summary"] == turn_text[ref].strip()
+                    and not _source_excerpt(turn_text[ref], category)
+                    and not _META_FEEDBACK.search(turn_text[ref])
+                    and not _DIAGNOSIS_REQUEST.search(turn_text[ref])
+                    and not _DECLINED.search(turn_text[ref])
+                    and not _EXPLICIT_FINISH.fullmatch(turn_text[ref].strip())
+                    and not re.search(r"[？?]", turn_text[ref])
+                ]
             grounded_refs = [
                 ref for ref in refs
                 if not _META_FEEDBACK.search(turn_text[ref])
                 and _source_excerpt(turn_text[ref], category)
-            ]
+            ] + literal_complaint_refs
             if category == "main_complaint":
                 grounded_refs = _current_main_complaint_refs(grounded_refs, turns)
             if (
@@ -369,6 +401,8 @@ def _ground_clinical_state(
                 state[category] = {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
                 continue
             summary = _source_summary(grounded_refs, contexts, turns, health_context, category=category)
+            if not summary and literal_complaint_refs:
+                summary = turn_text[literal_complaint_refs[0]].strip()
             state[category] = {
                 "status": "known",
                 "summary": summary,
@@ -645,7 +679,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         return _result(started=started, provider_name=provider_name, model_id=model_id, action="reply", assistant_text=MODEL_OUTPUT_BLOCKED_TEXT, question_category=None, stop_reason="model_output_blocked", controller=controller, clinical_state=fallback["clinical_state"], safety=safety)
 
     clinical_state = assessment["clinical_state"]
-    _ground_clinical_state(clinical_state, turns, health_context, controller)
+    _ground_clinical_state(clinical_state, turns, health_context, controller, assessment["user_intent"])
     _merge_obvious_facts(clinical_state, turns)
     latest_normalised = _normalise_text(latest)
     earlier = {_normalise_text(row["text"]) for row in turns[:-1]}
@@ -687,7 +721,8 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         eligible = [category for category in CATEGORIES if (clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and category not in controller["closed_categories"] and controller["question_counts"].get(category, 0) < 2]
         candidate = assessment["candidate_question"]
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
-        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions:
+        fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
+        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions:
             next_category = proposed
             assistant_text = _response_text(reply, candidate)
             if _unsafe_reply(assistant_text) or _NON_HEALTH_ACTION.search(assistant_text):

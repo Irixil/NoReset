@@ -532,6 +532,28 @@ test('safe scope explanation survives frontend checks but advice after a disclai
   assert.equal(c.turns.at(-1).ai_failed, true);
 });
 
+test('a record explanation that mentions 病历 is not mistaken for a disease conclusion', async () => {
+  const h = await harness();
+  const text = '这是病历记录，用来说明您已经说过的情况。';
+  h.setResponse('/api/ai/conversation-turn', { action: 'reply', assistant_text: text });
+  const c = await h.say(await h.start(), '虚构记录：昨天膝部酸');
+  assert.equal(c.turns.at(-1).text, text);
+  assert.notEqual(c.last_ai_metadata.ai_failed, true);
+});
+
+for (const text of [
+  '您得了肺炎。', '这是肺炎。', '诊断为关节炎。', '您患有糖尿病。',
+  '每天服用两片阿司匹林。', '把胰岛素增加到十单位。', '先去做血常规。',
+  '您的情况很安全，没有问题。', '请做CT检查。', '每天服用 2 mg 阿司匹林。',
+]) test(`frontend rejects out-of-bound model reply: ${text}`, async () => {
+  const h = await harness();
+  h.setResponse('/api/ai/conversation-turn', { action: 'reply', assistant_text: text });
+  const c = await h.say(await h.start(), '虚构测试：左膝酸');
+  assert.equal(c.turns.at(-1).ai_failed, true);
+  assert.notEqual(c.turns.at(-1).text, text);
+  assert.match(c.report.body, /左膝酸/);
+});
+
 test('a recognition interrupted by closing the page becomes retryable instead of staying processing forever', async () => {
   const h = await harness(), c = await h.start(), media = await savedAudio(h, c);
   await h.api.vault.put('media:' + media.media_id, { ...media, recognition_status: 'processing', updated_at: new Date(Date.now() - 130000).toISOString() });

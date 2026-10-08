@@ -115,7 +115,7 @@ async function mediaRequest(path,opt){
   const x=await api(path,opt);
   if(!x.r.ok){
     const error=new Error(x.r.status===0?'连接中断，请重试，原文件和重试信息保留':x.j.error==='media_mock_unavailable'?'识别服务尚未接通；原件已保存，可直接打字记录。':readableMediaError(x.j.message||x.j.error));
-    error.code=x.j.error||'';error.retryable=x.j.retryable===true;throw error;
+    error.code=x.j.error||'';error.status=x.r.status;error.retryable=x.j.retryable===true;throw error;
   }
   return x.j;
 }
@@ -189,17 +189,25 @@ async function uploadMedia(file,kind,{temporary=false,conversationId=null}={}){
     if(!(kind==='audio'?c.audio_content_types:c.image_content_types).includes(type))throw new Error('当前服务不支持该文件格式，请保留原件并换用支持的格式');
     if(!file.size||file.size>c.max_total_bytes)throw new Error('文件为空或超过当前实例的资源保护边界');
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await readBlobBytes(file))),v=>v.toString(16).padStart(2,'0')).join('');
-    const jobKey=`elder_media_upload_v1:${kind}:${hash}:${type}:${temporary?'temporary':'retained'}`;
+    const jobKey=`elder_media_upload_v2:${kind}:${hash}:${type}:${temporary?'temporary':'retained'}:${conversationId||'standalone'}`;
     let job;if(globalThis.HealthLocal?.active)job=localMediaJobs.get(jobKey);else try{job=JSON.parse(localStorage.getItem(jobKey)||'null')}catch{}
+    if(job?.mediaId){
+      try{
+        const {media}=await mediaRequest('/api/media/'+job.mediaId);
+        if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体');await loadMedia();return media;}
+      }catch(error){
+        if(error.status!==404)throw error;
+        // Deletion, successful temporary-audio cleanup or backup restore can
+        // remove an earlier upload. A new user upload gets a fresh identity.
+        if(globalThis.HealthLocal?.active)localMediaJobs.delete(jobKey);else localStorage.removeItem(jobKey);
+        job=null;
+      }
+    }
     if(!job){
       const chunkSize=c.max_part_bytes,total=Math.ceil(file.size/chunkSize);
       if(total>c.max_parts)throw new Error('文件分片数量超过当前实例边界');
       job={key:crypto.randomUUID(),chunkSize,metadata:{kind,content_type:type,total_parts:String(total),expected_size:String(file.size),expected_sha256:hash,original_filename:file.name||`recording.${type.split('/')[1]}`,actor_name:'老人',temporary:String(temporary===true),conversation_id:conversationId||''}};
       if(globalThis.HealthLocal?.active)localMediaJobs.set(jobKey,job);else localStorage.setItem(jobKey,JSON.stringify(job));
-    }
-    if(job.mediaId){
-      const {media}=await mediaRequest('/api/media/'+job.mediaId);
-      if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体');await loadMedia();return media;}
     }
     mediaMessage('正在创建上传，原件尚未保存完整');
     const form=new FormData();Object.entries(job.metadata).forEach(([k,v])=>form.append(k,v));
