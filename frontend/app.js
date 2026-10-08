@@ -302,11 +302,15 @@ function reportSectionsHtml(report){
 function reportFactHtml(line,index){
   if(typeof line==='string')return `<div class="report-fact report-fact-check"><p>${escapeHtml(line)}</p></div>`;
   const tags=(line?.tags||[]).map(tag=>`<span>${escapeHtml(tag)}</span>`).join('');
-  const source=line?.source_label?`<small>${escapeHtml(line.source_label)}</small>`:'';
+  const sourceVersions=(Array.isArray(line?.source_versions)?line.source_versions:[]).filter(source=>Array.isArray(line?.source_turn_ids)&&typeof source?.turn_id==='string'&&source.turn_id.trim()&&line.source_turn_ids.includes(source.turn_id)&&Number.isSafeInteger(source.version)&&source.version>0&&typeof source.quote==='string'&&source.quote.trim());
+  const sourceVersionLabel=source=>`原话第 ${source.version} 版${source.version>1?' · 已修订':''}`;
+  const versionLabels=sourceVersions.map(source=>`<span class="report-source-version">${escapeHtml(sourceVersionLabel(source))}</span>`).join('');
+  const source=line?.source_label||versionLabels?`<small>${line?.source_label?`<span>${escapeHtml(line.source_label)}</span>`:''}${versionLabels}</small>`:'';
+  const evidence=sourceVersions.map(source=>`<details class="report-source-evidence" data-source-turn-id="${escapeHtml(source.turn_id)}"><summary>查看对应原话（${escapeHtml(sourceVersionLabel(source))}）</summary><blockquote>${escapeHtml(source.quote)}</blockquote></details>`).join('');
   const kind=['quote','context','alert','check'].includes(line?.kind)?line.kind:'check';
   const text=escapeHtml(line?.text||'');
   const content=kind==='quote'?`<blockquote>${text}</blockquote>`:`<p>${text}</p>`;
-  return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}</article>`;
+  return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}${evidence}</article>`;
 }
 function syncConversation(conversation,{speak=true}={}){
   if(pendingMediaRetry&&pendingMediaRetry.conversation_id!==conversation?.conversation_id)pendingMediaRetry=null;

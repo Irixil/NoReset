@@ -625,6 +625,10 @@ main { width: 100%; padding: 0 20px; }
 .report-fact + .report-fact { padding-top: 18px; border-top: 1px dashed var(--line); }
 .report-fact-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
 .report-fact-head small { flex: none; color: var(--muted); font-size: 14px; }
+.report-source-version { display: block; }
+.report-source-evidence { margin-top: 8px; }
+.report-source-evidence summary { min-height: 44px; display: flex; align-items: center; color: var(--primary-dark); cursor: pointer; }
+.report-source-evidence blockquote { white-space: pre-wrap; }
 .report-fact-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .report-fact-tags span { padding: 3px 8px; border-radius: 999px; color: var(--primary-dark); background: var(--primary-soft); font-size: 14px; font-weight: 750; line-height: 1.45; }
 .report-fact blockquote,

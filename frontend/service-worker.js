@@ -1,4 +1,4 @@
-const CACHE = 'bingli-beta-shell-v52-text-replay';
+const CACHE = 'bingli-beta-shell-v53-source-version';
 const CACHE_PREFIX = 'bingli-beta-shell-';
 const SHELL = ['/', '/styles.css', '/ios.css', '/splash.css', '/runtime-config.js', '/config.js', '/local-store-core.js', '/safety.js', '/local-store.js', '/app.js', '/media.js', '/splash.js', '/assets/brand-mascot.png', '/manifest.webmanifest'];
 const SHELL_PATHS = new Set(SHELL);
