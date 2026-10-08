@@ -235,10 +235,11 @@ export type AppConfigResponse = {
   mode: "local_first";
   access_configured: boolean;
   cloud_backup_configured: boolean;
-  product_name: "病历不归零·内测版";
+  product_name: "NoReset·内测版";
   data_location: "this_device";
   backup_mode: "encrypted_archive";
   provider: string;
+  reviewed_risk_rules: ReviewedRiskManifest;
   capabilities: {
     text_ai: ConfiguredCapability;
     audio_recognition: ConfiguredCapability;
@@ -249,7 +250,26 @@ export type AppConfigResponse = {
 // Mock is unavailable. True is configuration readiness only, not connectivity or quality.
 export type ConfiguredCapability = { available: boolean; reason: string };
 
-export type ConversationAction = "ask" | "reply" | "finish" | "urgent";
+export type ConversationAction = "ask" | "reply" | "finish" | "urgent" | "soon_evaluation";
+
+export type ReviewedRiskLevel = "soon_evaluation" | "urgent";
+export type ReviewedRiskManifest = {
+  contract_version: "reviewed-risk-candidates-v1";
+  rule_set_version: string;
+  status: "no_approved_rules" | "reviewed_rules_loaded";
+  clinical_validation: "not_completed" | "synthetic_fixture_only" | "clinical_review_metadata_present";
+  config_sha256: string | null;
+  rules: { rule_id: string; version: string; level: ReviewedRiskLevel }[];
+};
+
+export type ReviewedRiskSource = { turn_id: string; version: number; quote: string };
+export type ReviewedRiskAssessment = Omit<ReviewedRiskManifest, "rules"> & {
+  level: "none" | ReviewedRiskLevel;
+  notice: string | null;
+  matched_rules: { rule_id: string; version: string; level: ReviewedRiskLevel; evidence: ReviewedRiskSource[] }[];
+  sources: ReviewedRiskSource[];
+  rejected_candidates: number;
+};
 
 export type ConversationModelTurn = {
   turn_id: string;

@@ -255,6 +255,11 @@ def test_app_config_reports_mock_and_missing_recognition_configuration(monkeypat
         config = HttpClient(base_url).request("GET", "/api/app/config")
         assert config.status == 200
         assert config.body["provider"] == "mock"
+        risk = config.body["reviewed_risk_rules"]
+        assert risk["contract_version"] == "reviewed-risk-candidates-v1"
+        assert risk["status"] == "no_approved_rules"
+        assert risk["clinical_validation"] == "not_completed"
+        assert risk["rules"] == []
         assert config.body["capabilities"]["text_ai"] == {"available": False, "reason": "provider_mock"}
         assert config.body["capabilities"]["audio_recognition"] == {
             "available": False, "reason": "provider_not_configured",

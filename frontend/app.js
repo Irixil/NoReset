@@ -132,7 +132,7 @@ function safetyHtml(s){
   if(s?.clinical_review_required)html+=`<p class="status error">${escapeHtml(s.clinical_review_notice||'这条记录需要专业人员复核，记录核对不能消除待办。')}</p>`;
   return html;
 }
-function safetyBanner(s){const b=$('dangerBanner');if(!b)return;if(s?.danger_detected){b.innerHTML=`<b>需要及时关注</b><br>${escapeHtml(s.danger_reminder||'记录中出现需要尽快请专业人员判断的描述，请联系当地急救服务或专业人员。')}`;b.classList.remove('hidden')}else b.classList.add('hidden')}
+function safetyBanner(s){const b=$('dangerBanner');if(!b)return;if(s?.danger_detected||s?.reviewed_risk_notice){b.innerHTML=`<b>${s?.reviewed_risk_level==='soon_evaluation'?'需要尽快评估':'需要及时关注'}</b><br>${escapeHtml(s.reviewed_risk_notice||s.danger_reminder||'记录中出现需要尽快请专业人员判断的描述，请联系当地急救服务或专业人员。')}`;b.classList.remove('hidden')}else b.classList.add('hidden')}
 function stateLabel(s){return ({inbox:'已保存，待整理',draft:'整理草稿，待核对',needs_review:'退回待整理',recorded:'已核对记录准确',superseded:'旧版本'})[s]||'状态待确认'}
 const EVENT_KIND_LABELS={symptom:'症状记录',measurement:'指标记录',medication:'用药记录',instruction:'医嘱或建议',document:'资料记录',question:'待核对问题',handoff:'交接记录',other:'其他记录'};
 const REVIEW_ROLE_LABELS={none:'暂未指定',family:'家属或照护者',clinician_or_pharmacist:'医生、护士或药师',emergency_services:'急救服务或专业人员'};
@@ -254,7 +254,7 @@ function voiceTurnHtml(turn){
     if(assistant){
       if(!mock&&canRetry)content+='<div class="chat-inline-actions"><button type="button" data-voice-retry>重试小零回复</button></div>';
       else if(!mock&&!turn.ai_failed)content+=`<div class="chat-inline-actions"><button type="button" data-voice-replay>再听一遍</button></div>`;
-      if(turn.action==='urgent'&&!turn.ai_failed)content+='<small>固定安全提醒 · 不包含诊断或用药建议</small>';
+      if(['urgent','soon_evaluation'].includes(turn.action)&&!turn.ai_failed)content+='<small>固定安全提醒 · 不包含诊断或用药建议</small>';
     }else{
       const source=mock?'模拟识别结果（非患者原话）':turn.source_kind==='audio_transcript'?'语音已转成文字':'已加密保存在本机';
       content+=`<small>${escapeHtml(source)}${turn.version>1?` · 已修改，第 ${turn.version} 版`:''}</small>${mock?'':'<button class="chat-edit-link" type="button" data-voice-turn-edit>修改</button>'}`;
@@ -652,7 +652,9 @@ function conversationTranscriptTurnHtml(turn){
 }
 function conversationSafety(conversation){
   const elderTurns=elderArchiveTurns(conversation).filter(turn=>!isMockContent(turn)),danger=elderTurns.find(turn=>turn.local_safety?.danger_detected),review=elderTurns.find(turn=>turn.local_safety?.clinical_review_required);
-  return {danger_detected:Boolean(danger),danger_reminder:danger?.local_safety?.danger_reminder,clinical_review_required:Boolean(review),clinical_review_notice:review?.local_safety?.clinical_review_notice};
+  const reviewedRisks=(conversation.report?.reviewed_risk_assessments||[]).filter(assessment=>globalThis.HealthSafety?.reviewedRiskSourcesCurrent(assessment,elderTurns));
+  const reviewedRisk=reviewedRisks.find(assessment=>assessment.level==='urgent')||reviewedRisks.find(assessment=>assessment.level==='soon_evaluation');
+  return {danger_detected:Boolean(danger),danger_reminder:danger?.local_safety?.danger_reminder,clinical_review_required:Boolean(review),clinical_review_notice:review?.local_safety?.clinical_review_notice,reviewed_risk_level:reviewedRisk?.level,reviewed_risk_notice:reviewedRisk?.notice};
 }
 function conversationDetailHtml(conversation){
   const turns=liveArchiveTurns(conversation),elderTurns=elderArchiveTurns(conversation),elderCount=elderTurns.filter(turn=>!isMockContent(turn)).length,hasMock=elderTurns.some(isMockContent),date=conversationDateLabel(conversation);

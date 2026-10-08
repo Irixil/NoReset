@@ -16,13 +16,13 @@ from typing import Any
 
 try:
     from .adapter import MockProvider, provider_from
-    from .safety import DANGER_REMINDER, scan_danger
+    from .safety import DANGER_REMINDER, scan_danger, load_reviewed_risk_rules, evaluate_reviewed_risk, RISK_CONTRACT_VERSION
 except ImportError:
     from adapter import MockProvider, provider_from
-    from safety import DANGER_REMINDER, scan_danger
+    from safety import DANGER_REMINDER, scan_danger, load_reviewed_risk_rules, evaluate_reviewed_risk, RISK_CONTRACT_VERSION
 
 
-PROMPT_VERSION = "clinical-intake-v7"
+PROMPT_VERSION = "clinical-intake-v8-risk-candidates"
 CATEGORIES = (
     "main_complaint", "onset_course", "symptom_character",
     "aggravating_relieving", "associated_symptoms", "functional_impact",
@@ -86,6 +86,7 @@ SYSTEM_PROMPT = """你是“NoReset”的健康对话助手，负责理解患者
 - known/unknown/declined 必须至少有一个真实 turn_id 或 context_id；missing/not_applicable 不得伪造来源；
 - unknowns 和 contradictions 的每项结构为 {"text":"……","evidence_turn_ids":[],"context_ids":[]} 且至少有一个来源；
 - summary、unknowns、contradictions 都必须是客观事实表达，不得包含推测或建议。known summary 尽量简短；unknowns.text 应对应来源中明确表达“不知道/不记得/不想说”的原话，不能把信息缺口改写成患者事实。"""
+SYSTEM_PROMPT += """\n风险合同 reviewed-risk-candidates-v1：新增 risk_candidates 数组。只从程序提供的 approved_risk_rules 选择编号和版本；目录为空时必须返回 []。每项严格为 {"rule_id":"目录编号","rule_version":"目录版本","evidence":[{"turn_id":"真实患者回合编号","version":1,"quote":"该版本回合完整原话"}]}，最多8项。证据必须是当前患者回合全文与当前version，不能剪裁否定或历史词，不能引用助手问题，也不能只引用health_context。缺省version为1。模型不得输出等级、提醒、诊断或检查建议，最终判断和固定文案由本地审核规则决定。"""
 PROMPT_SHA256 = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 
 _TURN_ID = re.compile(r"^turn_[A-Za-z0-9_-]{8,100}$")
@@ -181,7 +182,10 @@ def _clean_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
             raise ConversationError("turn_id_invalid")
         if not isinstance(text, str) or not text.strip() or len(text) > 10000:
             raise ConversationError("turn_text_invalid")
-        turn: dict[str, Any] = {"turn_id": turn_id, "text": text.strip()}
+        version = row.get("version", 1)
+        if type(version) is not int or version < 1:
+            raise ConversationError("turn_version_invalid")
+        turn: dict[str, Any] = {"turn_id": turn_id, "text": text.strip(), "version": version}
         responding_to = row.get("responding_to")
         if responding_to is not None:
             if not isinstance(responding_to, dict) or set(responding_to) != {"turn_id", "text"}:
@@ -493,7 +497,7 @@ def _clean_notes(value: Any, known_turns: set[str], known_context: set[str], *, 
 
 def _validate_assessment(value: Any, turns: list[dict[str, Any]], health_context: list[dict[str, str]]) -> dict[str, Any]:
     required = {"user_intent", "latest_turn_adds_fact", "suggested_action", "question_category", "question_importance", "candidate_question", "clinical_state", "relevant_context_ids", "unknowns", "contradictions"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"reply_text"} or not isinstance(value.get("clinical_state"), dict) or set(value["clinical_state"]) != set(CATEGORIES):
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"reply_text", "risk_candidates"} or not isinstance(value.get("clinical_state"), dict) or set(value["clinical_state"]) != set(CATEGORIES):
         raise ConversationError("model_schema_invalid", "model_schema_invalid")
     known_turns = {row["turn_id"] for row in turns}
     known_context = {row["context_id"] for row in health_context}
@@ -548,6 +552,7 @@ def _validate_assessment(value: Any, turns: list[dict[str, Any]], health_context
         "relevant_context_ids": list(dict.fromkeys(relevant)),
         "unknowns": _clean_notes(value.get("unknowns"), known_turns, known_context, require_evidence=False),
         "contradictions": _clean_notes(value.get("contradictions"), known_turns, known_context),
+        "risk_candidates": value.get("risk_candidates", []),
     }
 
 
@@ -630,7 +635,8 @@ def _result(*, started: float, provider_name: str, model_id: str, action: str, a
             question_category: str | None, stop_reason: str | None, controller: dict[str, Any],
             clinical_state: dict[str, dict[str, Any]], safety: dict[str, Any], model_intent: str | None = None,
             relevant_context_ids: list[str] | None = None, unknowns: list[dict[str, Any]] | None = None,
-            contradictions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            contradictions: list[dict[str, Any]] | None = None,
+            risk_assessment: dict[str, Any] | None = None) -> dict[str, Any]:
     completeness = {
         "complete": all(clinical_state[item]["status"] in {"known", "declined"} for item in CLOSURE_CATEGORIES),
         "clinical_state": clinical_state,
@@ -643,8 +649,10 @@ def _result(*, started: float, provider_name: str, model_id: str, action: str, a
         "latency_ms": round((time.perf_counter() - started) * 1000, 2), "action": action,
         "assistant_text": assistant_text, "question_category": question_category, "stop_reason": stop_reason,
         "controller": controller, "completeness": completeness, "model_intent": model_intent,
-        "risk_level": "urgent" if safety.get("danger_detected") else "needs_review" if safety.get("clinical_review_required") else "routine",
+        "risk_level": risk_assessment["level"] if risk_assessment and risk_assessment["level"] in {"soon_evaluation", "urgent"} else "urgent" if safety.get("danger_detected") else "needs_review" if safety.get("clinical_review_required") else "routine",
         "local_safety": safety,
+        "risk_contract_version": RISK_CONTRACT_VERSION,
+        "risk_assessment": risk_assessment if risk_assessment is not None else evaluate_reviewed_risk([], []),
     }
 
 
@@ -656,6 +664,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     controller = _controller_state(payload.get("controller"))
     latest = turns[-1]["text"]
     safety = scan_danger(latest)
+    risk_registry = load_reviewed_risk_rules()
     started = time.perf_counter()
 
     if safety["danger_detected"]:
@@ -667,7 +676,8 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         draft = _mock_assessment(turns, controller)
         model_id = "mock-clinical-intake-v1"
     else:
-        draft = selected_provider.complete_json(SYSTEM_PROMPT, {"turns": turns, "health_context": health_context, "controller": controller})
+        draft = selected_provider.complete_json(SYSTEM_PROMPT, {"turns": turns, "health_context": health_context, "controller": controller,
+            "approved_risk_rules": [{key: rule[key] for key in ("rule_id", "version", "description")} for rule in risk_registry["rules"]]})
         model_id = getattr(getattr(selected_provider, "c", None), "model", None) or "unknown"
     provider_name = type(selected_provider).__name__
     try:
@@ -681,6 +691,12 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     clinical_state = assessment["clinical_state"]
     _ground_clinical_state(clinical_state, turns, health_context, controller, assessment["user_intent"])
     _merge_obvious_facts(clinical_state, turns)
+    risk_assessment = evaluate_reviewed_risk(assessment["risk_candidates"], turns, risk_registry)
+    if risk_assessment["level"] in {"soon_evaluation", "urgent"}:
+        return _result(started=started, provider_name=provider_name, model_id=model_id,
+            action=risk_assessment["level"], assistant_text=risk_assessment["notice"],
+            question_category=None, stop_reason="reviewed_risk_rule", controller={**controller, "last_question_category": None},
+            clinical_state=clinical_state, safety=safety, model_intent=assessment["user_intent"], risk_assessment=risk_assessment)
     latest_normalised = _normalise_text(latest)
     earlier = {_normalise_text(row["text"]) for row in turns[:-1]}
     # Not remembering one detail must not erase separately stated symptoms.
@@ -793,6 +809,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         relevant_context_ids=assessment["relevant_context_ids"],
         unknowns=_ground_notes(assessment["unknowns"], turns, health_context, unknowns=True),
         contradictions=_ground_notes(assessment["contradictions"], turns, health_context),
+        risk_assessment=risk_assessment,
     )
 
 

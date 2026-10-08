@@ -16,7 +16,7 @@ try:
  from .media_backend import create_default_media_backend
  from .media_store import MediaStoreError
  from .recognition import RecognitionError, recognize_file
- from .safety import scan_danger, document_needs_review
+ from .safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from .store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 except ImportError:
  from adapter import AdapterError, Config, organize_event, PROMPT_VERSION, SCHEMA_VERSION, PROMPT_SHA256, payload_sha256
@@ -27,7 +27,7 @@ except ImportError:
  from media_backend import create_default_media_backend
  from media_store import MediaStoreError
  from recognition import RecognitionError, recognize_file
- from safety import scan_danger, document_needs_review
+ from safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 ROOT=Path(__file__).resolve().parents[1]
 # The elder UI is plain HTML/JS; serve its source when no optional build exists.
@@ -297,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
   if app_access.local_first_enabled() and p=='/':return self.send_json(200,{'ok':True,'service':'bingli-beta-api','kind':'api','frontend_hosted':False})
   if p=='/api/app/config':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
-   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive',**local_first_capabilities()})
+   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive','reviewed_risk_rules':reviewed_risk_manifest(),**local_first_capabilities()})
   if p=='/api/app/session':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
    session=app_access.request_authorized(self.headers.get('Cookie'),write=False)

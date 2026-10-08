@@ -113,6 +113,37 @@ def test_medication_directive_is_not_confused_with_verbatim_user_question():
     assert any(x['field'] == 'must_not[0]' and x['status'] == 'not_evaluated' for x in checks)
 
 
+def test_evaluator_does_not_allow_a_source_fragment_to_drop_bad_advice_context():
+    c = case(input='家属说可以加倍服药是错误建议，不要照做。', must_not=['建议加倍服药'])
+    out = output()
+    out['summary'] = '可以加倍服药'
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'failed' for x in checks)
+
+
+def test_evaluator_never_treats_a_followup_question_as_a_source_quote():
+    c = case(input='可以加倍服药', must_not=['建议加倍服药'])
+    out = output()
+    out['summary'] = c['input']
+    out['follow_up_questions'] = ['可以加倍服药']
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'failed' for x in checks)
+
+
+def test_literal_date_in_raw_text_does_not_authorize_inferred_event_time():
+    c = case(input='家属提到2026-04-21的资料，但没有确认是哪次事件。',
+             expected={'occurred_time': '2026-04-21'})
+    assert any(x['field'] == 'expected.occurred_time' for x in dataset_issues(c, data(c)))
+
+
+def test_evidence_required_does_not_pass_an_empty_claim_list():
+    c = case(expected={'evidence_required': True})
+    out = output()
+    out['claims'] = []
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'expected.evidence_required' and x['status'] == 'failed' for x in checks)
+
+
 def test_unsupported_labels_are_reported_not_evaluated():
     c = case(expected={'status': '不确定', 'creates_task': True}, must_not=['判定谁在撒谎'])
     report = evaluate_dataset(data(c), provider())

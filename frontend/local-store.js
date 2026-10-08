@@ -240,6 +240,16 @@
     };
     const missing = Object.entries(missingLabels).filter(([category]) => !collectedCategories.has(category)).map(([, label]) => label);
     const riskLines = [];
+    const reviewedRisks = liveConversationTurns(conversation).filter(turn => turn.role === 'assistant'
+      && turn.reviewed_risk_validated === true && !turn.ai_failed
+      && safety.reviewedRiskSourcesCurrent(turn.risk_assessment, turns)).map(turn => turn.risk_assessment);
+    for (const assessment of reviewedRisks) riskLines.push({
+      kind: 'alert', text: assessment.notice,
+      tags: [assessment.level === 'urgent' ? '固定紧急提醒' : '固定尽快评估提醒'],
+      source_turn_ids: [...new Set(assessment.sources.map(source => source.turn_id))],
+      source_label: '版本化规则与当前原话已核对；临床能力未验收',
+      risk_assessment: assessment,
+    });
     if (urgentTurns.length) riskLines.push({
       kind: 'alert', text: '对应原话触发了本机紧急提醒，请优先核对。', tags: ['需优先查看'],
       source_turn_ids: urgentTurns.map(turn => turn.turn_id), source_label: '本机安全规则',
@@ -271,6 +281,9 @@
       generated_at: now(),
       source_turn_ids: turns.map(turn => turn.turn_id),
       source_context_ids: conversation.completeness?.relevant_context_ids || [],
+      reviewed_risk_assessments: reviewedRisks,
+      legacy_clinical_review_status: 'active_unvalidated',
+      clinical_validation_status: 'not_verified_by_this_application',
       sections: usefulSections,
       transcript: liveConversationTurns(conversation).filter(turn => !mockSource(turn)).map(turn => ({
         turn_id: turn.turn_id,
@@ -286,7 +299,10 @@
   }
   function conversationWithCurrentReport(conversation) {
     conversation = excludeMockFacts(conversation);
-    if (!conversation || !elderTurns(conversation).length || conversation.report?.format_version === 4) return conversation;
+    if (!conversation || !elderTurns(conversation).length) return conversation;
+    const staleRisk = (conversation.report?.reviewed_risk_assessments || [])
+      .some(assessment => !safety.reviewedRiskSourcesCurrent(assessment, elderTurns(conversation)));
+    if (conversation.report?.format_version === 4 && !staleRisk) return conversation;
     return { ...conversation, report: buildConversationReport(conversation, conversation.report) };
   }
   function conversationArchiveView(conversation) {
@@ -739,22 +755,41 @@
   }
 
   async function appendAssistantResult(conversation, result) {
-    const reviewedFixedText = (result.j?.action === 'urgent' && result.j?.assistant_text === safety.DANGER_REMINDER) || result.j?.assistant_text === CONVERSATION_BLOCKED_TEXT;
+    const localUrgent = result.j?.action === 'urgent' && result.j?.provider === 'LocalDangerRule'
+      && result.j?.assistant_text === safety.DANGER_REMINDER && elderTurns(conversation).at(-1)?.local_safety?.danger_detected;
+    const riskRequested = !localUrgent && (['soon_evaluation', 'urgent'].includes(result.j?.action)
+      || (result.j?.risk_assessment && result.j.risk_assessment.level !== 'none'));
+    let riskAssessment = null;
+    if (result.r.ok && riskRequested) {
+      // Ordinary turns add no config request. A reviewed notice needs the live
+      // trusted manifest, never approval fields authored by the model itself.
+      const config = await cloudFetch('/api/app/config', {}, 8000);
+      const latest = await vault.get(conversationKey(conversation.conversation_id));
+      if (!latest) throw new Error('conversation_not_found');
+      conversation = latest;
+      riskAssessment = config.r.ok ? safety.validateReviewedRisk(result.j.risk_assessment,
+        config.j.reviewed_risk_rules, elderTurns(conversation)) : null;
+      if (riskAssessment && (result.j.action !== riskAssessment.level || result.j.assistant_text !== riskAssessment.notice)) riskAssessment = null;
+    }
+    const reviewedFixedText = localUrgent || Boolean(riskAssessment) || result.j?.assistant_text === CONVERSATION_BLOCKED_TEXT;
     const safeResult = result.r.ok && typeof result.j?.assistant_text === 'string' && result.j.assistant_text.trim()
-      && result.j.assistant_text.length <= 1000 && ['ask', 'reply', 'finish', 'urgent'].includes(result.j.action)
-      && !/mock/i.test(result.j.provider || '') && (reviewedFixedText || !unsafeAssistantText(result.j.assistant_text));
+      && result.j.assistant_text.length <= 1000 && ['ask', 'reply', 'finish', 'urgent', 'soon_evaluation'].includes(result.j.action)
+      && !/mock/i.test(result.j.provider || '') && (!riskRequested || Boolean(riskAssessment))
+      && (reviewedFixedText || !unsafeAssistantText(result.j.assistant_text));
     const assistantText = safeResult ? String(result.j.assistant_text || CONVERSATION_FINISH_TEXT) : CONVERSATION_FAILURE_TEXT;
     const assistant = {
       turn_id: id('turn'), role: 'assistant', text: assistantText,
       action: safeResult ? result.j.action : 'finish',
-      question_category: safeResult ? result.j.question_category || null : null,
-      stop_reason: safeResult ? result.j.stop_reason || null : 'model_failed',
+      question_category: safeResult && !riskAssessment ? result.j.question_category || null : null,
+      stop_reason: safeResult ? riskAssessment ? 'reviewed_risk_rule' : result.j.stop_reason || null : 'model_failed',
       created_at: now(), version: 1, ai_failed: !safeResult,
+      ...(safeResult && riskAssessment ? { risk_assessment: riskAssessment, reviewed_risk_validated: true } : {}),
     };
     const next = {
       ...conversation,
       turns: [...conversation.turns.map((turn, index) => index === conversation.turns.length - 1 && turn.ai_failed ? { ...turn, superseded: true } : turn), assistant],
-      controller: safeResult && result.j.controller ? result.j.controller : conversation.controller,
+      controller: safeResult && riskAssessment ? { ...conversation.controller, last_question_category: null }
+        : safeResult && result.j.controller ? result.j.controller : conversation.controller,
       completeness: safeResult && result.j.completeness ? result.j.completeness : conversation.completeness,
       relevant_health_context: safeResult && result.j.completeness ? (conversation.health_context || []).filter(item => result.j.completeness.relevant_context_ids?.includes(item.context_id)) : conversation.relevant_health_context || [],
       last_ai_metadata: safeResult ? { provider: result.j.provider, model_id: result.j.model_id, prompt_version: result.j.prompt_version, trace_id: result.j.trace_id } : { ai_failed: true, error: result.j?.error || 'ai_conversation_failed' },

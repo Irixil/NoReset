@@ -153,8 +153,8 @@ test('conversation recovery keeps later additions in the same grounded history',
   assert.doesNotMatch(localStore, /startsNewEpisode|episodeIndex|modelTurns/);
 });
 
-test('only the exact reviewed urgent conversation text bypasses the frontend safety scan', () => {
-  assert.match(localStore, /action === 'urgent' && result\.j\?\.assistant_text === safety\.DANGER_REMINDER/);
+test('the legacy urgent exception keeps its exact text check with local danger provenance', () => {
+  assert.match(localStore, /action === 'urgent'[\s\S]{0,200}result\.j\?\.assistant_text === safety\.DANGER_REMINDER/);
   assert.doesNotMatch(localStore, /reviewedFixedText = result\.j\?\.action === 'urgent' \|\|/);
 });
 
