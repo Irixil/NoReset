@@ -659,7 +659,7 @@ test('an explanation request cannot become a contradictory patient fact in a mig
     }] },
   });
   const report = (await h.request(`/api/conversations/${c.conversation_id}`)).j.conversation.report;
-  assert.equal(report.format_version, 4);
+  assert.equal(report.format_version, 5);
   assert.doesNotMatch(report.body, /原话有出入|这些原话可能有出入/);
   assert.ok(report.transcript.some(turn => turn.text === patients[1].text), 'the original explanation request remains in the full transcript');
 });

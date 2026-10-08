@@ -182,9 +182,10 @@ test('reports use doctor handoff sections with sources and retain raw transcript
     assert.match(localStore, new RegExp(title));
   }
   const reportBuilder = localStore.match(/function buildConversationReport[\s\S]*?function conversationWithCurrentReport/)?.[0] || '';
-  assert.doesNotMatch(reportBuilder, /\.summary/);
+  assert.match(reportBuilder, /analysisSourcesCurrent/);
+  assert.match(reportBuilder, /groundedReportSummary/);
   assert.match(reportBuilder, /kind: 'quote', text: turn\.text/);
-  assert.match(reportBuilder, /format_version: 4/);
+  assert.match(reportBuilder, /format_version: 5/);
   assert.match(localStore, /source_context_ids/);
   assert.match(localStore, /transcript:/);
   assert.match(app, /reportSectionsHtml/);

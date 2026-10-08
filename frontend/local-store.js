@@ -139,7 +139,8 @@
   function validLocalDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value); }
   async function listConversations() {
     const values = await vault.list('conversation:');
-    return values.filter(item => item?.conversation_id).map(excludeMockFacts).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    const currentContext = await healthContext();
+    return values.filter(item => item?.conversation_id).map(item => conversationWithCurrentReport(item, currentContext)).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   }
   async function healthContext() {
     const saved = await vault.get(HEALTH_CONTEXT_KEY);
@@ -163,6 +164,54 @@
     return { version: (previous?.version || 0) + 1, updated_at: now(), entries };
   }
   function elderTurns(conversation) { return (conversation.turns || []).filter(turn => turn.role === 'elder' && !turn.superseded && !mockSource(turn)); }
+  function analysisSources(conversation, currentContext = null) {
+    const selected = [...(conversation.selected_context_ids || [])].sort();
+    const contexts = currentContext ? currentContext.entries.filter(item => selected.includes(item.context_id)) : conversation.health_context || [];
+    return {
+      turns: elderTurns(conversation).map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
+      selected_context_ids: selected,
+      context_version: selected.length ? currentContext?.version ?? conversation.health_context_version ?? null : 0,
+      context: contexts.map(item => ({ context_id: item.context_id, category: item.category, text: item.text,
+        source: item.source, confirmed_at: item.confirmed_at, updated_at: item.updated_at })),
+    };
+  }
+  function analysisSourcesCurrent(conversation, currentContext = null) {
+    return Boolean(conversation.analysis_sources)
+      && JSON.stringify(conversation.analysis_sources) === JSON.stringify(analysisSources(conversation, currentContext));
+  }
+  function invalidateChangedAnalysis(conversation, currentContext = null) {
+    if (!conversation.completeness || analysisSourcesCurrent(conversation, currentContext)) return conversation;
+    return { ...conversation, completeness: null, analysis_sources: null, relevant_health_context: [] };
+  }
+  function groundedReportSummary(item, conversation) {
+    if (item?.status !== 'known' || typeof item.summary !== 'string' || !item.summary.trim()) return null;
+    const turns = elderTurns(conversation), turnIds = item.evidence_turn_ids || [], contextIds = item.context_ids || [];
+    if (!turnIds.length && !contextIds.length) return null;
+    const sources = turnIds.map(value => turns.find(turn => turn.turn_id === value));
+    const contexts = contextIds.map(value => (conversation.health_context || []).find(entry => entry.context_id === value));
+    if ([...sources, ...contexts].some(value => !value)) return null;
+    // Reuse only literal source pieces, preserving negation/uncertainty. The
+    // backend owns category semantics; this is a second provenance check.
+    const pieces = item.summary.split('；').map(value => value.trim()).filter(Boolean);
+    const clauses = text => String(text).split(/[，。；！？,;!?\n]/).map(value => value.trim()).filter(Boolean);
+    const qualified = /不是|没有|并非|否认|不记得|不清楚|不确定|无|未|没|不|可能|也许|好像|大概|如果|假如|担心|害怕|会不会|是否|要不要/;
+    const correction = /^\s*(?:我(?:现在|目前)?|现在|目前)?(?:不是|并非|没有|否认|不再)(.+)$/;
+    const allText = [...sources.map(turn => turn.text), ...contexts.map(entry => entry.text)];
+    if (!pieces.length || pieces.some(piece => {
+      const literal = allText.some(text => String(text).includes(piece) &&
+        (!clauses(piece).length || clauses(text).some(clause => clause.includes(piece.replace(/[，。；！？,;!?]+$/g, '')) &&
+          [...clause.matchAll(new RegExp(qualified.source, 'g'))].every(match => piece.includes(match[0]))) || piece === String(text).trim()));
+      if (!literal) return true;
+      return sources.some(source => turns.slice(turns.indexOf(source) + 1).some(later => clauses(later.text).some(clause => {
+        const rejected = clause.match(correction)?.[1]?.trim();
+        return rejected && piece.includes(rejected);
+      })));
+    })) return null;
+    return { kind: 'summary', text: item.summary, tags: ['当前整理 · 待核对'],
+      source_turn_ids: turnIds, source_context_ids: contextIds,
+      source_versions: sources.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
+      source_label: `当前原话${sources.length ? ' ' + sources.map(turn => turns.indexOf(turn) + 1).join('、') : '与所选背景'} · 本人未核对` };
+  }
   function reportTurnCategories(turn, state) {
     const fromState = CLINICAL_CATEGORIES.filter(category => state?.[category]?.status === 'known' && state[category].evidence_turn_ids?.includes(turn.turn_id));
     // Once reviewed source references exist, do not reclassify "晚上睡得好"
@@ -201,6 +250,16 @@
     const bySection = new Map(grouped.map(section => [section.key, section]));
     const collectedCategories = new Set();
     let hasChiefComplaint = false;
+    const boundAnalysis = analysisSourcesCurrent(conversation);
+    if (boundAnalysis) for (const category of CLINICAL_CATEGORIES) {
+      const line = groundedReportSummary(state[category], conversation);
+      if (!line) continue;
+      const sectionKey = reportSectionFor([category], category === 'main_complaint');
+      if (sectionKey) { bySection.get(sectionKey).lines.push(line); collectedCategories.add(category); }
+    }
+    const hasCurrentSummary = grouped.some(section => section.lines.some(line => line.kind === 'summary'));
+    if (!hasCurrentSummary) grouped.filter(section => section.key !== 'patient_questions')
+      .forEach(section => { section.title += '（原话历史 · 待核对）'; });
     turns.forEach((turn, index) => {
       if (REPORT_META_MESSAGE.test(turn.text || '')) return;
       if (/(担心|害怕|会不会|要不要|怎么办|想知道)/.test(turn.text || '') && !REPORT_PATTERNS.main_complaint.test(turn.text || '')) {
@@ -208,6 +267,7 @@
           source_turn_ids: [turn.turn_id], source_label: `患者原话 ${index + 1}` });
         return;
       }
+      if (hasCurrentSummary) return;
       const categories = reportTurnCategories(turn, state);
       const sectionKey = reportSectionFor(categories, !hasChiefComplaint);
       if (!sectionKey) return;
@@ -217,10 +277,10 @@
       bySection.get(sectionKey).lines.push({
         kind: 'quote', text: turn.text,
         tags: categories.filter(category => category !== redundantCategory).map(category => REPORT_CATEGORY_LABELS[category]).filter(Boolean).slice(0, 4),
-        source_turn_ids: [turn.turn_id], source_label: `患者原话 ${index + 1}`,
+        source_turn_ids: [turn.turn_id], source_label: `患者原话历史 ${index + 1} · 待核对`,
       });
     });
-    for (const item of conversation.relevant_health_context || []) {
+    for (const item of boundAnalysis ? conversation.relevant_health_context || [] : []) {
       bySection.get('background_actions').lines.push({
         kind: 'context', text: item.text, tags: ['本机已确认背景'],
         source_context_ids: [item.context_id], source_label: '本人此前确认',
@@ -228,7 +288,7 @@
       collectedCategories.add('relevant_history');
     }
     for (const category of CLINICAL_CATEGORIES) {
-      if (['known', 'declined'].includes(state?.[category]?.status)) collectedCategories.add(category);
+      if (boundAnalysis && state?.[category]?.status === 'declined') collectedCategories.add(category);
     }
     const urgentTurns = turns.filter(turn => turn.local_safety?.danger_detected);
     const reviewTurns = turns.filter(turn => turn.local_safety?.clinical_review_required);
@@ -270,16 +330,17 @@
     grouped.push({ key: 'verification', title: '尚待医生核实', lines: riskLines });
     const usefulSections = grouped.filter(section => section.lines.length);
     const bodyParts = usefulSections.map(section => `${section.title}\n${section.lines.map(line => `- ${line.tags?.length ? `${line.tags.join('、')}：` : ''}${line.text}`).join('\n')}`);
-    bodyParts.push(`老人原话（按说话顺序）\n${transcript.join('\n')}`);
+    bodyParts.push(`老人原话历史（按说话顺序完整保留）\n${transcript.join('\n')}`);
     return {
       report_id: previous?.report_id || id('report'),
-      format_version: 4,
+      format_version: 5,
       title: '就诊沟通记录',
       status: 'auto_unreviewed',
       status_label: '自动整理 · 本人未核对',
       version: (previous?.version || 0) + 1,
       generated_at: now(),
       source_turn_ids: turns.map(turn => turn.turn_id),
+      source_versions: turns.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
       source_context_ids: conversation.completeness?.relevant_context_ids || [],
       reviewed_risk_assessments: reviewedRisks,
       legacy_clinical_review_status: 'active_unvalidated',
@@ -297,13 +358,21 @@
       disclaimer: '用于和医生沟通，不是诊断，也不包含用药或治疗建议。',
     };
   }
-  function conversationWithCurrentReport(conversation) {
+  function conversationWithCurrentReport(conversation, currentContext = null) {
     conversation = excludeMockFacts(conversation);
     if (!conversation || !elderTurns(conversation).length) return conversation;
+    const missingBinding = conversation.completeness && !conversation.analysis_sources;
+    const changedAnalysis = conversation.completeness && !analysisSourcesCurrent(conversation, currentContext);
+    // Legacy data without a binding may retain only full historical quotes.
+    const reportInput = missingBinding ? conversation : invalidateChangedAnalysis(conversation, currentContext);
+    conversation = invalidateChangedAnalysis(conversation, currentContext);
     const staleRisk = (conversation.report?.reviewed_risk_assessments || [])
       .some(assessment => !safety.reviewedRiskSourcesCurrent(assessment, elderTurns(conversation)));
-    if (conversation.report?.format_version === 4 && !staleRisk) return conversation;
-    return { ...conversation, report: buildConversationReport(conversation, conversation.report) };
+    const staleSources = JSON.stringify(conversation.report?.source_versions) !== JSON.stringify(analysisSources(conversation).turns);
+    const unboundSummary = !analysisSourcesCurrent(conversation, currentContext)
+      && conversation.report?.sections?.some(section => section.lines?.some(line => line.kind === 'summary'));
+    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !unboundSummary) return conversation;
+    return { ...conversation, report: buildConversationReport(reportInput, conversation.report) };
   }
   function conversationArchiveView(conversation) {
     const current = conversationWithCurrentReport(conversation);
@@ -741,6 +810,7 @@
     const selected = new Set(conversation.selected_context_ids || []);
     const context = currentContext.entries.filter(item => selected.has(item.context_id)).slice(0, 5);
     conversation.health_context = context;
+    conversation.health_context_version = currentContext.version;
     return {
       turns: allElderTurns.map(turn => {
         const index = conversation.turns.findIndex(item => item.turn_id === turn.turn_id);
@@ -791,11 +861,13 @@
       controller: safeResult && riskAssessment ? { ...conversation.controller, last_question_category: null }
         : safeResult && result.j.controller ? result.j.controller : conversation.controller,
       completeness: safeResult && result.j.completeness ? result.j.completeness : conversation.completeness,
+      analysis_sources: safeResult && result.j.completeness ? analysisSources(conversation) : conversation.analysis_sources || null,
       relevant_health_context: safeResult && result.j.completeness ? (conversation.health_context || []).filter(item => result.j.completeness.relevant_context_ids?.includes(item.context_id)) : conversation.relevant_health_context || [],
       last_ai_metadata: safeResult ? { provider: result.j.provider, model_id: result.j.model_id, prompt_version: result.j.prompt_version, trace_id: result.j.trace_id } : { ai_failed: true, error: result.j?.error || 'ai_conversation_failed' },
     };
-    next.report = buildConversationReport(next, conversation.report);
-    return saveConversation(next);
+    const current = invalidateChangedAnalysis(next, await healthContext());
+    current.report = buildConversationReport(current, conversation.report);
+    return saveConversation(current);
   }
 
   async function conversationReply(conversation) {
@@ -894,7 +966,7 @@
           local_media_count: result.plan.mediaIds.length, pending_upload_count: result.plan.uploadIds.length, encrypted_backups_unchanged: true } });
       }
     }
-    if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, conversation: conversationWithCurrentReport(conversation) });
+    if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, conversation: conversationWithCurrentReport(conversation, await healthContext()) });
     if (parts.length === 4 && parts[3] === 'context' && method === 'POST') {
       const ids = body.context_ids;
       const current = await healthContext();
@@ -905,11 +977,13 @@
       return (async () => {
         const latest = await vault.get(conversationKey(conversationId));
         const selected = new Set(ids);
-        const updated = { ...latest, selected_context_ids: ids,
+        let updated = { ...latest, selected_context_ids: ids,
           health_context: current.entries.filter(item => selected.has(item.context_id)),
+          health_context_version: current.version,
           relevant_health_context: (latest.relevant_health_context || []).filter(item => selected.has(item.context_id)),
           completeness: latest.completeness ? { ...latest.completeness,
             relevant_context_ids: (latest.completeness.relevant_context_ids || []).filter(value => selected.has(value)) } : null };
+        updated = invalidateChangedAnalysis(updated, current);
         updated.report = buildConversationReport(updated, latest.report);
         return ok(200, { ok: true, conversation: await saveConversation(updated) });
       })();

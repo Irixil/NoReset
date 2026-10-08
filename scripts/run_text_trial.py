@@ -16,7 +16,7 @@ from backend.evaluation import SAFE_MODEL_ERROR_CODES
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKET = ROOT / 'docs/evidence/goal-audit-2026-10-08/preflight/five-call-inputs.json'
+PACKET = ROOT / 'data/synthetic/five-call-preflight/inputs.json'
 OUT_DIR = ROOT / 'docs/evidence/goal-audit-2026-10-08/preflight/text-subset'
 MODEL = 'deepseek-flash'
 BASE_URL = 'https://api.deepseek.com'

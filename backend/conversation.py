@@ -104,11 +104,12 @@ _META_FEEDBACK = re.compile(
 _CORRECTION = re.compile(r"说错了|不是.{0,10}是|改一下|更正|纠正")
 _DIAGNOSIS_REQUEST = re.compile(r"(?:这是|到底|究竟)?(?:怎么了|怎么回事|什么情况|什么病)|为什么会这样|能不能告诉我.{0,12}(?:怎么了|什么情况|什么病)")
 _NEGATIVE_ANSWER = re.compile(r"^(?:没有|没|无|不是|从来没有|没什么|没有别的)")
+_TEMPORAL_CHANGE = r"(?:早晨|清晨|早上|上午|中午|下午|傍晚|晚上|昨晚|夜间|夜里|凌晨|白天)[^，。！？；,!?;]{0,8}(?:明显|加重|减轻|缓解|好转|好些)"
 _PATTERNS = {
     "main_complaint": re.compile(r"疼|痛|酸|胀|刺痛|灼痛|晕|咳|喘|闷|恶心|吐|发热|发烧|无力|没劲|麻|痒|肿胀|肿起来|肿得|发肿|不舒服|难受|睡不着|吃不下|伸不直"),
     "onset_course": re.compile(r"今天|昨天|前天|刚才|早上|上午|中午|下午|晚上|半夜|最近|小时|分钟|天|周|月|年|开始|一直|后来|突然|慢慢|越来越|反复|时好时坏"),
     "symptom_character": re.compile(r"刺痛|胀痛|酸痛|酸|麻|烧|灼|跳着|隐隐|钝|刀割|压着|一阵|持续|较轻|轻微|不算重|偏重|剧烈疼痛|很疼|非常疼|程度|[一二三四五六七八九十\d]+分"),
-    "aggravating_relieving": re.compile(r"活动|走路|上楼|下楼|弯|伸|躺|坐|站|休息|吃饭|空腹|更疼|减轻|缓解"),
+    "aggravating_relieving": re.compile(_TEMPORAL_CHANGE + r"|活动|走路|上楼|下楼|弯|伸|躺|坐|站|休息|吃饭|空腹|更疼|减轻|缓解"),
     "associated_symptoms": re.compile(r"同时|还会|伴随|另外|胸(?:口|部)?(?:疼|痛)|胸闷|发烧|咳|吐|恶心|晕|麻|肿|喘|心慌|出汗"),
     "functional_impact": re.compile(r"影响|费劲|不稳|抓不住|拿不住|抬不起来|睡不着|睡不好|睡得(?:还好|好|不好)|睡眠(?:正常|还好|不好|受影响)|睡觉(?:受影响|不好|还好)|吃不下|走不了|不能走|平地(?:能|可)走|能(?:自己)?走路|可以自己走|走楼梯|上下楼|下不了地|起不来|伸不直|活动|自理|干活"),
     "relevant_history": re.compile(r"以前|之前也|老毛病|长期|过敏|手术|住院|一直吃|既往|病史"),
@@ -238,8 +239,41 @@ def _empty_state() -> dict[str, dict[str, Any]]:
     return {category: {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []} for category in CATEGORIES}
 
 
-def _correction_span(text: str) -> tuple[int, int] | None:
+def _easy_single_question(question: str) -> bool:
+    """Reject explicit compound presence checks without inventing a replacement.
+
+    Single-dimension choices such as left versus right remain available. This
+    lexical guard does not claim to decide every question's semantic complexity.
+    """
+    presence = list(re.finditer(r"有没有|有无|是否(?:还)?有|同时(?:还)?有|还(?:会|有)", question))
+    return len(presence) <= 1 and not (presence and "、" in question[presence[0].end():])
+
+
+def _correction_context_span(text: str, match) -> tuple[int, int]:
+    separators = "。！？；.!?;\n"
+    start = max((text.rfind(char, 0, match.start()) for char in separators), default=-1) + 1
+    ends = [index for char in separators if (index := text.find(char, match.end())) >= 0]
+    return start, min(ends) + 1 if ends else len(text)
+
+
+def _correction_context(text: str, match) -> str:
+    start, end = _correction_context_span(text, match)
+    return text[start:end]
+
+
+def _direct_correction(text: str):
     match = _CORRECTION_REPLACEMENT.search(text)
+    if match and re.search(
+        r"如果|假如|假设|要是|会不会|[？?]|(?:没|没有|未)(?:说|更正|改|表示)|"
+        r"(?:医生|药师|家属|别人|他|她).{0,6}(?:说|建议|嘱咐|提到)",
+        _correction_context(text, match),
+    ):
+        return None
+    return match
+
+
+def _correction_span(text: str) -> tuple[int, int] | None:
+    match = _direct_correction(text)
     return (match.start("new"), match.end("new")) if match else None
 
 
@@ -249,19 +283,32 @@ def _source_excerpt(text: str, category: str | None = None) -> str:
     if matcher is None:
         return text.strip()
     correction = _correction_span(text)
-    search_start, search_end = correction if correction else (0, len(text))
-    matches = list(matcher.finditer(text, search_start, search_end))
+    correction_match = _CORRECTION_REPLACEMENT.search(text)
+    correction_context = _correction_context_span(text, correction_match) if correction_match else None
+    matches = list(matcher.finditer(text))
     if not matches:
         return ""
     separators = "，。！？；,.!?;\n"
     excerpts = []
     for match in matches:
+        search_start, search_end = 0, len(text)
+        if correction_context and correction_context[0] <= match.start() < correction_context[1]:
+            if not correction or not correction[0] <= match.start() < correction[1]:
+                continue
+            search_start, search_end = correction
         previous = max((text.rfind(char, 0, match.start()) for char in separators), default=-1)
         following = [index for char in separators if (index := text.find(char, match.end())) >= 0]
         start = max(previous + 1, search_start)
         end = min(min(following) + 1 if following else len(text), search_end)
         clause = text[start:end].strip()
         if re.search(r"[？?]", clause):
+            continue
+        if category not in {"relevant_history", "prior_actions_results", "unknown"}:
+            if re.search(r"如果|假如|假设|要是|会不会", clause):
+                continue
+        if category == "aggravating_relieving" and re.fullmatch(_TEMPORAL_CHANGE, match.group()) and re.search(
+            r"建议|应该|应当|请|就医|医院|急诊|检查", clause,
+        ):
             continue
         if category != "unknown" and _EXPLICIT_UNKNOWN.search(clause):
             continue
@@ -285,12 +332,54 @@ def _source_excerpt(text: str, category: str | None = None) -> str:
     return "；".join(excerpts)
 
 
+def _literal_corrections(ref: str, turns: list[dict[str, Any]]):
+    positions = {row["turn_id"]: index for index, row in enumerate(turns)}
+    position = positions[ref]
+    for index, row in enumerate(turns):
+        if index < position:
+            continue
+        correction = _direct_correction(row["text"])
+        if not correction:
+            continue
+        old = correction.group("old").strip()
+        numeric = "0123456789零〇一二三四五六七八九十百千万两"
+        left = r"(?<![0-9零〇一二三四五六七八九十百千万两])" if old and old[0] in numeric else ""
+        right = r"(?![0-9零〇一二三四五六七八九十百千万两])" if old and old[-1] in numeric else ""
+        pattern = re.compile(left + re.escape(old) + right)
+        owners = [(source["turn_id"], len(list(pattern.finditer(source["text"])))) for source in turns[:index]]
+        occurrences = sum(count for _, count in owners)
+        if position == index or any(source == ref and count for source, count in owners):
+            yield old, pattern, occurrences, position == index
+
+
+def _current_source_excerpt(ref: str, category: str, turns: list[dict[str, Any]]) -> str:
+    source = next(row["text"] for row in turns if row["turn_id"] == ref)
+    excerpt = _source_excerpt(source, category)
+    if category in {"relevant_history", "prior_actions_results", "unknown", None}:
+        return excerpt
+    for old, pattern, occurrences, is_correction in _literal_corrections(ref, turns):
+        if is_correction:
+            if occurrences != 1 and not (category == "main_complaint" and _PATTERNS[category].search(excerpt)):
+                return ""  # No unique earlier attribute to attach this replacement to.
+            continue
+        if not pattern.search(excerpt):
+            continue  # Unchanged clauses in this source remain literal facts.
+        if re.match(r"^(?:不|没|未|无|否认)", old) or old in {"是", "有"}:
+            return ""  # Never make an affirmative fact by deleting a negation.
+        # Keep only still-supported category fragments, never paste new words
+        # into an old quote. Ambiguous attributes remain unassigned; raw history
+        # retains every occurrence and other source clauses stay available.
+        excerpt = "；".join(part.strip("，。；,; ") for part in pattern.split(excerpt)
+                           if _PATTERNS[category].search(part))
+    return excerpt
+
+
 def _current_main_complaint_refs(refs: list[str], turns: list[dict[str, Any]]) -> list[str]:
     """Drop an earlier side-specific complaint explicitly replaced by a correction."""
     positions = {row["turn_id"]: index for index, row in enumerate(turns)}
     current = set(refs)
     for correction in turns:
-        match = _CORRECTION_REPLACEMENT.search(correction["text"])
+        match = _direct_correction(correction["text"])
         if not match:
             continue
         old_side = "右" if "右" in match.group("old") else "左" if "左" in match.group("old") else None
@@ -314,7 +403,7 @@ def _source_summary(
     """Use concise extractive evidence, never unsupported model prose."""
     turn_text = {row["turn_id"]: row["text"] for row in turns}
     context_text = {row["context_id"]: row["text"] for row in health_context}
-    values = [_source_excerpt(turn_text[ref], category) for ref in turn_ids if ref in turn_text]
+    values = [_current_source_excerpt(ref, category, turns) for ref in turn_ids if ref in turn_text]
     values.extend(context_text[ref].strip() for ref in context_ids if ref in context_text)
     result = []
     for value in dict.fromkeys(values):
@@ -358,7 +447,7 @@ def _ground_clinical_state(
                 ref for ref in refs
                 if ref != latest["turn_id"]
                 and not _META_FEEDBACK.search(turn_text[ref])
-                and _source_excerpt(turn_text[ref], category)
+                and _current_source_excerpt(ref, category, turns)
             ]
             summary = _source_summary(existing_refs, contexts, turns, health_context, category=category)
             state[category] = {
@@ -379,6 +468,7 @@ def _ground_clinical_state(
                     ref for ref in refs
                     if item["summary"] == turn_text[ref].strip()
                     and not _source_excerpt(turn_text[ref], category)
+                    and not list(_literal_corrections(ref, turns))
                     and not _META_FEEDBACK.search(turn_text[ref])
                     and not _DIAGNOSIS_REQUEST.search(turn_text[ref])
                     and not _DECLINED.search(turn_text[ref])
@@ -388,7 +478,7 @@ def _ground_clinical_state(
             grounded_refs = [
                 ref for ref in refs
                 if not _META_FEEDBACK.search(turn_text[ref])
-                and _source_excerpt(turn_text[ref], category)
+                and _current_source_excerpt(ref, category, turns)
             ] + literal_complaint_refs
             if category == "main_complaint":
                 grounded_refs = _current_main_complaint_refs(grounded_refs, turns)
@@ -435,29 +525,31 @@ def _ground_clinical_state(
             state[category] = {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
 
 
-def _merge_obvious_facts(state: dict[str, dict[str, Any]], turns: list[dict[str, Any]]) -> None:
+def _merge_obvious_facts(state: dict[str, dict[str, Any]], turns: list[dict[str, Any]], *, infer_associated: bool = False) -> None:
     """Prevent obvious repetition; never create a medical interpretation."""
     for category in _PATTERNS:
+        if category == "associated_symptoms" and not infer_associated:
+            continue  # A primary symptom does not establish a second symptom.
         if state[category]["status"] != "missing":
             continue
         refs = [
             row["turn_id"] for row in turns
-            if not _META_FEEDBACK.search(row["text"]) and _source_excerpt(row["text"], category)
+            if not _META_FEEDBACK.search(row["text"]) and _current_source_excerpt(row["turn_id"], category, turns)
         ]
         if category == "main_complaint":
             refs = _current_main_complaint_refs(refs, turns)
         if refs:
             excerpts = [
-                _source_excerpt(next(row["text"] for row in turns if row["turn_id"] == ref), category)
+                _current_source_excerpt(ref, category, turns)
                 for ref in refs[-2:]
             ]
             state[category] = {"status": "known", "summary": "；".join(excerpts)[:500], "evidence_turn_ids": refs, "context_ids": []}
 
 
-def _mock_assessment(turns: list[dict[str, Any]], controller: dict[str, Any]) -> dict[str, Any]:
+def _mock_assessment(turns: list[dict[str, Any]], controller: dict[str, Any], *, infer_associated: bool = True) -> dict[str, Any]:
     latest = turns[-1]
     state = _empty_state()
-    _merge_obvious_facts(state, turns)
+    _merge_obvious_facts(state, turns, infer_associated=infer_associated)
     text = latest["text"]
     intent = "meta_feedback" if _META_FEEDBACK.search(text) else "patient_question" if _DIAGNOSIS_REQUEST.search(text) or "?" in text or "？" in text else "correction" if _CORRECTION.search(text) else "explicit_finish" if _EXPLICIT_FINISH.fullmatch(text.strip()) else "answer" if len(turns) > 1 else "health_fact"
     earlier = {_normalise_text(row["text"]) for row in turns[:-1]}
@@ -668,7 +760,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     started = time.perf_counter()
 
     if safety["danger_detected"]:
-        assessment = _mock_assessment(turns, controller)
+        assessment = _mock_assessment(turns, controller, infer_associated=False)
         return _result(started=started, provider_name="LocalDangerRule", model_id="local-danger-rule-v1", action="urgent", assistant_text=DANGER_REMINDER, question_category=None, stop_reason="urgent_rule", controller={**controller, "last_question_category": None}, clinical_state=assessment["clinical_state"], safety=safety, model_intent=assessment["user_intent"])
 
     selected_provider = provider or provider_from()
@@ -685,7 +777,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     except ConversationError as error:
         if error.code != "model_reply_unsafe":
             raise
-        fallback = _mock_assessment(turns, controller)
+        fallback = _mock_assessment(turns, controller, infer_associated=isinstance(selected_provider, MockProvider))
         return _result(started=started, provider_name=provider_name, model_id=model_id, action="reply", assistant_text=MODEL_OUTPUT_BLOCKED_TEXT, question_category=None, stop_reason="model_output_blocked", controller=controller, clinical_state=fallback["clinical_state"], safety=safety)
 
     clinical_state = assessment["clinical_state"]
@@ -738,7 +830,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         candidate = assessment["candidate_question"]
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
         fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
-        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions:
+        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _QUESTION_SCOPE.search(candidate) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions:
             next_category = proposed
             assistant_text = _response_text(reply, candidate)
             if _unsafe_reply(assistant_text) or _NON_HEALTH_ACTION.search(assistant_text):
@@ -772,7 +864,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
 
         candidate = assessment["candidate_question"] if proposed == next_category else ""
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
-        candidate_is_valid = bool(candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions)
+        candidate_is_valid = bool(candidate and _QUESTION_SCOPE.search(candidate) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions)
         if next_category and candidate_is_valid:
             previous_count = controller["question_counts"].get(next_category, 0)
             assistant_text = _response_text(reply, candidate)
