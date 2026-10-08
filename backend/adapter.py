@@ -104,7 +104,7 @@ class OpenAICompatibleProvider:
   try:
    self.client=ChatCompletionsClient(base_url=c.base_url or self.default_base_url,model=c.model,api_key=c.token,timeout=c.timeout,
     json_mode=self.default_json_mode if c.json_mode is None else c.json_mode,
-    extra_body=c.extra_body,max_tokens=c.max_tokens)
+    extra_body=c.extra_body,max_tokens=c.max_tokens,trial_provider=c.provider)
   except ModelClientError as error:
    raise AdapterError(str(error),code='model_configuration_invalid') from None
  def complete_json(self,system_prompt,payload):

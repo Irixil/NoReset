@@ -43,7 +43,12 @@ function mediaRetryable(m){
   // retryable merely because it has a failed status.
   if(m?.recognition_status==='interrupted')return m.recognition?.retryable!==false;
   if(m?.recognition_status!=='failed')return false;
+  if(m.recognition?.manual_retry_after_authorization===true&&['trial_authorization_required','trial_budget_exhausted'].includes(m.recognition?.error?.code))return true;
   return m.recognition?.retryable===true||m.recognition?.error?.retryable===true||m.retryable===true;
+}
+function trialRetryMessage(m){
+  const code=m?.recognition?.error?.code;
+  return code==='trial_budget_exhausted'?'本次试验额度已用尽；原件已保留，需要新的预算授权后才能手动重试。':code==='trial_authorization_required'?'试验尚未获预算授权；原件已保留，获得授权后可手动重试。':'';
 }
 function capabilityMessage(c){
   if(c?.enabled===true)return '';
@@ -129,7 +134,8 @@ function renderMedia(){
   $('archivePhotos').innerHTML=mediaItems.length?latestMediaFirst(mediaItems).map(m=>{
     const mock=isMockMedia(m);
     const terminalUnavailable=['failed','interrupted'].includes(m.recognition_status)&&!mediaRetryable(m);
-    const action=mock?(mediaRetryable(m)?'重新识别原录音':'查看模拟结果'):m.recognition_status==='succeeded'?'查看识别文字':m.recognition_status==='processing'?'识别处理中':terminalUnavailable?'':'识别 / 重试';
+    const trialRetry=m.recognition?.manual_retry_after_authorization===true&&trialRetryMessage(m);
+    const action=trialRetry?(m.recognition.error.code==='trial_budget_exhausted'?'新授权后重试':'获授权后重试'):mock?(mediaRetryable(m)?'重新识别原录音':'查看模拟结果'):m.recognition_status==='succeeded'?'查看识别文字':m.recognition_status==='processing'?'识别处理中':terminalUnavailable?'':'识别 / 重试';
     const actionButton=action?`<button class="outline" data-recognize="${m.media_id}" ${m.save_status!=='saved'||m.recognition_status==='processing'?'disabled':''}>${action}</button>`:'';
     const unusableAudio=unusableAudioMessage(m);
     const recognitionError=(m.recognition?.error_message||unusableAudio)?`<p class="status error">${escapeHtml(unusableAudio||readableMediaError(m.recognition.error_message,'识别没有完成，请保留原件并重试'))}</p>`:'';
@@ -264,7 +270,7 @@ async function recognizeMedia(id){
       const {media}=await mediaRequest('/api/media/'+id);
       if(!recognitionStillFinishing(media)){
         await loadMedia();showRecognition(media);await loadEvents();
-        mediaMessage(media.recognition_status==='succeeded'?'识别文字已保留，请核对来源和内容':unusableAudioMessage(media)||(mediaRetryable(media)?'识别没有完成，原件仍可查看和重试':'识别没有完成，原件仍可查看；请查看下方说明。'));return media;
+        mediaMessage(media.recognition_status==='succeeded'?'识别文字已保留，请核对来源和内容':trialRetryMessage(media)||unusableAudioMessage(media)||(mediaRetryable(media)?'识别没有完成，原件仍可查看和重试':'识别没有完成，原件仍可查看；请查看下方说明。'));return media;
       }
       await new Promise(resolve=>setTimeout(resolve,1000));
     }

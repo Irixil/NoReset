@@ -11,6 +11,7 @@ WebSocket 接入；通用供应商必须显式配置地址、模型和凭据。A
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -33,7 +34,8 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 from urllib.parse import quote, urlsplit
 
-from .model_client import _open_request
+from .model_client import _open_request, ModelClientError
+from .trial_gate import is_loopback_url
 
 
 class RecognitionError(RuntimeError):
@@ -132,6 +134,8 @@ def _safe_error(code: str) -> RecognitionError:
         "provider_rate_limited": "识别服务请求过于频繁，可稍后重试",
         "invalid_provider_response": "识别服务返回了无法使用的结果",
         "incomplete_provider_response": "识别返回被截断，未作为完整结果保存；原件仍保留，可重试",
+        "trial_authorization_required": "合成试验尚未获得有效预算授权，原始资料已保留。",
+        "trial_budget_exhausted": "合成试验请求预算已用完，原始资料已保留。",
     }
     retryable = code in {
         "provider_timeout",
@@ -343,6 +347,11 @@ def _dashscope_failure(code: Any) -> RecognitionError:
 
 
 def _connect_dashscope(config: _ProviderConfig):
+    # This trial cannot prove output/thinking bounds for streaming tasks.
+    # Preserve the controlled local protocol test without enabling external WS.
+    parsed = urlsplit(config.url)
+    if parsed.scheme not in {'ws', 'wss'} or not is_loopback_url(parsed._replace(scheme='https' if parsed.scheme == 'wss' else 'http').geturl()):
+        raise _safe_error('trial_authorization_required')
     try:
         from websockets.exceptions import InvalidStatus, WebSocketException
         from websockets.sync.client import connect
@@ -600,6 +609,10 @@ class _OpenAICompatibleProvider:
             request = self._audio_request(media, content_type, filename)
         else:
             request = self._image_request(media, content_type, filename)
+        request._noreset_trial_profile = {
+            'kind': 'asr' if kind == 'audio' else 'ocr', 'provider': self._config.name,
+            'model': self._config.model, 'source_sha256': hashlib.sha256(media).hexdigest(),
+        }
         return self._send(request)
 
     def _audio_request(self, media: bytes, content_type: str, filename: str) -> urllib.request.Request:
@@ -634,7 +647,7 @@ class _OpenAICompatibleProvider:
                 ],
                 "generationConfig": {
                     "temperature": 0,
-                    "maxOutputTokens": 8192,
+                    "maxOutputTokens": 1024,
                     "thinkingConfig": {"thinkingBudget": 0, "includeThoughts": False},
                 },
             }
@@ -693,6 +706,7 @@ class _OpenAICompatibleProvider:
         body = {
             "model": self._config.model,
             "temperature": 0,
+            "max_tokens": 4096,
             "messages": [
                 {
                     "role": "user",
@@ -713,8 +727,9 @@ class _OpenAICompatibleProvider:
             ],
         }
         if self._config.name == "aihubmix" and self._config.model == _AIHUBMIX_OCR_MODEL:
-            # Bound reasoning so dense tables leave time for the transcription.
-            body.update(enable_thinking=True, thinking_budget=1024)
+            # Documented gateway switch; this requests no reasoning and does
+            # not claim a service-side billing guarantee.
+            body.update(reasoning_effort='none')
         return urllib.request.Request(
             self._config.url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -729,6 +744,10 @@ class _OpenAICompatibleProvider:
         try:
             with _open_request(request, self._config.timeout_seconds) as response:
                 raw = response.read(self._config.max_response_bytes + 1)
+        except ModelClientError as exc:
+            if exc.code in {'trial_authorization_required', 'trial_budget_exhausted'}:
+                raise _safe_error(exc.code) from None
+            raise _safe_error('provider_unavailable') from None
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 raise _safe_error("provider_auth_failed") from None

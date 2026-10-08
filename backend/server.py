@@ -61,6 +61,7 @@ def _media_error_status(error):
  code=getattr(error,'code',str(error))
  if code in {'limit_exceeded','request_too_large'}:return 413
  if code=='media_limits_not_configured':return 503
+ if code in {'trial_authorization_required','trial_budget_exhausted'}:return 503
  if code in {'invalid_media','integrity_mismatch'}:return 422
  if code in {'storage_failed','storage_corrupt','unsafe_storage'}:return 500
  if code in {'unsupported_format','content_type_kind_mismatch'}:return 415
@@ -78,6 +79,7 @@ def _media_error_code(error):
   'provider_unavailable','provider_not_configured','provider_auth_failed',
   'provider_rate_limited','invalid_provider_response','no_text_detected','storage_failed',
   'storage_corrupt','unsafe_storage','media_limits_not_configured','invalid_range',
+  'trial_authorization_required','trial_budget_exhausted',
  }
  return code if code in known else 'media_request_failed'
 
@@ -136,7 +138,9 @@ def model_failure_details(error):
            'model_configuration_invalid':'模型配置无效','model_redirect_rejected':'模型地址返回重定向，已拒绝转发',
            'model_response_too_large':'模型响应超过大小限制','model_output_truncated':'模型输出被截断',
            'model_response_invalid':'模型返回内容格式无效','model_http_error':'模型服务请求失败',
-           'model_account_binding_required':'魔搭账号需先绑定阿里云账号'}
+           'model_account_binding_required':'魔搭账号需先绑定阿里云账号',
+           'trial_authorization_required':'合成试验尚未获预算授权，原文已保留',
+           'trial_budget_exhausted':'合成试验调用额度已用尽，原文已保留'}
  code=error.code if isinstance(error,AdapterError) and type(error.code) is str and error.code in messages else None
  status=error.status if isinstance(error,AdapterError) and code in {'model_http_error','model_account_binding_required'} and type(error.status)==int and 100<=error.status<=599 else None
  if code:

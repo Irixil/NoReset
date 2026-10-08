@@ -7,6 +7,7 @@ Errors deliberately exclude server bodies, URLs, credentials and exceptions.
 from __future__ import annotations
 
 import copy
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -16,6 +17,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+try:
+    from .trial_gate import authorize_request, TrialGateError
+except ImportError:
+    from trial_gate import authorize_request, TrialGateError
 
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -134,7 +139,11 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _open_request(request, timeout):
-    return urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=timeout)
+    try:
+        authorize_request(request)
+    except TrialGateError as error:
+        raise ModelClientError(str(error), code=error.code) from None
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler()).open(request, timeout=timeout)
 
 
 def _modelscope_account_binding_required(error, request_url):
@@ -159,7 +168,8 @@ def _modelscope_account_binding_required(error, request_url):
 class ChatCompletionsClient:
     def __init__(self, *, base_url: str, model: str, api_key: str,
                  timeout: float = 30, json_mode: bool = False,
-                 extra_body: dict | None = None, max_tokens: int = 4096):
+                 extra_body: dict | None = None, max_tokens: int = 4096,
+                 trial_provider: str = 'openai_compatible'):
         self.url = completion_url(base_url)
         if not isinstance(model, str) or not model.strip() or re.search(r'[\x00-\x1f\x7f]', model):
             raise ModelClientError('未配置有效模型名称')
@@ -174,6 +184,7 @@ class ChatCompletionsClient:
         self.model, self.api_key, self.timeout = model, api_key, timeout
         self.json_mode, self.max_tokens = json_mode, max_tokens
         self.extra_body = validate_extra_body(extra_body)
+        self.trial_provider = trial_provider
 
     def complete_json(self, system_prompt: str, payload: dict) -> dict:
         try:
@@ -196,6 +207,10 @@ class ChatCompletionsClient:
                 self.url, json.dumps(body, ensure_ascii=False, allow_nan=False).encode('utf-8'),
                 {'Authorization': 'Bearer ' + self.api_key,
                  'Content-Type': 'application/json', 'Accept': 'application/json'}, method='POST')
+            request._noreset_trial_profile = {
+                'kind': 'llm', 'provider': self.trial_provider, 'model': self.model,
+                'source_sha256': hashlib.sha256(serialized_payload.encode('utf-8')).hexdigest(),
+            }
             with _open_request(request, self.timeout) as response:
                 status = response.status
                 if status != 200:

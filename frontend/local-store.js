@@ -1049,6 +1049,13 @@
         error_message: '此前是模拟结果，不是原件内容。请在真实识别服务接通后重试。',
         error: { code: 'media_mock_unavailable', retryable: true } } };
     }
+    if (media.recognition_status === 'failed' && ['trial_authorization_required', 'trial_budget_exhausted'].includes(media.recognition?.error?.code)) {
+      const exhausted = media.recognition.error.code === 'trial_budget_exhausted';
+      return { ...media, recognition: { ...media.recognition, retryable: false, manual_retry_after_authorization: true,
+        error_message: exhausted ? '本次试验额度已用尽，原件已保存在本机。需要新的预算授权后才能手动重试。'
+          : '试验尚未获预算授权，原件已保存在本机。获得授权后可手动重试。',
+        error: { ...media.recognition.error, retryable: false } } };
+    }
     if (media.recognition_status === 'failed' && RECOVERABLE_MEDIA_ERRORS.has(media.recognition?.error?.code)) {
       return { ...media, recognition: { ...media.recognition, retryable: true,
         error_message: '识别暂未完成，原件已保存在本机。服务恢复后可以重试。',
