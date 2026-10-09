@@ -274,6 +274,20 @@
       return quotes.length >= 2 ? quotes : [];
     }))];
   }
+  function pendingQuestionLines(conversation) {
+    if (!analysisSourcesCurrent(conversation)) return [];
+    const questions = conversation.completeness?.pending_questions;
+    if (!Array.isArray(questions) || questions.length > 12) return [];
+    const safeQuestions = questions.filter(question => typeof question === 'string'
+      && question.trim() && question.length <= 160
+      && !/[<>\u0000-\u001f\u007f\u200b-\u200f\ufeff]/.test(question)
+      && (question.match(/[?？]/g) || []).length === 1 && /[?？]$/.test(question.trim())
+      && !unsafeAssistantText(question)).map(question => question.trim());
+    return [...new Set(safeQuestions)].map(question => ({
+      kind: 'check', text: question, candidate_question: true,
+      tags: ['助手候选 · 未回答'], source_label: '助手提出的待核实问题，不是患者陈述',
+    }));
+  }
   function buildConversationReport(conversation, previous = null) {
     const turns = elderTurns(conversation);
     if (!turns.length) return null;
@@ -371,6 +385,8 @@
     if (missing.length) riskLines.push({
       kind: 'check', text: `尚未问清：${missing.join('、')}。`, tags: ['信息未完整'], source_label: '继续对话后会自动补充',
     });
+    const pendingLines = pendingQuestionLines(conversation);
+    riskLines.push(...pendingLines);
     grouped.push({ key: 'verification', title: '尚待医生核实', lines: riskLines });
     const usefulSections = grouped.filter(section => section.lines.length);
     const bodyParts = usefulSections.map(section => `${section.title}\n${section.lines.map(line => `- ${line.tags?.length ? `${line.tags.join('、')}：` : ''}${line.text}`).join('\n')}`);
@@ -386,6 +402,7 @@
       source_turn_ids: turns.map(turn => turn.turn_id),
       source_versions: turns.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
       source_context_ids: conversation.completeness?.relevant_context_ids || [],
+      pending_questions: pendingLines.map(line => line.text),
       reviewed_risk_assessments: reviewedRisks,
       legacy_clinical_review_status: 'active_unvalidated',
       clinical_validation_status: 'not_verified_by_this_application',
@@ -435,7 +452,12 @@
     const cachedSummaries = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
       .filter(line => line.kind === 'summary').map(line => JSON.stringify([section.key, line]))).sort();
     const staleSummaries = JSON.stringify(expectedSummaries) !== JSON.stringify(cachedSummaries);
-    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary && !staleSummaries) return conversation;
+    const expectedPending = pendingQuestionLines(conversation);
+    const cachedPending = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
+      .filter(line => line.candidate_question === true).map(line => ({ section: section.key, line })));
+    const stalePending = JSON.stringify(expectedPending.map(line => ({ section: 'verification', line }))) !== JSON.stringify(cachedPending)
+      || JSON.stringify(conversation.report?.pending_questions || []) !== JSON.stringify(expectedPending.map(line => line.text));
+    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary && !staleSummaries && !stalePending) return conversation;
     return { ...conversation, report: buildConversationReport(reportInput, conversation.report) };
   }
   function conversationArchiveView(conversation) {
