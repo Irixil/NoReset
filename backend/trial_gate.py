@@ -424,7 +424,7 @@ def validate_trial_authorization(*, receipt_path=RECEIPT_PATH, state_path=STATE_
                     closed = _closed_context(connection, receipt)
                     result.update(scope_used_requests=len(steps),
                         next_kind=receipt['request_sequence'][len(steps)] if len(steps) < len(receipt['request_sequence']) else None,
-                        manual_review_required=bool(steps and connection.execute('SELECT 1 FROM trial_reviews WHERE attempt_id=?', (steps[-1][0],)).fetchone() != (1,)),
+                        manual_review_required=bool(steps and not _has_trial_review(connection, steps[-1][0])),
                         protected_through_attempt_id=closed.get('protected_through_attempt_id', closed['failed_attempt_id']) if closed else 0)
                 return result
             budget = int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)
@@ -988,8 +988,15 @@ def _risk_stage(connection, receipt, kind):
     if [row[1] for row in rows] != pattern[:len(rows)] or len(rows) >= len(pattern) or kind != pattern[len(rows)]:
         _deny()
     if rows:
-        if connection.execute('SELECT 1 FROM trial_reviews WHERE attempt_id=?', (rows[-1][0],)).fetchone() != (1,):
+        if not _has_trial_review(connection, rows[-1][0]):
             _deny()
+
+
+def _has_trial_review(connection, attempt_id):
+    # The first human confirmation lazily creates this table. Absence means
+    # pending review; a read-only preflight must not create it or assume consent.
+    return (_table_exists(connection, 'trial_reviews') and
+            connection.execute('SELECT 1 FROM trial_reviews WHERE attempt_id=?', (attempt_id,)).fetchone() == (1,))
 
 
 def confirm_trial_review(attempt_id, approval_ref, *, state_path=STATE_PATH):

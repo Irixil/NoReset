@@ -489,3 +489,25 @@ def test_zero_new_attempt_closed_scope_can_succeed_without_budget_or_history_res
     assert trial_budget.budget_snapshot(five['descriptor'])['reserved_estimate_usd']=='0.0203392'
     assert len(gate.trial_journal(state_path=next_meter.state_path))==8
     unchanged(case); unchanged(next_case)
+
+
+def test_first_native_asr_usage_before_first_review_has_readonly_pending_preflight(five):
+    case=proposal(five); meter,_=succeed(case)
+    ident=send(meter,case['document'],'asr')
+    with sqlite3.connect(meter.state_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trial_reviews'").fetchone() is None
+    before=meter.state_path.read_bytes()
+    preflight=gate.validate_trial_authorization(receipt_path=meter.receipt_path,state_path=meter.state_path)
+    assert preflight['manual_review_required'] is True and preflight['next_kind']=='llm'
+    assert preflight['remaining_requests']==2 and preflight['scope_used_requests']==1
+    assert meter.state_path.read_bytes()==before
+    with sqlite3.connect(meter.state_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trial_reviews'").fetchone() is None
+    with pytest.raises(gate.TrialGateError): send(meter,case['document'],'llm')
+    assert meter.state_path.read_bytes()==before
+    assert trial_budget.budget_snapshot(five['descriptor'])['attempt_allocations']==1
+    review(meter,ident)
+    assert gate.validate_trial_authorization(receipt_path=meter.receipt_path,state_path=meter.state_path)['manual_review_required'] is False
+    assert send(meter,case['document'],'llm')==7
+    assert trial_budget.budget_snapshot(five['descriptor'])['attempt_allocations']==2
+    unchanged(case)
