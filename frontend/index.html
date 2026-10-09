@@ -7,10 +7,10 @@
   <meta name="color-scheme" content="light">
   <meta name="description" content="加密保存在当前设备的健康记录与就诊交接工具。">
   <title>NoReset·内测版｜陪你记下来</title>
-  <link rel="manifest" href="manifest.webmanifest?v=20261009-noreset-audio-review-1">
-  <link rel="stylesheet" href="styles.css?v=20261009-noreset-audio-review-1">
-  <link rel="stylesheet" href="ios.css?v=20261009-noreset-audio-review-1">
-  <link rel="stylesheet" href="splash.css?v=20261009-noreset-audio-review-1">
+  <link rel="manifest" href="manifest.webmanifest?v=audio-recovery-20261009-1">
+  <link rel="stylesheet" href="styles.css?v=audio-recovery-20261009-1">
+  <link rel="stylesheet" href="ios.css?v=audio-recovery-20261009-1">
+  <link rel="stylesheet" href="splash.css?v=audio-recovery-20261009-1">
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true">
@@ -28,7 +28,7 @@
   </svg>
 
   <div id="splashScreen" class="splash-screen" role="dialog" aria-label="NoReset启动页" aria-modal="true">
-    <div class="splash-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=20261009-noreset-audio-review-1" alt=""></div>
+    <div class="splash-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=audio-recovery-20261009-1" alt=""></div>
     <div class="splash-copy"><p>NoReset</p><h1>每一次不舒服，<br>都值得被好好记住。</h1></div>
     <button id="splashSkip" class="splash-skip" type="button">现在开始</button>
   </div>
@@ -36,7 +36,7 @@
 
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand" aria-label="NoReset·内测版"><div class="brand-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=20261009-noreset-audio-review-1" alt=""></div><div><strong>NoReset·内测版</strong><span>陪你把每次不舒服记下来</span></div></div>
+      <div class="brand" aria-label="NoReset·内测版"><div class="brand-mark" aria-hidden="true"><img src="assets/brand-mascot.png?v=audio-recovery-20261009-1" alt=""></div><div><strong>NoReset·内测版</strong><span>陪你把每次不舒服记下来</span></div></div>
       <div class="topbar-actions"><div id="modePill" class="device-pill" role="status" aria-live="polite">等待解锁</div><button class="settings-button" type="button" data-view="settingsView" aria-label="打开设置"><svg aria-hidden="true"><use href="#i-settings"/></svg></button></div>
     </header>
 
@@ -75,7 +75,7 @@
           </div>
 
           <section id="conversationResumeChoice" class="conversation-choice hidden" aria-labelledby="resumeChoiceTitle">
-            <img src="assets/brand-mascot.png?v=20261009-noreset-audio-review-1" alt="" aria-hidden="true">
+            <img src="assets/brand-mascot.png?v=audio-recovery-20261009-1" alt="" aria-hidden="true">
             <h2 id="resumeChoiceTitle">上次的话还要接着说吗？</h2>
             <p>继续会补到原来的报告里；新记录会单独保存。</p>
             <button id="continueConversationBtn" class="primary" type="button">接着上次说</button>
@@ -204,13 +204,13 @@
   <template id="conversationRecordTpl"><article class="event-item conversation-record"><label class="handoff-choice"><input class="handoff-select" type="checkbox" checked><span>用于就诊交接</span></label><div class="event-main"><div class="event-date"></div><h2 class="conversation-record-title"></h2><div class="event-raw"></div><div class="badges"></div></div><div class="record-actions"><button class="view-btn" type="button">查看完整对话</button><button class="record-delete-btn" type="button" aria-label="删除这条完整对话"><svg aria-hidden="true"><use href="#i-trash"/></svg></button></div></article></template>
   <template id="eventTpl"><article class="event-item standalone-record"><label class="handoff-choice"><input class="handoff-select" type="checkbox" checked><span>用于就诊交接</span></label><div class="event-main"><div class="event-date"></div><div class="event-raw"></div><div class="badges"></div></div><div class="record-actions"><button class="view-btn" type="button">查看单条记录</button><button class="record-delete-btn" type="button" aria-label="删除这条记录"><svg aria-hidden="true"><use href="#i-trash"/></svg></button></div></article></template>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="runtime-config.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="config.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="local-store-core.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="safety.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="local-store.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="splash.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="app.js?v=20261009-noreset-audio-review-1"></script>
-  <script src="media.js?v=20261009-noreset-audio-review-1"></script>
+  <script src="runtime-config.js?v=audio-recovery-20261009-1"></script>
+  <script src="config.js?v=audio-recovery-20261009-1"></script>
+  <script src="local-store-core.js?v=audio-recovery-20261009-1"></script>
+  <script src="safety.js?v=audio-recovery-20261009-1"></script>
+  <script src="local-store.js?v=audio-recovery-20261009-1"></script>
+  <script src="splash.js?v=audio-recovery-20261009-1"></script>
+  <script src="app.js?v=audio-recovery-20261009-1"></script>
+  <script src="media.js?v=audio-recovery-20261009-1"></script>
 </body>
 </html>

@@ -933,7 +933,7 @@
     return cloudRequest('/api/ai/conversation-turn', { method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)), ...(trialContinue ? { trialVoiceContinue: { ...conversation.trial_control, conversation_version: conversation.version } } : {}) });
   }
 
-  async function conversationRequest(path, options, locked = false, sourceLocked = false) {
+  async function conversationRequest(path, options, locked = false, sourceLocked = false, backgroundInactive = false) {
     const method = options?.method || 'GET';
     const pathname = path.split('?')[0];
     const parts = pathname.split('/').filter(Boolean);
@@ -1113,7 +1113,7 @@
       }
       const withUser = {
         ...conversation,
-        status: 'active',
+        status: backgroundInactive ? conversation.status : 'active',
         turns: [...conversation.turns, userTurn],
         controller: conversation.controller,
         completeness: conversation.completeness,
@@ -1123,6 +1123,9 @@
       conversation = controlled ? await saveTrialConversation({ ...withUser, status: 'paused' }, { ...controlled, conversation_id: conversationId, turn_id: userTurn.turn_id, turn_version: userTurn.version, media_id: body.media_id }) : await saveConversation(withUser);
       await vault.put(`operation:conversation-turn:${operationKey}`, { conversation_id: conversationId, turn_id: userTurn.turn_id });
       if (controlled) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id, trial_control: conversation.trial_control });
+      // A recognition already in flight can complete after an explicit pause.
+      // Save its source and report, then wait for the user to return for a reply.
+      if (backgroundInactive) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id });
       const result = await conversationReply(conversation);
       conversation = await appendAssistantResult(conversation, result);
       if (body.keep_media_until_pause !== true) await cleanupTemporaryAudio(body.media_id);
@@ -1290,7 +1293,8 @@
       return withRecognitionLocks(media, () => withMediaLock('voice-recognition-start', async () => {
         const current = await vault.get(mediaKey(mediaId));
         if (!current) return fail(404, 'media_not_found');
-        if (current.conversation_id && !(await vault.get(conversationKey(current.conversation_id)))) return fail(404, 'conversation_not_found');
+        const sourceConversation = current.conversation_id ? await vault.get(conversationKey(current.conversation_id)) : null;
+        if (current.conversation_id && !sourceConversation) return fail(404, 'conversation_not_found');
         if (mediaPublic(current).recognition_status === 'processing') return ok(202, { ok: true, action: 'existing', media: mediaPublic(current) });
         if (current.kind === 'audio') {
           const trial = await trialVoiceState();
@@ -1298,7 +1302,8 @@
           if (current.recognition_status === 'succeeded' && current.trial_control) return ok(200, { ok: true, media: mediaPublic(current) });
           if ((await mediaList()).some(item => item.media_id !== mediaId && item.kind === 'audio' && item.recognition_status === 'processing')) return fail(409, 'audio_recognition_in_progress', { media: mediaPublic(current) });
         }
-        const processing = { ...current, recognition_status: 'processing', version: current.version + 1, updated_at: now(), recognition: null };
+        const processing = { ...current, conversation_version_at_start: sourceConversation?.version ?? null,
+          recognition_status: 'processing', version: current.version + 1, updated_at: now(), recognition: null };
         await vault.put(mediaKey(mediaId), processing);
         processRecognition(processing);
         return ok(202, { ok: true, action: 'started', media: mediaPublic(processing) });
@@ -1351,6 +1356,11 @@
         let updated = { ...current, ...(trial ? { trial_control: trial } : {}), recognition_status: 'succeeded', recognition: result.j.recognition, local_safety: created.j.event.local_safety, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', link_pending_reason: media.temporary === true && media.conversation_id ? 'conversation_link_pending' : null, conversation_link_error: null, version: current.version + 1, updated_at: now() };
         await vault.put(mediaKey(media.media_id), updated);
         if (updated.temporary === true && updated.conversation_id) {
+          // Only a pause/finish after this attempt started defers the reply.
+          // A new recording made after returning to a paused conversation still
+          // follows the ordinary automatic dialogue path.
+          const backgroundInactive = !trial && ['paused', 'finished'].includes(conversation.status)
+            && conversation.version !== media.conversation_version_at_start;
           // This internal source is already owned by the conversation lock.
           // Its local owner pointer makes archive mutations take that lock too;
           // avoid taking event after media, which would invert delete's order.
@@ -1358,12 +1368,17 @@
             method: 'POST',
             headers: { 'Idempotency-Key': `media-conversation:${updated.media_id}` },
             body: JSON.stringify({ text: result.j.recognition.text, source_kind: 'audio_transcript', record_id: created.j.event.record_id, media_id: updated.media_id, expected_version: conversation.version, keep_media_until_pause: true }),
-          }, true, true);
+          }, true, true, backgroundInactive);
           if (linked.r.ok && linked.j.turn_id) {
             updated = { ...updated, conversation_turn_id: linked.j.turn_id, version: updated.version + 1, updated_at: now() };
           } else updated = { ...updated, conversation_link_error: linked.j.error || 'conversation_link_failed' };
           updated = { ...updated, link_pending_reason: null, updated_at: now() };
           await vault.put(mediaKey(media.media_id), updated);
+          if (backgroundInactive && linked.r.ok && linked.j.turn_id && updated.kind === 'audio') {
+            // The media lock is already held. Apply the same successful,
+            // temporary, non-trial cleanup without trying to acquire it again.
+            await vault.mutate({ deletes: [mediaBinaryKey(updated.media_id), mediaKey(updated.media_id)] });
+          }
         }
       });
     } catch (error) {
