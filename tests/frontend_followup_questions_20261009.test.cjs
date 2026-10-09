@@ -210,7 +210,7 @@ test('pending-only changes and legacy or mistagged candidate caches rebuild loca
   assert.equal(h.calls.length, calls);
 });
 
-test('edited source versions or missing bindings cannot reuse old pending candidates as current analysis', async () => {
+test('edited source versions invalidate clinical analysis while independent candidate history remains explicitly scoped', async () => {
   const h = await harness(), c = await twoPending(h), calls = h.calls.length;
   const key = 'conversation:' + c.conversation_id;
   for (const change of ['version', 'quote', 'missing-binding']) {
@@ -222,15 +222,24 @@ test('edited source versions or missing bindings cannot reuse old pending candid
     await h.api.vault.put(key, changed);
     const current = await h.read(c);
     assert.equal(current.completeness, null, change);
-    assert.deepEqual(plain(current.report.pending_questions), [], change);
-    assert.equal(candidates(current).length, 0, change);
+    const expected = change === 'missing-binding' ? questions.slice(1) : questions;
+    assert.deepEqual(plain(current.report.pending_questions), expected, change);
+    assert.equal(candidates(current).length, expected.length, change);
+    assert.equal(lines(current).some(line => line.kind === 'summary'), false, 'Old clinical summary cannot survive');
+    assert.equal(current.report.question_coverage.kind, 'assistant_question_coverage_not_clinical_facts');
+    if (change !== 'missing-binding') {
+      assert.deepEqual(plain(current.report.question_coverage.historical_scope_questions), questions);
+      assert.ok(candidates(current).every(line => /历史.*重新核实/.test(line.tags[0])
+        && /未确认与当前主诉相关/.test(line.source_label)));
+    } else assert.deepEqual(plain(current.report.question_coverage.resolved_questions.map(item => item.question)), [questions[0]],
+      'Missing clinical binding does not erase an actual literal answer');
     assert.deepEqual(plain(current.controller.followup_questions), questions, 'Stored candidate history is not a current patient fact');
     assert.ok(current.report.transcript.some(turn => turn.text === elder.text && turn.version === elder.version));
   }
   assert.equal(h.calls.length, calls);
 });
 
-test('a selected background version change invalidates pending questions before a new model reply', async () => {
+test('a selected background version change invalidates clinical analysis and marks retained candidates historical', async () => {
   const h = await harness();
   const entry = (await h.request('/api/health-context', { fields: { conditions: ['纯虚构：已确认旧背景'] } })).health_context.entries[0];
   let c = await h.start();
@@ -242,8 +251,12 @@ test('a selected background version change invalidates pending questions before 
   await h.request('/api/health-context', { fields: { conditions: ['纯虚构：已确认新背景'] } });
   const changed = await h.read(c);
   assert.equal(changed.completeness, null);
-  assert.equal(candidates(changed).length, 0);
-  assert.deepEqual(plain(changed.report.pending_questions), []);
+  assert.equal(candidates(changed).length, questions.length);
+  assert.deepEqual(plain(changed.report.pending_questions), questions);
+  assert.deepEqual(plain(changed.report.question_coverage.historical_scope_questions), questions);
+  assert.ok(candidates(changed).every(line => /历史.*重新核实/.test(line.tags[0])
+    && /未确认与当前主诉相关/.test(line.source_label)));
+  assert.equal(lines(changed).some(line => line.kind === 'summary'), false);
   assert.equal(h.calls.length, calls);
 });
 

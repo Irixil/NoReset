@@ -42,6 +42,8 @@ ASR文字是机器初稿，可供正常对话整理，但会话报告保持 `aut
 - `POST /api/ai/organize`：需 Cookie + CSRF + `consent:true`；只返回经验证的草稿和本地安全字段，不写数据库。
 - `POST /api/ai/conversation-turn`：需精确 Origin、签名 Cookie 和 CSRF。`turns` 为 1–40 条老人原话，每条 `{turn_id,text,version?,responding_to?:{turn_id,text}}`；`responding_to` 只解释回答语境，助手 ID 不能作为患者事实来源。`health_context` 在客户端发送前限制为本次显式勾选的最多 5 项；未勾选内容不外发。完整对话仍保存在本机。`action` 可为 `ask / reply / finish / urgent`：`reply` 表示本轮仅回应、不结束、不新增追问计数；`assistant_text` 是已经验证的完整回应，模型内部 `reply_text` 不作为患者事实。
   `controller.followup_questions?:string[]` 保存模型多项候选中经过现有单问和范围校验的项目（最多 12 条，每条最多 160 字，包含已问/已答项目）；客户端原样加密保存并在后续发言时回传。`completeness.pending_questions?:string[]` 是仍未回答的候选，医生报告将其标为“助手候选 · 未回答”，不得当作患者事实或阴性结论。模型仍选择下一问；此元数据不强制固定问序，不突破主动结束、疲劳与总计 12 问上限。未核实项会在结束后保留，`complete` 不因其他类别已有事实而忽略它们。同一类别多个短回答分别绑定实际问题和患者来源。
+  本机医生报告另列“原话与对应问题”：短答保留患者原句、原话 ID 和版本，旁列实际助手问题全文及其 ID/版本，标为非患者陈述；不会将“没有”扩写成症状结论。对应关系须匹配库内实际问题和原始顺序，失效问题只作历史展示。
+  报告的 `question_coverage` 是候选提名来源与当前回答的工程记录，不是临床分析。追加危险原话后，即使旧临床分析已清除，仍逐项从当前原话和有效问答重算待核实清单；未知、拒答、历史、他人和未回答说明不作否认。提名的原话或背景范围改变时，旧候选明确标为历史、范围需重新核实。刷新与加密备份恢复同样检查来源和版本，不复用失效摘要。
 - `POST /api/ai/media/recognize`：需 Cookie + CSRF，`multipart/form-data` 严格包含 `kind` / `content_type` / `attempt_id` / `file`；原件只写入临时文件，请求完成或失败后删除。
 - `GET /api/backups`：需登录 Cookie；只列出私有 TOS 中 `backups/` 下密文对象的名称、大小和时间，不返回内容。
 - `POST /api/backups/upload-grant`：需 Cookie + CSRF，请求 `size` 与 64 位十六进制 `sha256`；返回服务端生成对象名及最多 15 分钟、默认 5 分钟有效的 TOS `PUT` 地址。浏览器直接上传已经加密的 `.bingli` 包。

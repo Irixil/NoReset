@@ -274,21 +274,200 @@
       return quotes.length >= 2 ? quotes : [];
     }))];
   }
-  function pendingQuestionLines(conversation) {
-    if (!analysisSourcesCurrent(conversation)) return [];
-    const questions = conversation.completeness?.pending_questions;
+  function safeReportQuestions(questions) {
     if (!Array.isArray(questions) || questions.length > 12) return [];
-    const safeQuestions = questions.filter(question => typeof question === 'string'
+    return [...new Set(questions.filter(question => typeof question === 'string'
       && question.trim() && question.length <= 160
       && !/[<>\u0000-\u001f\u007f\u200b-\u200f\ufeff]/.test(question)
       && (question.match(/[?？]/g) || []).length === 1 && /[?？]$/.test(question.trim())
-      && !unsafeAssistantText(question)).map(question => question.trim());
-    return [...new Set(safeQuestions)].map(question => ({
+      && !unsafeAssistantText(question)).map(question => question.trim()))];
+  }
+  function questionText(text) {
+    if (typeof text !== 'string' || (text.match(/[?？]/g) || []).length !== 1) return null;
+    return safeReportQuestions([text.split(/[。！!\n]/).at(-1).trim()])[0] || null;
+  }
+  function answerQuestion(conversation, turn) {
+    const index = conversation.turns.indexOf(turn), question = conversation.turns[index - 1];
+    if (!question || question.role !== 'assistant' || question.ai_failed || mockSource(question)
+      || !['ask', 'reply'].includes(question.action)
+      || !Number.isSafeInteger(question.version) || question.version < 1
+      || !Number.isSafeInteger(turn.version) || turn.version < 1
+      || conversation.turns.filter(item => item.turn_id === turn.turn_id).length !== 1
+      || conversation.turns.filter(item => item.turn_id === question.turn_id).length !== 1
+      || turn.responding_to?.turn_id !== question.turn_id || turn.responding_to?.text !== question.text
+      || (turn.responding_to_version ?? 1) !== question.version || unsafeAssistantText(question.text)) return null;
+    const text = questionText(question.text);
+    return text ? { question: text, current: !question.superseded,
+      source: { turn_id: question.turn_id, version: question.version, quote: question.text } } : null;
+  }
+  const SHORT_ANSWER = /^(?:没有|没|无|不是|有|是|有的|不知道|不清楚|不确定|不记得)[。.!！\s]*$/;
+  const ANSWER_UNCLEAR = /不知道|不清楚|不确定|不记得|记不清|说不清|可能|也许|好像|大概|如果|假如|假设|万一|担心|害怕|不想说|不愿说|不方便说|拒绝|不回答|没(?:有)?回答|未回答|还没说|没(?:有)?告诉|未告诉|没(?:有)?说清|没(?:有)?提到|没(?:有)?说过|为什么问|问我|您问|你问|刚才说错|更正|纠正|[?？]/;
+  const ANSWER_OTHER = /(?:妈妈|爸爸|母亲|父亲|家人|孩子|女儿|儿子|朋友|邻居|他|她|别人)/;
+  const ANSWER_PAST = /以前|之前|曾经|过去|去年|前年|昨天|前天|上次|当时|小时候/;
+  function presenceTopic(question) {
+    const markers = question.match(/有没有|有无|是否有/g) || [];
+    if (markers.length !== 1) return null;
+    const topic = question.split(/有没有|有无|是否有/)[1]?.replace(/[?？]$/, '').replace(/的情况$/, '').trim();
+    return topic && !/[、，,；;或和及与]/.test(topic) ? topic : null;
+  }
+  function currentAnswerClauses(text) {
+    let otherSubject = false, past = false;
+    const current = [];
+    const clauses = (text.match(/[^，。；！？,;!?\n]+[！？!?]?/g) || []).flatMap(value => value.split(/但是|可是|不过|但/));
+    for (let clause of clauses) {
+      clause = clause.trim().replace(/^纯虚构[:：]\s*/, '').replace(/[！!]+$/, '');
+      if (!clause) continue;
+      if (ANSWER_OTHER.test(clause)) otherSubject = true;
+      if (ANSWER_PAST.test(clause)) past = true;
+      if (/^(?:我(?:现在|目前|今天)|(?:现在|目前|今天)我)/.test(clause)
+        && !ANSWER_OTHER.test(clause) && !ANSWER_PAST.test(clause)) { otherSubject = false; past = false; }
+      if (!otherSubject && !past) current.push(clause);
+    }
+    return current;
+  }
+  function rawAddressesQuestion(conversation, turn, question) {
+    if (typeof turn.text !== 'string' || !Number.isSafeInteger(turn.version) || turn.version < 1
+      || conversation.turns.filter(item => item.turn_id === turn.turn_id).length !== 1) return null;
+    const bound = answerQuestion(conversation, turn);
+    if (/^(?:没有|没|无|不是|有|是|有的)[。.!！\s]*$/.test(turn.text)) {
+      return bound?.current && bound.question === question ? 'actual_single_question_answer' : null;
+    }
+    const topic = presenceTopic(question);
+    if (!topic) return null;
+    // This is literal conversation coverage, not symptom interpretation. Topics
+    // come from the saved question; no disease vocabulary or synonyms are used.
+    for (const clause of currentAnswerClauses(turn.text)) {
+      const selfCurrent = /^(?:我(?:现在|目前|今天)|(?:现在|目前|今天)我)/.test(clause);
+      if (!clause.includes(topic) || ANSWER_UNCLEAR.test(clause)) continue;
+      const before = clause.slice(0, clause.indexOf(topic)), after = clause.slice(clause.indexOf(topic) + topic.length);
+      if (/^(?:(?:我(?:现在|目前|今天)?|(?:现在|目前|今天)(?:我)?)?(?:还|也|确实)?(?:没有|没|无|不是))$/.test(before)
+        && /^(?:了|的情况)?$/.test(after)) return 'literal_current_answer';
+      if (selfCurrent && /^(?:我(?:现在|目前|今天)|(?:现在|目前|今天)我)(?:还|也|确实)?$/.test(before)
+        && /^(?:了|的情况)?$/.test(after)) return 'literal_current_answer';
+    }
+    return null;
+  }
+  function coverageSources(conversation, currentContext = null) {
+    return { ...analysisSources(conversation, currentContext),
+      turns: elderTurns(conversation).map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text,
+        responding_to: turn.responding_to ? { turn_id: turn.responding_to.turn_id, text: turn.responding_to.text } : null,
+        responding_to_version: turn.responding_to_version ?? null })),
+      questions: conversation.turns.filter(turn => turn.role === 'assistant' && !mockSource(turn)).map(turn => ({
+        turn_id: turn.turn_id, version: turn.version, quote: turn.text, action: turn.action,
+        superseded: Boolean(turn.superseded), ai_failed: Boolean(turn.ai_failed) })),
+      episode: conversation.active_episode_start_turn_id || null };
+  }
+  function safeQuestionNomination(origin) {
+    const source = item => item && typeof item.turn_id === 'string' && item.turn_id.trim()
+      && Number.isSafeInteger(item.version) && item.version > 0 && typeof item.quote === 'string'
+      && item.quote.trim() && item.quote.length <= 10000;
+    return Boolean(origin && typeof origin === 'object' && !Array.isArray(origin)
+      && (origin.assistant_source === null || source(origin.assistant_source))
+      && Array.isArray(origin.patient_sources) && origin.patient_sources.length > 0 && origin.patient_sources.length <= 40
+      && origin.patient_sources.every(source)
+      && new Set(origin.patient_sources.map(item => item.turn_id)).size === origin.patient_sources.length
+      && Array.isArray(origin.selected_context_ids) && origin.selected_context_ids.length <= 5
+      && origin.selected_context_ids.every(value => typeof value === 'string')
+      && Array.isArray(origin.context) && origin.context.length <= 5
+      && (origin.episode === null || typeof origin.episode === 'string')
+      && typeof origin.origin_verified === 'boolean');
+  }
+  function questionCoverage(conversation, previous = null, currentContext = null) {
+    const sources = coverageSources(conversation, currentContext), candidates = [];
+    const prior = previous?.question_coverage;
+    if (prior?.format_version === 1 && prior.conversation_id === conversation.conversation_id && Array.isArray(prior.candidates)
+      && prior.candidates.length <= 12) for (const item of prior.candidates) {
+      if (safeReportQuestions([item?.question]).length && safeQuestionNomination(item.nomination)
+        && !candidates.some(candidate => candidate.question === item.question.trim())) {
+        candidates.push({ question: item.question.trim(), nomination: item.nomination });
+      }
+    }
+    const bound = Boolean(conversation.completeness && analysisSourcesCurrent(conversation, currentContext));
+    const proposed = safeReportQuestions(conversation.controller?.followup_questions);
+    if (bound) proposed.push(...safeReportQuestions(conversation.completeness?.pending_questions));
+    const first = conversation.turns.find(turn => turn.role === 'assistant' && !turn.superseded && !turn.ai_failed && !mockSource(turn)
+      && Number.isSafeInteger(turn.version) && turn.version > 0
+      && conversation.turns.filter(item => item.turn_id === turn.turn_id).length === 1
+      && ['ask', 'reply'].includes(turn.action) && proposed.includes(questionText(turn.text)));
+    for (const question of [...new Set(proposed)]) {
+      if (candidates.some(item => item.question === question) || candidates.length === 12) continue;
+      const before = first ? conversation.turns.indexOf(first) : conversation.turns.length;
+      candidates.push({ question, nomination: {
+        assistant_source: first ? { turn_id: first.turn_id, version: first.version, quote: first.text } : null,
+        patient_sources: elderTurns(conversation).filter(turn => conversation.turns.indexOf(turn) < before)
+          .map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
+        selected_context_ids: sources.selected_context_ids, context_version: sources.context_version, context: sources.context,
+        episode: sources.episode, origin_verified: bound && Boolean(first),
+      } });
+    }
+    const resolved = [], scopeChanged = [];
+    for (const item of candidates) {
+      const origin = item.nomination, assistant = conversation.turns.find(turn => turn.turn_id === origin.assistant_source?.turn_id);
+      const current = origin.origin_verified === true && assistant?.role === 'assistant' && !mockSource(assistant)
+        && !assistant.superseded && !assistant.ai_failed && ['ask', 'reply'].includes(assistant.action)
+        && Number.isSafeInteger(assistant.version) && assistant.version > 0
+        && conversation.turns.filter(turn => turn.turn_id === assistant.turn_id).length === 1
+        && candidates.some(candidate => candidate.question === questionText(assistant.text))
+        && safeQuestionNomination(origin)
+        && assistant.version === origin.assistant_source.version && assistant.text === origin.assistant_source.quote
+        && origin.patient_sources.every(source => elderTurns(conversation).some(turn => turn.turn_id === source.turn_id
+          && turn.version === source.version && turn.text === source.quote
+          && conversation.turns.filter(item => item.turn_id === turn.turn_id).length === 1
+          && conversation.turns.indexOf(turn) < conversation.turns.indexOf(assistant)))
+        && JSON.stringify([origin.selected_context_ids, origin.context_version, origin.context, origin.episode])
+          === JSON.stringify([sources.selected_context_ids, sources.context_version, sources.context, sources.episode]);
+      if (!current) { scopeChanged.push(item.question); continue; }
+      // Later actual answers replace earlier coverage. An unknown/correction
+      // mentioning this topic conservatively reopens it rather than reusing No.
+      let evidence = null;
+      const topic = presenceTopic(item.question);
+      for (const turn of elderTurns(conversation)) {
+        if (conversation.turns.indexOf(turn) <= conversation.turns.indexOf(assistant)) continue;
+        const method = rawAddressesQuestion(conversation, turn, item.question);
+        if (method) evidence = { question: item.question, method,
+          answer_source: { turn_id: turn.turn_id, version: turn.version, quote: turn.text },
+          question_source: method === 'actual_single_question_answer' ? answerQuestion(conversation, turn).source : null };
+        else {
+          const clauses = currentAnswerClauses(turn.text), question = answerQuestion(conversation, turn);
+          if (clauses.some(clause => ANSWER_UNCLEAR.test(clause) && (topic && clause.includes(topic)
+            || question?.current && question.question === item.question))) evidence = null;
+        }
+      }
+      if (evidence) resolved.push(evidence);
+    }
+    // A current backend analysis owns normal (including complex) answer
+    // semantics. This limited literal receipt proves engineering coverage only;
+    // it derives the fallback list when that clinical analysis is unavailable.
+    const pending = bound ? safeReportQuestions(conversation.completeness?.pending_questions)
+      : candidates.filter(item => !resolved.some(answer => answer.question === item.question)).map(item => item.question);
+    return { format_version: 1, kind: 'assistant_question_coverage_not_clinical_facts', conversation_id: conversation.conversation_id,
+      sources, candidates, resolved_questions: resolved, historical_scope_questions: scopeChanged, pending_questions: pending };
+  }
+  function answerContextLines(conversation) {
+    return elderTurns(conversation).filter(turn => SHORT_ANSWER.test(turn.text)).flatMap(turn => {
+      const bound = answerQuestion(conversation, turn);
+      if (!bound) return [];
+      const label = bound.current ? '助手实际问题 · 非患者陈述' : '助手历史问题 · 已失效 · 非患者陈述';
+      return [
+        { kind: 'check', text: bound.source.quote, answer_context_question: true, tags: [label],
+          question_source: bound.source, source_label: `助手问题 ${bound.source.turn_id} · 第 ${bound.source.version} 版` },
+        { kind: 'quote', text: turn.text, answer_context_answer: true, tags: ['患者原答 · 对应上方问题'],
+          source_turn_ids: [turn.turn_id], source_versions: [{ turn_id: turn.turn_id, version: turn.version, quote: turn.text }],
+          question_source: bound.source, question_binding_current: bound.current,
+          source_label: `患者原话 ${turn.turn_id} · 对应助手问题“${bound.question}”` },
+      ];
+    });
+  }
+  function pendingQuestionLines(conversation, coverage = questionCoverage(conversation, conversation.report)) {
+    return coverage.pending_questions.map(question => ({
       kind: 'check', text: question, candidate_question: true,
-      tags: ['助手候选 · 未回答'], source_label: '助手提出的待核实问题，不是患者陈述',
+      tags: [coverage.historical_scope_questions.includes(question) ? '助手历史候选 · 范围需重新核实' : '助手候选 · 未回答'],
+      source_label: coverage.historical_scope_questions.includes(question)
+        ? '历史助手候选，来源范围已变或未确认；不是当前患者事实，也未确认与当前主诉相关'
+        : '助手提出的待核实问题，不是患者陈述',
     }));
   }
-  function buildConversationReport(conversation, previous = null) {
+  function buildConversationReport(conversation, previous = null, currentContext = null) {
     const turns = elderTurns(conversation);
     if (!turns.length) return null;
     const transcript = turns.map((turn, index) => `${index + 1}. ${turn.text}`);
@@ -308,13 +487,19 @@
       const line = groundedReportSummary(state[category], conversation);
       if (!line) continue;
       const sectionKey = reportSectionFor([category], category === 'main_complaint');
-      if (sectionKey) { bySection.get(sectionKey).lines.push(line); collectedCategories.add(category); }
+      if (sectionKey) {
+        collectedCategories.add(category);
+        // Short replies keep their valid backend category, but their meaning
+        // is displayed only with the actual question and patient original.
+        if (!SHORT_ANSWER.test(line.text)) bySection.get(sectionKey).lines.push(line);
+      }
     }
     const hasCurrentSummary = grouped.some(section => section.lines.some(line => line.kind === 'summary'));
     if (!hasCurrentSummary) grouped.filter(section => section.key !== 'patient_questions')
       .forEach(section => { section.title += '（原话历史 · 待核对）'; });
     turns.forEach((turn, index) => {
       if (REPORT_META_MESSAGE.test(turn.text || '')) return;
+      if (SHORT_ANSWER.test(turn.text)) return;
       if (/(担心|害怕|会不会|要不要|怎么办|想知道)/.test(turn.text || '') && !REPORT_PATTERNS.main_complaint.test(turn.text || '')) {
         bySection.get('patient_questions').lines.push({ kind: 'quote', text: turn.text, tags: ['患者疑问'],
           source_turn_ids: [turn.turn_id], source_versions: [{ turn_id: turn.turn_id, version: turn.version, quote: turn.text }],
@@ -385,7 +570,10 @@
     if (missing.length) riskLines.push({
       kind: 'check', text: `尚未问清：${missing.join('、')}。`, tags: ['信息未完整'], source_label: '继续对话后会自动补充',
     });
-    const pendingLines = pendingQuestionLines(conversation);
+    const coverage = questionCoverage(conversation, previous, currentContext);
+    const answerLines = answerContextLines(conversation);
+    if (answerLines.length) grouped.push({ key: 'answer_context', title: '原话与对应问题', lines: answerLines });
+    const pendingLines = pendingQuestionLines(conversation, coverage);
     riskLines.push(...pendingLines);
     grouped.push({ key: 'verification', title: '尚待医生核实', lines: riskLines });
     const usefulSections = grouped.filter(section => section.lines.length);
@@ -403,6 +591,7 @@
       source_versions: turns.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
       source_context_ids: conversation.completeness?.relevant_context_ids || [],
       pending_questions: pendingLines.map(line => line.text),
+      question_coverage: coverage,
       reviewed_risk_assessments: reviewedRisks,
       legacy_clinical_review_status: 'active_unvalidated',
       clinical_validation_status: 'not_verified_by_this_application',
@@ -447,18 +636,23 @@
     const expectedSummaries = analysisSourcesCurrent(conversation, currentContext) ? CLINICAL_CATEGORIES.flatMap(category => {
       const line = groundedReportSummary(conversation.completeness?.clinical_state?.[category], conversation);
       const section = reportSectionFor([category], category === 'main_complaint');
-      return line && section ? [JSON.stringify([section, line])] : [];
+      return line && section && !SHORT_ANSWER.test(line.text) ? [JSON.stringify([section, line])] : [];
     }).sort() : [];
     const cachedSummaries = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
       .filter(line => line.kind === 'summary').map(line => JSON.stringify([section.key, line]))).sort();
     const staleSummaries = JSON.stringify(expectedSummaries) !== JSON.stringify(cachedSummaries);
-    const expectedPending = pendingQuestionLines(conversation);
+    const expectedCoverage = questionCoverage(conversation, conversation.report, currentContext);
+    const expectedPending = pendingQuestionLines(conversation, expectedCoverage);
     const cachedPending = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
       .filter(line => line.candidate_question === true).map(line => ({ section: section.key, line })));
     const stalePending = JSON.stringify(expectedPending.map(line => ({ section: 'verification', line }))) !== JSON.stringify(cachedPending)
       || JSON.stringify(conversation.report?.pending_questions || []) !== JSON.stringify(expectedPending.map(line => line.text));
-    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary && !staleSummaries && !stalePending) return conversation;
-    return { ...conversation, report: buildConversationReport(reportInput, conversation.report) };
+    const staleCoverage = JSON.stringify(conversation.report?.question_coverage) !== JSON.stringify(expectedCoverage);
+    const cachedAnswers = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
+      .filter(line => line.answer_context_question || line.answer_context_answer).map(line => ({ section: section.key, line })));
+    const staleAnswers = JSON.stringify(answerContextLines(conversation).map(line => ({ section: 'answer_context', line }))) !== JSON.stringify(cachedAnswers);
+    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary && !staleSummaries && !stalePending && !staleCoverage && !staleAnswers) return conversation;
+    return { ...conversation, report: buildConversationReport(reportInput, conversation.report, currentContext) };
   }
   function conversationArchiveView(conversation) {
     const current = conversationWithCurrentReport(conversation);
@@ -1194,6 +1388,7 @@
       const previous = liveConversationTurns(conversation).at(-1);
       if (previous?.role === 'assistant' && ['ask', 'reply'].includes(previous.action) && !mockSource(previous)) {
         userTurn.responding_to = { turn_id: previous.turn_id, text: previous.text };
+        userTurn.responding_to_version = previous.version;
       }
       let withUser = {
         ...conversation,
