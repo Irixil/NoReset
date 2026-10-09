@@ -960,4 +960,4 @@ if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('fee
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 health().then(loadEvents);
-if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=controlled-text-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});
+if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=report-conversion-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

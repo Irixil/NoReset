@@ -219,9 +219,21 @@
     const correction = /^\s*(?:我(?:现在|目前)?|现在|目前)?(?:不是|并非|没有|否认|不再)(.+)$/;
     const allText = [...sources.map(turn => turn.text), ...contexts.map(entry => entry.text)];
     if (!pieces.length || pieces.some(piece => {
-      const literal = allText.some(text => String(text).includes(piece) &&
-        (!clauses(piece).length || clauses(text).some(clause => clause.includes(piece.replace(/[，。；！？,;!?]+$/g, '')) &&
-          [...clause.matchAll(new RegExp(qualified.source, 'g'))].every(match => piece.includes(match[0]))) || piece === String(text).trim()));
+      const pieceClauses = clauses(piece);
+      const literal = allText.some(text => {
+        if (!String(text).includes(piece)) return false;
+        const sourceClauses = clauses(text);
+        const start = String(text).indexOf(piece), before = String(text).slice(0, start).trimEnd(), after = String(text).slice(start + piece.length).trimStart();
+        const sentenceBoundary = /[。；！？;!?\n]/;
+        const wholeSentences = (!before || sentenceBoundary.test(before.at(-1)))
+          && (!after || sentenceBoundary.test(piece.trimEnd().at(-1)) || sentenceBoundary.test(after[0]));
+        // A continuous excerpt may span complete clauses. Exact clause
+        // and sentence boundaries retain same-sentence qualifiers at either end.
+        const completeExcerpt = wholeSentences && pieceClauses.length > 1 && sourceClauses.some((_, start) =>
+          pieceClauses.every((clause, offset) => clause === sourceClauses[start + offset]));
+        return completeExcerpt || !pieceClauses.length || sourceClauses.some(clause => clause.includes(piece.replace(/[，。；！？,;!?]+$/g, '')) &&
+          [...clause.matchAll(new RegExp(qualified.source, 'g'))].every(match => piece.includes(match[0]))) || piece === String(text).trim();
+      });
       if (!literal) return true;
       return sources.some(source => turns.slice(turns.indexOf(source) + 1).some(later => clauses(later.text).some(clause => {
         const rejected = clause.match(correction)?.[1]?.trim();
@@ -413,7 +425,17 @@
     }));
     const unboundSummary = !analysisSourcesCurrent(conversation, currentContext)
       && conversation.report?.sections?.some(section => section.lines?.some(line => line.kind === 'summary'));
-    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary) return conversation;
+    // Recheck the locally derived summary receipt, so a v5 cache produced by an
+    // older literal guard cannot silently omit a currently grounded category.
+    const expectedSummaries = analysisSourcesCurrent(conversation, currentContext) ? CLINICAL_CATEGORIES.flatMap(category => {
+      const line = groundedReportSummary(conversation.completeness?.clinical_state?.[category], conversation);
+      const section = reportSectionFor([category], category === 'main_complaint');
+      return line && section ? [JSON.stringify([section, line])] : [];
+    }).sort() : [];
+    const cachedSummaries = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
+      .filter(line => line.kind === 'summary').map(line => JSON.stringify([section.key, line]))).sort();
+    const staleSummaries = JSON.stringify(expectedSummaries) !== JSON.stringify(cachedSummaries);
+    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary && !staleSummaries) return conversation;
     return { ...conversation, report: buildConversationReport(reportInput, conversation.report) };
   }
   function conversationArchiveView(conversation) {
