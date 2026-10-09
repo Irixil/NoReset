@@ -129,7 +129,7 @@ async function mediaRequest(path,opt){
 }
 async function loadMedia(){
   const {r,j}=await api('/api/media');
-  if(!r.ok){mediaMessage('媒体列表暂时无法读取，请恢复连接后刷新');const box=$('archivePhotos');if(box)box.innerHTML='<div class="load-error" role="status"><b>原件列表暂时无法读取</b><span>已保存原件不会删除，请恢复连接后刷新。</span></div>';return false;}
+  if(!r.ok){mediaMessage('媒体列表暂时无法读取，请恢复连接后刷新');const box=$('archivePhotos');if(box){releaseOriginalsIn(box);box.innerHTML='<div class="load-error" role="status"><b>原件列表暂时无法读取</b><span>已保存原件不会删除，请恢复连接后刷新。</span></div>';}return false;}
   mediaItems=j.media||[];renderMedia();return true;
 }
 function renderMedia(){
@@ -180,8 +180,10 @@ async function openOriginal(id,{box=null,media=null}={}){
     return true;
   }catch(e){
     if(url&&originalUrls.get(id)!==url)URL.revokeObjectURL(url);
-    if(originalTargets.get(id)===target)releaseOriginal(id);
-    if(box&&box.isConnected!==false)box.textContent='原件暂时无法读取，请重新打开核对。';else if(!box)mediaMessage(e.message);
+    if(target&&originalTargets.get(id)===target){
+      releaseOriginal(id);
+      if(box&&box.isConnected!==false)box.textContent='原件暂时无法读取，请重新打开核对。';
+    }else if(!box)mediaMessage(e.message);
   }
   return false;
 }

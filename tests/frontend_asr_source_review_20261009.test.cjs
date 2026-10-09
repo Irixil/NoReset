@@ -92,17 +92,17 @@ function originalHarness({delayed=false,failNode=false}={}) {
   const source=process.env.NORESET_TEST_ORIGINAL_BASELINE==='1'
     ?require('node:child_process').execFileSync('git',['show','cfa798b:frontend/media.js'],{cwd:require('node:path').join(__dirname,'..'),encoding:'utf8'})
     :fs.readFileSync(require.resolve('../frontend/media.js'),'utf8');
-  const urls=new Map(),targets=new Map(),revoked=[],counts={created:0,paused:0,cleared:0,loaded:0};let release;
+  const urls=new Map(),targets=new Map(),revoked=[],counts={created:0,paused:0,cleared:0,loaded:0};let release,reject;
   const box={isConnected:true,replaceChildren(node){this.node=node},append(){},textContent:''};
   const parent={contains:node=>node===box};
   const context=vm.createContext({originalUrls:urls,originalTargets:targets,mediaItems:[],URL:{revokeObjectURL:url=>revoked.push(url)},
-    HealthLocal:{active:true,originalObjectUrl:()=>delayed?new Promise(r=>release=r):Promise.resolve('blob:synthetic-audio')},
+    HealthLocal:{active:true,originalObjectUrl:()=>delayed?new Promise((r,j)=>{release=r;reject=j}):Promise.resolve('blob:synthetic-audio')},
     document:{createElement(){counts.created++;if(failNode)throw Error('synthetic-render-failed');return{style:{},pause(){counts.paused++},removeAttribute(){counts.cleared++},load(){counts.loaded++}}}},mediaMessage(){}});
   const start=source.includes('function releaseOriginal(')?source.indexOf('function releaseOriginal('):source.indexOf('async function openOriginal(');
   vm.runInContext(source.slice(start,source.indexOf('async function showDocumentOriginals(')),context);
   const open=()=>context.openOriginal('media_synthetic',{box,media:{media_id:'media_synthetic',kind:'audio'}});
   const close=()=>{if(context.releaseOriginalsIn)context.releaseOriginalsIn(parent)};
-  return {context,box,urls,targets,revoked,counts,open,close,release:()=>release('blob:synthetic-audio')};
+  return {context,box,parent,urls,targets,revoked,counts,open,close,release:()=>release('blob:synthetic-audio'),reject:()=>reject(Error('synthetic-old-read-failed'))};
 }
 test('closing or redrawing an original player stops playback, clears source and revokes its object URL',async()=>{
   const h=originalHarness();await h.open();assert.equal(h.urls.size,1);h.close();
@@ -115,4 +115,23 @@ test('late detached or canceled original read and render failures release URLs w
     h.release();await pending;assert.equal(h.counts.created,0);assert.equal(h.urls.size,0);assert.equal(h.targets.size,0);assert.deepEqual(h.revoked,['blob:synthetic-audio']);
   }
   const failed=originalHarness({failNode:true});await failed.open();assert.equal(failed.urls.size,0);assert.equal(failed.targets.size,0);assert.deepEqual(failed.revoked,['blob:synthetic-audio']);
+});
+test('metadata arriving after leaving a connected voice view cannot start a hidden original read',async()=>{
+  let release,active=true;const app=appHarness({api:{request:()=>new Promise(r=>release=r)}},{conversation_id:'conversation_synthetic'});
+  const box={isConnected:true,textContent:'',closest:()=>({classList:{contains:()=>active}})};
+  const turn={turn_id:'turn_synthetic',role:'elder',source_kind:'audio_transcript',media_id:'media_synthetic'};
+  const pending=app.context.showConversationOriginal(turn,box,{conversation_id:'conversation_synthetic'});active=false;
+  release({r:{ok:true},j:{media:{media_id:'media_synthetic',kind:'audio',conversation_id:'conversation_synthetic'}}});
+  await pending;assert.equal(app.originals.length,0);assert.equal(box.innerHTML,undefined);
+});
+test('an older original read failure cannot overwrite a newer successful player in the same box',async()=>{
+  const h=originalHarness({delayed:true}),old=h.open();
+  h.context.HealthLocal.originalObjectUrl=()=>Promise.resolve('blob:synthetic-new');await h.open();
+  const player=h.box.node;h.reject();await old;
+  assert.equal(h.box.textContent,'');assert.equal(h.box.node,player);assert.equal(h.urls.get('media_synthetic'),'blob:synthetic-new');assert.equal(h.counts.paused,0);
+});
+test('failed media-list rendering releases the archived audio before replacing its container',async()=>{
+  const h=originalHarness();await h.open();h.context.api=async()=>({r:{ok:false},j:{}});h.context.$=()=>h.parent;
+  const source=fs.readFileSync(require.resolve('../frontend/media.js'),'utf8');vm.runInContext(source.slice(source.indexOf('async function loadMedia('),source.indexOf('function renderMedia(')),h.context);
+  await h.context.loadMedia();assert.equal(h.urls.size,0);assert.deepEqual(h.revoked,['blob:synthetic-audio']);assert.equal(h.counts.paused,1);assert.match(h.parent.innerHTML,/原件列表暂时无法读取/);
 });

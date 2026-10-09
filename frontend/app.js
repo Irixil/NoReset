@@ -263,6 +263,7 @@ async function showConversationOriginal(turn,box,conversation){
   try{
     const x=await api('/api/media/'+encodeURIComponent(turn.media_id));
     if(!box.isConnected&&box.isConnected!==undefined)return false;
+    const view=box.closest?.('.view');if(view&&!view.classList.contains('active'))return false;
     if(!x.r.ok||!x.j.media){box.textContent='这份临时录音已清理或暂时无法读取；识别文字与修改历史仍保留。';return false}
     const media=x.j.media;
     if(media.media_id!==turn.media_id||media.kind!=='audio'||(media.conversation_id&&media.conversation_id!==conversation?.conversation_id)){
