@@ -451,3 +451,41 @@ def test_append_without_closed_origin_cannot_replace_the_same_cumulative_authori
     receipt.write_text(json.dumps(next_document))
     with pytest.raises(gate.TrialGateError): gate.append_trial(receipt,state)
     assert state.read_bytes()==before
+
+
+def test_zero_new_attempt_closed_scope_can_succeed_without_budget_or_history_reset(five):
+    case=proposal(five); meter,_=succeed(case)
+    assert gate.close_trial_scope(meter.receipt_path,meter.state_path,'owner_stop')['stopped'] is True
+    before_budget=trial_budget.budget_snapshot(five['descriptor'])
+    assert before_budget['attempt_allocations']==0 and before_budget['reserved_estimate_usd']=='0'
+    next_directory=five['tmp']/'zero-post-successor-preparation'; next_directory.mkdir()
+    next_case=proposal(dict(meter=meter,document=case['document'],tmp=next_directory))
+    # Same historical row count is not the identity of a new approved scope.
+    next_case['receipt']=five['tmp']/'after-zero-attempt-close.json'
+    next_case['state']=five['tmp']/'after-zero-attempt-close.sqlite3'
+    next_case['closure_path']=five['tmp']/'after-zero-attempt-close-closure.json'
+    next_case['evidence_path']=five['tmp']/'after-zero-attempt-close-evidence.json'
+    next_case['document'].update(receipt_id='invented-successor-after-zero-new-posts',
+        approval_ref='invented-explicit-new-batch-within-same-cumulative-authorization')
+    next_case['receipt'].write_text(json.dumps(next_case['document']))
+    next_case['evidence_path'].write_text(json.dumps(next_case['evidence']))
+    next_case['closure'].update(approval_ref=next_case['document']['approval_ref'],
+        new_receipt_sha256=digest(next_case['receipt'].read_bytes()),
+        failure_evidence_sha256=digest(next_case['evidence_path'].read_bytes()))
+    next_case['closure_path'].write_text(json.dumps(next_case['closure']))
+    next_meter,result=succeed(next_case)
+    assert result['remaining_requests']==3 and result['protected_through_attempt_id']==5
+    assert result['historical_reserved_usd']=='0.9510912' and result['remaining_usd'] is None
+    assert next_case['document']['cumulative_budget']==case['document']['cumulative_budget']==five['descriptor']
+    with sqlite3.connect(next_meter.state_path) as db:
+        assert db.execute('SELECT * FROM attempts ORDER BY id').fetchall()==case['old_rows']
+        assert db.execute('SELECT usage_json FROM attempts WHERE id=4').fetchone()==(None,)
+        assert db.execute('SELECT frozen_reason FROM closed_scope_metadata ORDER BY rowid').fetchall()==[('owner_stop',),('owner_stop',)]
+    assert gate.trial_journal(state_path=next_meter.state_path)[3]['closed_status']=='failed_usage_unverified'
+    snapshot=trial_budget.budget_snapshot(five['descriptor'])
+    assert snapshot['attempt_allocations']==0 and snapshot['reserved_estimate_usd']=='0'
+    assert [b['status'] for b in snapshot['batches']]==['closed','active']
+    for kind in ('asr','llm','llm'): review(next_meter,send(next_meter,next_case['document'],kind))
+    assert trial_budget.budget_snapshot(five['descriptor'])['reserved_estimate_usd']=='0.0203392'
+    assert len(gate.trial_journal(state_path=next_meter.state_path))==8
+    unchanged(case); unchanged(next_case)
