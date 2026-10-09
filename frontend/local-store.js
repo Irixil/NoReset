@@ -227,6 +227,12 @@
       source_versions: sources.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
       source_label: `当前原话${sources.length ? ' ' + sources.map(turn => turns.indexOf(turn) + 1).join('、') : '与所选背景'} · 本人未核对` };
   }
+  function unclearAssociatedSymptoms(text) {
+    const topic = '(?:别的|其他)(?:身体)?(?:变化|症状|表现)';
+    const unknown = '(?:不清楚|不知道|不记得|不确定|记不清|说不清)';
+    const withinClause = '[^，。；！？,;!?\\n]*';
+    return new RegExp(`${topic}${withinClause}${unknown}|${unknown}${withinClause}${topic}`).test(text || '');
+  }
   function reportTurnCategories(turn, state) {
     const fromState = CLINICAL_CATEGORIES.filter(category => state?.[category]?.status === 'known' && state[category].evidence_turn_ids?.includes(turn.turn_id));
     // Once reviewed source references exist, do not reclassify "晚上睡得好"
@@ -279,7 +285,8 @@
       if (REPORT_META_MESSAGE.test(turn.text || '')) return;
       if (/(担心|害怕|会不会|要不要|怎么办|想知道)/.test(turn.text || '') && !REPORT_PATTERNS.main_complaint.test(turn.text || '')) {
         bySection.get('patient_questions').lines.push({ kind: 'quote', text: turn.text, tags: ['患者疑问'],
-          source_turn_ids: [turn.turn_id], source_label: `患者原话 ${index + 1}` });
+          source_turn_ids: [turn.turn_id], source_versions: [{ turn_id: turn.turn_id, version: turn.version, quote: turn.text }],
+          source_label: `患者原话 ${index + 1}` });
         return;
       }
       if (hasCurrentSummary) return;
@@ -287,12 +294,16 @@
       const sectionKey = reportSectionFor(categories, !hasChiefComplaint);
       if (!sectionKey) return;
       if (sectionKey === 'chief_complaint') hasChiefComplaint = true;
-      categories.forEach(category => collectedCategories.add(category));
+      const associatedUnclear = unclearAssociatedSymptoms(turn.text);
+      categories.filter(category => category !== 'associated_symptoms' || !associatedUnclear)
+        .forEach(category => collectedCategories.add(category));
       const redundantCategory = sectionKey === 'chief_complaint' ? 'main_complaint' : sectionKey === 'onset_course' ? 'onset_course' : null;
       bySection.get(sectionKey).lines.push({
         kind: 'quote', text: turn.text,
-        tags: categories.filter(category => category !== redundantCategory).map(category => REPORT_CATEGORY_LABELS[category]).filter(Boolean).slice(0, 4),
-        source_turn_ids: [turn.turn_id], source_label: `患者原话历史 ${index + 1} · 待核对`,
+        tags: categories.filter(category => category !== redundantCategory).map(category => category === 'associated_symptoms' && associatedUnclear
+          ? '其他身体变化未明确' : REPORT_CATEGORY_LABELS[category]).filter(Boolean).slice(0, 4),
+        source_turn_ids: [turn.turn_id], source_versions: [{ turn_id: turn.turn_id, version: turn.version, quote: turn.text }],
+        source_label: `患者原话历史 ${index + 1} · 待核对`,
       });
     });
     for (const item of boundAnalysis ? conversation.relevant_health_context || [] : []) {
@@ -384,9 +395,19 @@
     const staleRisk = (conversation.report?.reviewed_risk_assessments || [])
       .some(assessment => !safety.reviewedRiskSourcesCurrent(assessment, elderTurns(conversation)));
     const staleSources = JSON.stringify(conversation.report?.source_versions) !== JSON.stringify(analysisSources(conversation).turns);
+    const currentTurns = elderTurns(conversation);
+    const staleQuoteSources = conversation.report?.sections?.some(section => section.lines?.some(line => {
+      if (line.kind !== 'quote') return false;
+      if (!Array.isArray(line.source_turn_ids) || !line.source_turn_ids.length) return true;
+      const sources = line.source_turn_ids.map(turnId => currentTurns.find(turn => turn.turn_id === turnId));
+      if (sources.some(turn => !turn)) return true;
+      return JSON.stringify(line.source_versions) !== JSON.stringify(sources.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })))
+        || sources.length === 1 && line.text !== sources[0].text
+        || sources.some(turn => unclearAssociatedSymptoms(turn.text)) && line.tags?.includes(REPORT_CATEGORY_LABELS.associated_symptoms);
+    }));
     const unboundSummary = !analysisSourcesCurrent(conversation, currentContext)
       && conversation.report?.sections?.some(section => section.lines?.some(line => line.kind === 'summary'));
-    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !unboundSummary) return conversation;
+    if (conversation.report?.format_version === 5 && !staleRisk && !changedAnalysis && !staleSources && !staleQuoteSources && !unboundSummary) return conversation;
     return { ...conversation, report: buildConversationReport(reportInput, conversation.report) };
   }
   function conversationArchiveView(conversation) {

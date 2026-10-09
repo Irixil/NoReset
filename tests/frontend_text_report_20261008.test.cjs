@@ -121,3 +121,76 @@ test('source bindings remain encrypted, survive backup restore and are removed w
   assert.equal(await h.api.vault.get('conversation:' + c.conversation_id), undefined);
   assert.ok((await h.api.vault.driver.listDocs()).every(doc => !JSON.stringify(doc).includes('膝痛一周')));
 });
+
+test('failed model replies retain current versioned originals for both historical and patient-question quotes', async () => {
+  for (const text of ['纯虚构：今天手麻，其他身体变化我不清楚。', '纯虚构：我担心记错时间，不知道要不要告诉医生。']) {
+    const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+    let c = await h.say(await h.start(), '纯虚构：昨天膝痛。');
+    const elder = c.turns.find(turn => turn.role === 'elder');
+    c = (await h.request(`/api/conversations/${c.conversation_id}/turns/${elder.turn_id}`, {
+      text, expected_version: elder.version, expected_conversation_version: c.version,
+    })).j.conversation;
+    const current = c.turns.find(turn => turn.turn_id === elder.turn_id);
+    assert.equal(current.version, 2); assert.equal(c.last_ai_metadata.ai_failed, true);
+    assert.equal(c.completeness, null);
+    const quotes = c.report.sections.flatMap(section => section.lines).filter(line => line.kind === 'quote');
+    assert.equal(quotes.length, 1); assert.equal(quotes[0].text, text);
+    assert.equal(JSON.stringify(quotes[0].source_versions), JSON.stringify([{ turn_id: current.turn_id, version: 2, quote: text }]));
+    if (text.includes('身体变化我不清楚')) {
+      assert.ok(quotes[0].tags.includes('其他身体变化未明确'));
+      assert.equal(quotes[0].tags.includes('同时出现'), false);
+      assert.match(sections(c, 'verification').map(line => line.text).join('\n'), /是否同时出现其他身体变化/);
+    }
+    const handoff = (await h.request('/api/handoffs', { record_ids: [current.record_id] })).j.handoff;
+    const handoffQuote = handoff.conversation_reports[0].report.sections.flatMap(section => section.lines).find(line => line.kind === 'quote');
+    assert.equal(JSON.stringify(handoffQuote.source_versions), JSON.stringify(quotes[0].source_versions));
+    assert.ok(handoff.conversation_reports[0].report.sections.flatMap(section => section.lines).every(line => line.kind !== 'summary'));
+  }
+});
+
+test('legacy version-5 failed quote cache rebuilds locally with stable report identity and current source version', async () => {
+  const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+  let c = await h.say(await h.start(), '纯虚构：昨天膝痛。');
+  const elder = c.turns.find(turn => turn.role === 'elder');
+  c = (await h.request(`/api/conversations/${c.conversation_id}/turns/${elder.turn_id}`, {
+    text: '纯虚构：今天手麻，其他情况不清楚。', expected_version: elder.version, expected_conversation_version: c.version,
+  })).j.conversation;
+  const current = c.turns.find(turn => turn.turn_id === elder.turn_id), calls = h.calls.length;
+  const legacy = JSON.parse(JSON.stringify({ ...c, trial_control: { state: 'stopped', turn_id: current.turn_id } }));
+  for (const line of legacy.report.sections.flatMap(section => section.lines)) if (line.kind === 'quote') delete line.source_versions;
+  await h.api.vault.put('conversation:' + c.conversation_id, legacy);
+  const read = async () => (await h.request('/api/conversations/' + c.conversation_id)).j.conversation;
+  const rebuilt = await read(), again = await read();
+  assert.equal(rebuilt.report.report_id, legacy.report.report_id);
+  assert.equal(rebuilt.report.version, legacy.report.version + 1);
+  assert.equal(again.report.version, rebuilt.report.version, 'Repeated reads of the stored legacy report do not accumulate versions');
+  const quote = rebuilt.report.sections.flatMap(section => section.lines).find(line => line.kind === 'quote');
+  assert.equal(JSON.stringify(quote.source_versions), JSON.stringify([{ turn_id: current.turn_id, version: 2, quote: current.text }]));
+  assert.equal(JSON.stringify(rebuilt.turns), JSON.stringify(legacy.turns));
+  assert.equal(rebuilt.version, legacy.version); assert.equal(rebuilt.trial_control.state, 'stopped');
+  assert.equal((await h.api.vault.get('conversation:' + c.conversation_id)).report.version, legacy.report.version, 'A read does not mutate the vault');
+  await h.api.vault.put('conversation:' + c.conversation_id, rebuilt);
+  assert.equal((await read()).report.version, rebuilt.report.version, 'A complete returned cache is reused');
+  assert.equal(h.calls.length, calls, 'Report reconstruction makes no model request');
+});
+
+test('versioned legacy quote cache cannot hide explicitly unknown accompanying symptoms', async () => {
+  const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+  const c = await h.say(await h.start(), '完全虚构。我咳嗽两天，晚上明显，别的变化我不清楚。');
+  const legacy = JSON.parse(JSON.stringify(c));
+  const quote = legacy.report.sections.flatMap(section => section.lines).find(line => line.kind === 'quote');
+  quote.tags = quote.tags.map(tag => tag === '其他身体变化未明确' ? '同时出现' : tag);
+  for (const line of legacy.report.sections.find(section => section.key === 'verification').lines)
+    line.text = line.text.replace('是否同时出现其他身体变化、', '');
+  await h.api.vault.put('conversation:' + c.conversation_id, legacy);
+  const calls = h.calls.length;
+  const rebuilt = (await h.request('/api/conversations/' + c.conversation_id)).j.conversation;
+  assert.equal(rebuilt.report.report_id, legacy.report.report_id);
+  assert.equal(rebuilt.report.version, legacy.report.version + 1);
+  assert.match(sections(rebuilt, 'verification').map(line => line.text).join('\n'), /是否同时出现其他身体变化/);
+  const rebuiltQuote = rebuilt.report.sections.flatMap(section => section.lines).find(line => line.kind === 'quote');
+  assert.ok(rebuiltQuote.tags.includes('其他身体变化未明确'));
+  assert.equal(rebuiltQuote.tags.includes('同时出现'), false);
+  assert.equal(JSON.stringify(rebuiltQuote.source_versions), JSON.stringify(quote.source_versions));
+  assert.equal(h.calls.length, calls);
+});
