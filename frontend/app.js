@@ -3,6 +3,7 @@ let token = localStorage.getItem('session_token') || '', modelProvider = '', sav
 let events = [], conversations = [], current = null, detailRequestSerial = 0, mediaRecorder = null, chunks = [], timerId = null, startedAt = 0, elapsedMs = 0, demoMode = false, localMode = Boolean(globalThis.HealthLocal), voicePermissionPending = false, voiceUploadPending = false;
 let activeConversation = null, conversationLoading = false, conversationEditingTurnId = null, pendingConversationTurn = null, pendingMediaRetry = null, lastSpokenTurnId = null;
 let voicePermissionGeneration = 0;
+let cancelPendingMicrophone = null;
 let silenceAudioContext = null, silenceAnalyser = null, silenceFrameId = null, silenceStartedAt = 0, speechDetected = false;
 let reportReturnFocus = null, reportInertTargets = [], contextReturnFocus = null, contextInertTargets = [];
 let healthContextEntries = [], contextDraftSelection = new Set(), contextPickerLoading = false, contextPickerLoadError = false, contextPickerRequestId = 0, contextSelectionSaving = false, voiceStatusCheckId = 0;
@@ -852,7 +853,8 @@ async function startVoice(){
   }
   globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='正在准备录音，请稍候';setVoiceStatus('正在准备录音…');
   const permissionGeneration=++voicePermissionGeneration,conversationId=activeConversation?.conversation_id;
-  let stream,preflightReady=false;
+  let stream,preflightReady=false,tracksClosed=false;
+  const closePermissionStream=()=>{if(stream&&!tracksClosed){tracksClosed=true;stream.getTracks().forEach(track=>track.stop())}};
   try{
     const trial=await globalThis.HealthLocal?.trialVoiceState?.();
     if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
@@ -861,27 +863,32 @@ async function startVoice(){
     if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),trial.state==='stopped'?'error':'ok');return}
     preflightReady=true;$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
     stream=await getUserMedia.call(globalThis.navigator.mediaDevices,{audio:true});
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      closePermissionStream();$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus($('voiceHint').textContent);return;
+    }
+    cancelPendingMicrophone=closePermissionStream;
     const lateTrial=await globalThis.HealthLocal?.trialVoiceState?.();
     if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||lateTrial&&lateTrial.state!=='completed'||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
-      stream.getTracks().forEach(track=>track.stop());$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus(lateTrial&&lateTrial.state!=='completed'?trialVoiceMessage(lateTrial):$('voiceHint').textContent,lateTrial?.state==='stopped'?'error':'ok');return;
+      closePermissionStream();$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus(lateTrial&&lateTrial.state!=='completed'?trialVoiceMessage(lateTrial):$('voiceHint').textContent,lateTrial?.state==='stopped'?'error':'ok');return;
     }
     const preferred=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(type=>typeof Recorder.isTypeSupported==='function'&&Recorder.isTypeSupported(type));
     try{mediaRecorder=preferred?new Recorder(stream,{mimeType:preferred}):new Recorder(stream)}catch{mediaRecorder=new Recorder(stream)}
     const recordingChunks=chunks;
     mediaRecorder.ondataavailable=e=>{if(e.data.size)recordingChunks.push(e.data)};
-    mediaRecorder.onstop=()=>stream.getTracks().forEach(t=>t.stop());
+    mediaRecorder.onstop=closePermissionStream;
     mediaRecorder.onerror=()=>{ $('voiceHint').textContent='录音遇到问题；请结束这一段，系统会尽量保留已录部分';setVoiceStatus('录音遇到问题；请结束这一段，系统会尽量保留已录部分。','error'); };
-    mediaRecorder.start();const autoStop=startSilenceWatch(stream);startedAt=Date.now();timerId=setInterval(updateTimer,1000);$('voiceHint').textContent=autoStop?'正在听，停顿约 3 秒会自动结束':'正在录音；请听完后按“结束这句话”';setVoiceStatus(autoStop?'您慢慢说；停顿约 3 秒会自动保存并回复。':'您慢慢说；听完后按“结束这句话”，录音会自动保存。');
+    cancelPendingMicrophone=null;mediaRecorder.start();const autoStop=startSilenceWatch(stream);startedAt=Date.now();timerId=setInterval(updateTimer,1000);$('voiceHint').textContent=autoStop?'正在听，停顿约 3 秒会自动结束':'正在录音；请听完后按“结束这句话”';setVoiceStatus(autoStop?'您慢慢说；停顿约 3 秒会自动保存并回复。':'您慢慢说；听完后按“结束这句话”，录音会自动保存。');
   }catch(e){
-    stream?.getTracks().forEach(t=>t.stop());mediaRecorder=null;clearInterval(timerId);timerId=null;
+    closePermissionStream();mediaRecorder=null;clearInterval(timerId);timerId=null;
     if(!preflightReady){$('voiceHint').textContent='暂时无法确认录音状态；麦克风未开启，请重试。';setVoiceStatus($('voiceHint').textContent,'error');return}
     const name=e?.name||'';
     const message=name==='NotAllowedError'||name==='PermissionDeniedError'?'麦克风权限未允许；您可以在浏览器设置中开启，或直接输入文字。':name==='NotFoundError'||name==='DevicesNotFoundError'?'没有找到可用麦克风；请检查设备，或直接输入文字。':name==='NotReadableError'||name==='TrackStartError'?'麦克风正在被其他应用使用；请关闭后重试，或直接输入文字。':name==='SecurityError'||globalThis.location?.protocol==='http:'&&!['localhost','127.0.0.1'].includes(globalThis.location?.hostname)?'当前页面不允许使用麦克风；请在安全连接中打开，或直接输入文字。':'麦克风未能开启；请检查权限或设备，也可以上传已有录音或直接输入文字。';
     $('voiceHint').textContent=message;setVoiceStatus(message,'error');
-  }finally{voicePermissionPending=false;setRecording(mediaRecorder?.state==='recording');updateTimer()}
+  }finally{if(cancelPendingMicrophone===closePermissionStream)cancelPendingMicrophone=null;voicePermissionPending=false;setRecording(mediaRecorder?.state==='recording');updateTimer()}
 }
 function stopVoice(reason){
   voicePermissionGeneration++;
+  const cancelPermission=cancelPendingMicrophone;cancelPendingMicrophone=null;cancelPermission?.();
   if(mediaRecorder?.state==='recording')elapsedMs+=Date.now()-startedAt;
   clearInterval(timerId);timerId=null;stopSilenceWatch();
   let failed=false;
