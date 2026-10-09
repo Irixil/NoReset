@@ -183,14 +183,16 @@ def _trial_report(request, envelope, raw, *, protocol='openai'):
         raise ModelClientError('合成试验用量无法验证', code='trial_authorization_required')
     if protocol == 'gemini':
         model, usage = envelope.get('modelVersion'), envelope.get('usageMetadata')
-        fields = ('promptTokenCount', 'candidatesTokenCount', 'thoughtsTokenCount', 'totalTokenCount')
+        fields = ('promptTokenCount', 'candidatesTokenCount', 'totalTokenCount')
+        thoughts = usage.get('thoughtsTokenCount', 0) if isinstance(usage, dict) else None
         if (not isinstance(usage, dict) or any(type(usage.get(k)) is not int or usage[k] < 0 for k in fields)
+                or type(thoughts) is not int or thoughts < 0
                 or ('toolUsePromptTokenCount' in usage and (type(usage['toolUsePromptTokenCount']) is not int or usage['toolUsePromptTokenCount'] != 0))
-                or usage['totalTokenCount'] != usage['promptTokenCount'] + usage['candidatesTokenCount'] + usage['thoughtsTokenCount']):
+                or usage['totalTokenCount'] != usage['promptTokenCount'] + usage['candidatesTokenCount'] + thoughts):
             raise ModelClientError('合成试验用量无法验证', code='trial_authorization_required')
         usage = {'prompt_tokens': usage['promptTokenCount'],
-                 'completion_tokens': usage['candidatesTokenCount'] + usage['thoughtsTokenCount'],
-                 'completion_tokens_details': {'reasoning_tokens': usage['thoughtsTokenCount']}}
+                 'completion_tokens': usage['candidatesTokenCount'] + thoughts,
+                 'completion_tokens_details': {'reasoning_tokens': thoughts}}
         trace = envelope.get('responseId')
     else:
         model, usage, trace = envelope.get('model'), envelope.get('usage'), envelope.get('id')

@@ -109,7 +109,7 @@ def test_asr_reports_full_usage_and_internal_review_marker(meter):
 
 
 @pytest.mark.parametrize('mutation', [
-    lambda b: b['usageMetadata'].pop('thoughtsTokenCount'),
+    lambda b: (b['usageMetadata'].pop('thoughtsTokenCount'), b['usageMetadata'].update(totalTokenCount=999)),
     lambda b: b['usageMetadata'].update(promptTokenCount=True),
     lambda b: b['usageMetadata'].update(totalTokenCount=999),
     lambda b: b.pop('modelVersion'),

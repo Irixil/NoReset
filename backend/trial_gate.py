@@ -1,18 +1,23 @@
 """Default-closed, persisted allowance for one explicitly approved synthetic trial.
 
 Authorization is a trusted local receipt, never request data or an environment
-flag. Reviewed price/context bounds reserve worst-case nano-USD before sending.
-This is a conservative local reservation meter, not an account/billing control.
+flag. Hard-bound scopes reserve reviewed worst-case nano-USD before sending.
+An explicitly accepted informed-risk scope limits requests and parameters with
+a disclosed non-hard estimate; its zero hard reserve does not mean free usage.
+This local meter does not control supplier billing or guarantee final charges.
 """
 from __future__ import annotations
 
 import hashlib
+import base64
+import io
 import ipaddress
 import json
 import re
 import socket
 import sqlite3
-from datetime import datetime, timezone
+import wave
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,6 +30,8 @@ MAX_WIRE_BYTES = {'llm': 24000, 'asr': 3 * 1024 * 1024, 'ocr': 3 * 1024 * 1024}
 HASH = re.compile(r'^[a-f0-9]{64}$')
 SCHEMA = 'noreset-synthetic-trial-v2'
 SCHEMA_V3 = 'noreset-synthetic-trial-v3'
+SCHEMA_RISK = 'noreset-synthetic-trial-informed-risk-v1'
+APPEND_SCHEMAS = {SCHEMA_V3, SCHEMA_RISK}
 USD_UNITS = Decimal('1000000000')  # Integer nano-USD, never a float ledger.
 
 
@@ -183,7 +190,7 @@ def _parse_receipt(raw, *, historical=False):
         if len(raw) > 65536:
             _deny()
         data = json.loads(raw, object_pairs_hook=_unique_object)
-        if isinstance(data, dict) and data.get('schema_version') == SCHEMA_V3:
+        if isinstance(data, dict) and data.get('schema_version') in APPEND_SCHEMAS:
             _validate_v3(data, historical=historical)
             return data, hashlib.sha256(raw).hexdigest()
         required = {'schema_version', 'receipt_id', 'status', 'authorization_source', 'approval_ref',
@@ -274,7 +281,7 @@ def amend_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
     """
     try:
         receipt, digest = _receipt(receipt_path)
-        if receipt['schema_version'] == SCHEMA_V3:
+        if receipt['schema_version'] in APPEND_SCHEMAS:
             return _amend_v3(receipt, digest, state_path)
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -308,7 +315,7 @@ def amend_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
 
 def _history(connection, receipt, *, historical=False):
     """Recheck each durable reserve; damaged but readable rows fail closed."""
-    if receipt['schema_version'] == SCHEMA_V3:
+    if receipt['schema_version'] in APPEND_SCHEMAS:
         return _history_v3(connection, receipt)
     rows = connection.execute('SELECT kind,request_sha256,source_sha256,wire_bytes,output_limit,thinking_limit,input_bound,generated_bound,reserved_nano_usd,pricing_json,usage_json FROM attempts').fetchall()
     counts, occupied = {}, 0
@@ -350,7 +357,7 @@ class TrialGate:
     def reserve(self, *, kind, provider, model, url, wire, source_sha256, output_tokens, thinking_tokens):
         try:
             receipt, digest = _receipt(self.receipt_path)
-            if receipt['schema_version'] == SCHEMA_V3:
+            if receipt['schema_version'] in APPEND_SCHEMAS:
                 return _reserve_v3(self, receipt, digest, kind=kind, provider=provider, model=model,
                     url=url, wire=wire, source_sha256=source_sha256,
                     output_tokens=output_tokens, thinking_tokens=thinking_tokens)
@@ -399,6 +406,11 @@ def validate_trial_authorization(*, receipt_path=RECEIPT_PATH, state_path=STATE_
             if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt), None)]:
                 _deny()
             counts, occupied = _history(connection, receipt)
+            if receipt['schema_version'] == SCHEMA_RISK:
+                return {'receipt': receipt, 'receipt_sha256': digest, 'remaining_usd': None,
+                        'cost_bound_known': False, 'estimated_new_usd': receipt['spend_authorization']['estimated_new_usd'],
+                        'historical_reserved_usd': _usd(occupied),
+                        'remaining_requests': receipt['total_requests'] - sum(counts.values()), 'frozen': False}
             budget = int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)
             return {'receipt': receipt, 'receipt_sha256': digest, 'remaining_usd': _usd(budget - occupied),
                     'remaining_requests': receipt['total_requests'] - sum(counts.values()), 'frozen': False}
@@ -419,6 +431,9 @@ def trial_journal(*, state_path=STATE_PATH):
                 item['pricing'] = json.loads(item.pop('pricing_json'))
                 usage_raw = item.pop('usage_json')
                 item['usage'] = json.loads(usage_raw) if usage_raw else None
+                if item['pricing'].get('status') == 'disclosed_estimate':
+                    item['estimated_usd'] = item['pricing']['estimated_usd']
+                    item['cost_bound_known'] = False
                 result.append(item)
             return result
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
@@ -442,7 +457,8 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
                 _deny()
             incoming_bound, generated_bound, pricing_json, previous, thinking_limit, output_limit = row
             pricing = json.loads(pricing_json)
-            strict = 'charge_contract' in pricing
+            risk = pricing.get('status') == 'disclosed_estimate'
+            strict = 'charge_contract' in pricing or risk
             prompt = usage.get('prompt_tokens') if isinstance(usage, dict) else None
             generated = usage.get('completion_tokens') if isinstance(usage, dict) else None
             details = usage.get('completion_tokens_details') if isinstance(usage, dict) else None
@@ -454,6 +470,10 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
                      and type(generated) is int and 0 <= generated <= generated_bound
                      and type(thinking) is int and 0 <= thinking <= generated
                      and (not strict or thinking <= thinking_limit and generated <= output_limit))
+            if valid and risk:
+                observed_cost = (_decimal(pricing['usd_per_million_input_tokens']) * prompt
+                                 + _decimal(pricing['usd_per_million_generated_tokens']) * generated) / Decimal('1000000')
+                valid = observed_cost <= _decimal(pricing['estimated_usd'])
             normalized = {'returned_model': returned_model if isinstance(returned_model, str) else None,
                           'prompt_tokens': prompt if type(prompt) is int and 0 <= prompt < 2**63 else None,
                           'completion_tokens': generated if type(generated) is int and 0 <= generated < 2**63 else None,
@@ -477,9 +497,12 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
 
 
 def _validate_v3(data, *, historical=False):
+    risk = data['schema_version'] == SCHEMA_RISK
     fields = {'schema_version', 'receipt_id', 'status', 'authorization_source', 'approval_ref',
               'synthetic_only', 'expires_at', 'total_requests', 'planned_text_requests',
               'spend_authorization', 'profiles', 'previous_receipt_sha256'}
+    if risk:
+        fields.add('approved_at')
     if (set(data) != fields or data['status'] != 'approved'
             or data['authorization_source'] != 'explicit_owner_approval' or data['synthetic_only'] is not True
             or not isinstance(data['previous_receipt_sha256'], str) or not HASH.fullmatch(data['previous_receipt_sha256'])):
@@ -491,12 +514,23 @@ def _validate_v3(data, *, historical=False):
     if not expires.tzinfo or not historical and expires <= datetime.now(timezone.utc):
         _deny()
     spend = data['spend_authorization']
-    if (not isinstance(spend, dict) or set(spend) != {'currency', 'amount', 'hard_currency_cap', 'billing_limitations_accepted', 'scope'}
+    if risk:
+        approved = datetime.fromisoformat(data['approved_at'].replace('Z', '+00:00'))
+        if (not approved.tzinfo or approved >= expires or expires - approved > timedelta(minutes=60)
+                or not historical and approved > datetime.now(timezone.utc)
+                or not isinstance(spend, dict) or set(spend) != {'currency', 'estimated_new_usd', 'hard_currency_cap',
+                    'billing_limitations_accepted', 'scope', 'unknown_final_cost_accepted'}
+                or spend['currency'] != 'USD' or spend['hard_currency_cap'] is not False
+                or spend['billing_limitations_accepted'] is not True or spend['unknown_final_cost_accepted'] is not True
+                or spend['scope'] != 'limited_requests_with_disclosed_non_hard_estimate'):
+            _deny()
+    elif (not isinstance(spend, dict) or set(spend) != {'currency', 'amount', 'hard_currency_cap', 'billing_limitations_accepted', 'scope'}
             or spend['currency'] != 'USD' or spend['hard_currency_cap'] is not True
             or spend['billing_limitations_accepted'] is not False
             or spend['scope'] != 'cumulative_reservations_and_new_contract_bounds'
-            or not 0 < _decimal(spend['amount']) * USD_UNITS < 2**63
-            or type(data['total_requests']) is not int or not 0 < data['total_requests'] < 2**31
+            or not 0 < _decimal(spend['amount']) * USD_UNITS < 2**63):
+        _deny()
+    if (type(data['total_requests']) is not int or not 0 < data['total_requests'] < 2**31
             or type(data['planned_text_requests']) is not int):
         _deny()
     if not isinstance(data['profiles'], dict) or set(data['profiles']) != {'llm', 'asr'}:
@@ -508,6 +542,7 @@ def _validate_v3(data, *, historical=False):
                     'max_thinking_tokens', 'source_sha256', 'request_sha256', 'billing'}
         if (not isinstance(profile, dict) or set(profile) != expected or not _official_endpoint(kind, profile)
                 or kind == 'asr' and profile['model'] != 'gemini-2.5-flash-lite'
+                or risk and kind == 'llm' and (profile['provider'] != 'deepseek' or profile['url'] != 'https://api.deepseek.com/chat/completions')
                 or type(profile['requests']) is not int or not 0 < profile['requests'] <= 2
                 or type(profile['max_input_bytes']) is not int or not 0 < profile['max_input_bytes'] <= MAX_WIRE_BYTES[kind]
                 or type(profile['max_output_tokens']) is not int or not 0 < profile['max_output_tokens'] <= CAPS[kind][1]
@@ -515,13 +550,66 @@ def _validate_v3(data, *, historical=False):
             _deny()
         for field in ('source_sha256', 'request_sha256'):
             values = profile[field]
-            if (not isinstance(values, list) or not 1 <= len(values) <= 5
+            minimum, maximum = (0, 2) if risk and kind == 'llm' else (1, 2) if risk else (1, 5)
+            if (not isinstance(values, list) or not minimum <= len(values) <= maximum
                     or any(not isinstance(value, str) or not HASH.fullmatch(value) for value in values)
                     or len(set(values)) != len(values)):
                 _deny()
-        if not isinstance(profile['billing'], dict) or 'charge_contract' not in profile['billing']:
+        if not risk and (not isinstance(profile['billing'], dict) or 'charge_contract' not in profile['billing']):
             _deny()  # Legacy estimates do not become new hard contracts.
-        _quote(kind, profile, historical=historical)
+        _profile_quote(data, kind, historical=historical)
+    if risk and (data['profiles']['asr']['requests'] != data['profiles']['llm']['requests']
+            or _decimal(spend['estimated_new_usd']) != sum(_decimal(p['billing']['estimated_usd']) * p['requests'] for p in data['profiles'].values())):
+        _deny()
+
+
+def _risk_quote(kind, profile, *, historical=False):
+    """Planning figures and observed stop thresholds; never a billing bound."""
+    billing = profile['billing']
+    fields = {'status', 'currency', 'model', 'evidence_url', 'evidence_date', 'expires_at', 'approval_ref',
+              'usd_per_million_input_tokens', 'usd_per_million_generated_tokens', 'estimated_input_tokens',
+              'estimated_usd', 'observed_input_tokens_limit', 'observed_generated_tokens_limit',
+              'completion_tokens_include_reasoning', 'returned_models', 'complete_cost_bound_known',
+              'internal_billable_attempts_known'}
+    if (not isinstance(billing, dict) or set(billing) != fields or billing['status'] != 'disclosed_estimate'
+            or billing['currency'] != 'USD' or billing['model'] != profile['model']
+            or billing['complete_cost_bound_known'] is not False or billing['internal_billable_attempts_known'] is not False
+            or billing['completion_tokens_include_reasoning'] is not True
+            or not isinstance(billing['approval_ref'], str) or not billing['approval_ref'].strip()):
+        _deny()
+    evidence = urlsplit(billing['evidence_url'])
+    expires = datetime.fromisoformat(billing['expires_at'].replace('Z', '+00:00'))
+    if (evidence.scheme != 'https' or evidence.username or evidence.password
+            or evidence.hostname not in ({'api-docs.deepseek.com'} if kind == 'llm' else {'docs.aihubmix.com', 'aihubmix.com'})
+            or datetime.fromisoformat(billing['evidence_date']).date() > datetime.now(timezone.utc).date()
+            or not expires.tzinfo or not historical and expires <= datetime.now(timezone.utc)):
+        _deny()
+    incoming, generated = (24000, 2048) if kind == 'llm' else (2048, 1024)
+    if (type(billing['estimated_input_tokens']) is not int or billing['estimated_input_tokens'] != incoming
+            or type(billing['observed_input_tokens_limit']) is not int or billing['observed_input_tokens_limit'] != incoming
+            or type(billing['observed_generated_tokens_limit']) is not int or billing['observed_generated_tokens_limit'] != generated
+            or _decimal(billing['usd_per_million_input_tokens']) != Decimal('0.30')
+            or _decimal(billing['usd_per_million_generated_tokens']) != (Decimal('1.20') if kind == 'llm' else Decimal('0.40'))):
+        _deny()
+    expected = (Decimal('0.30') * incoming + _decimal(billing['usd_per_million_generated_tokens']) * generated) / Decimal('1000000')
+    aliases = billing['returned_models']
+    if (not isinstance(aliases, list) or not aliases or len(set(aliases)) != len(aliases)
+            or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+            or kind == 'llm' and not set(aliases) <= {'deepseek-flash', 'deepseek-v4-flash'}
+            or _decimal(billing['estimated_usd']) != expected):
+        _deny()
+    return billing, 0  # A zero hard reserve is explicitly NOT a zero charge claim.
+
+
+def _profile_quote(receipt, kind, *, historical=False):
+    function = _risk_quote if receipt['schema_version'] == SCHEMA_RISK else _quote
+    return function(kind, receipt['profiles'][kind], historical=historical)
+
+
+def _usage_bounds(pricing):
+    if pricing.get('status') == 'disclosed_estimate':
+        return pricing['observed_input_tokens_limit'], pricing['observed_generated_tokens_limit']
+    return pricing['max_billable_input_tokens'], pricing['max_billable_generated_tokens']
 
 
 def _authority_tables(connection):
@@ -597,12 +685,12 @@ def _history_v3(connection, receipt):
         profile = authorization['profiles'].get(kind)
         if profile is None:
             _deny()
-        quoted = _quote(kind, profile, historical=True)
+        quoted = _profile_quote(authorization, kind, historical=True)
         if quoted is None:
             _deny()
         pricing, reserve = quoted
         if (type(cost) is not int or cost != reserve or price_json != _snapshot(pricing)
-                or incoming != pricing['max_billable_input_tokens'] or generated != pricing['max_billable_generated_tokens']
+                or (incoming, generated) != _usage_bounds(pricing)
                 or wire_sha not in profile['request_sha256'] or source_sha not in profile['source_sha256']
                 or type(size) is not int or not 0 < size <= profile['max_input_bytes']
                 or type(output) is not int or not 0 < output <= profile['max_output_tokens']
@@ -614,7 +702,7 @@ def _history_v3(connection, receipt):
                 or type(usage['prompt_tokens']) is not int or not 0 <= usage['prompt_tokens'] <= incoming
                 or type(usage['completion_tokens']) is not int or not 0 <= usage['completion_tokens'] <= generated
                 or type(usage['reasoning_tokens']) is not int or not 0 <= usage['reasoning_tokens'] <= usage['completion_tokens']
-                or authorization['schema_version'] == SCHEMA_V3
+                or authorization['schema_version'] in APPEND_SCHEMAS
                 and (usage['reasoning_tokens'] > thinking or usage['completion_tokens'] > output)):
             _deny()
         scope = (authorization['receipt_id'], kind)
@@ -623,7 +711,8 @@ def _history_v3(connection, receipt):
             _deny()
         counts[kind] = counts.get(kind, 0) + 1
         occupied += cost
-    if sum(counts.values()) > receipt['total_requests'] or occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS):
+    if (sum(counts.values()) > receipt['total_requests']
+            or receipt['schema_version'] != SCHEMA_RISK and occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
         _deny()
     return counts, occupied
 
@@ -632,7 +721,7 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
     """Trusted explicit new scope; preserve historical estimates, never reprice them."""
     try:
         receipt, digest = _receipt(receipt_path)
-        if receipt['schema_version'] != SCHEMA_V3:
+        if receipt['schema_version'] not in APPEND_SCHEMAS:
             _deny()
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -648,8 +737,9 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
             if (receipt['previous_receipt_sha256'] != previous or digest == previous
                     or receipt['receipt_id'] == old['receipt_id'] or receipt['approval_ref'] == old['approval_ref']
                     or receipt['total_requests'] != prior_count + sum(p['requests'] for p in receipt['profiles'].values())
-                    or _decimal(receipt['spend_authorization']['amount']) < _decimal(old['spend_authorization']['amount'])
-                    or occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
+                    or receipt['schema_version'] != SCHEMA_RISK and (old['schema_version'] == SCHEMA_RISK
+                        or _decimal(receipt['spend_authorization']['amount']) < _decimal(old['spend_authorization']['amount'])
+                        or occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS))):
                 _deny()
             _authority_tables(connection)
             if old['schema_version'] == SCHEMA:
@@ -725,21 +815,103 @@ def _reserve_v3(meter, receipt, digest, **args):
             or type(thinking) is not int or thinking != 0):
         _deny()
     _wire_limits_v3(kind, wire, output, thinking, args['model'])
-    pricing, cost = _quote(kind, profile)
+    risk = receipt['schema_version'] == SCHEMA_RISK
+    if risk and kind == 'asr':
+        _risk_audio(wire, args['source_sha256'])
+    pricing, cost = _profile_quote(receipt, kind)
     with sqlite3.connect(meter.state_path.resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
         connection.execute('BEGIN IMMEDIATE')
         if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt), None)]:
             _deny()
         counts, occupied = _history_v3(connection, receipt)
+        if risk:
+            _risk_stage(connection, receipt, kind)
         used = connection.execute('SELECT COUNT(*) FROM attempts a JOIN attempt_authorizations l ON l.attempt_id=a.id JOIN authorization_snapshots s ON s.receipt_sha256=l.receipt_sha256 WHERE s.receipt_id=? AND a.kind=?', (receipt['receipt_id'], kind)).fetchone()[0]
         if (used >= profile['requests'] or sum(counts.values()) >= receipt['total_requests']
-                or occupied + cost > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
+                or not risk and occupied + cost > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
             raise TrialGateError('trial_budget_exhausted')
         cursor = connection.execute('INSERT INTO attempts(kind,request_sha256,source_sha256,wire_bytes,output_limit,thinking_limit,input_bound,generated_bound,reserved_nano_usd,pricing_json) VALUES (?,?,?,?,?,?,?,?,?,?)',
-            (kind, request_sha, args['source_sha256'], len(wire), output, thinking, pricing['max_billable_input_tokens'], pricing['max_billable_generated_tokens'], cost, _snapshot(pricing)))
+            (kind, request_sha, args['source_sha256'], len(wire), output, thinking, *_usage_bounds(pricing), cost, _snapshot(pricing)))
         ident = cursor.lastrowid
         connection.execute('INSERT INTO attempt_authorizations VALUES (?,?)', (ident, digest))
     return ident
+
+
+def _risk_audio(wire, source_sha):
+    body = json.loads(wire)
+    if set(body) - {'contents', 'systemInstruction', 'generationConfig'}:
+        _deny()
+    if ('temperature' in body['generationConfig'] and
+            (type(body['generationConfig']['temperature']) not in {int, float} or body['generationConfig']['temperature'] != 0)):
+        _deny()
+    contents = body['contents']
+    if (not isinstance(contents, list) or len(contents) != 1 or not isinstance(contents[0], dict)
+            or set(contents[0]) - {'role', 'parts'} or contents[0].get('role', 'user') != 'user'):
+        _deny()
+    parts = contents[0]['parts']
+    if not isinstance(parts, list) or any(not isinstance(part, dict) or set(part) not in ({'text'}, {'inlineData'}) for part in parts):
+        _deny()
+    if 'systemInstruction' in body:
+        system = body['systemInstruction']
+        if (not isinstance(system, dict) or set(system) - {'role', 'parts'}
+                or any(not isinstance(part, dict) or set(part) != {'text'} or not isinstance(part['text'], str) for part in system['parts'])):
+            _deny()
+    media = [part['inlineData'] for part in parts if 'inlineData' in part]
+    if len(media) != 1 or set(media[0]) != {'mimeType', 'data'} or media[0]['mimeType'] != 'audio/wav':
+        _deny()
+    raw = base64.b64decode(media[0]['data'], validate=True)
+    if len(raw) > 640044 or hashlib.sha256(raw).hexdigest() != source_sha:
+        _deny()
+    try:
+        with wave.open(io.BytesIO(raw), 'rb') as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getcomptype()) != (1, 2, 16000, 'NONE'):
+                _deny()
+            frames = wav.getnframes()
+            if not 0 < frames <= 320000 or len(wav.readframes(frames)) != frames * 2:
+                _deny()
+    except (wave.Error, EOFError):
+        _deny()
+
+
+def _risk_scope_attempts(connection, receipt):
+    return connection.execute('SELECT a.id,a.kind FROM attempts a JOIN attempt_authorizations l ON l.attempt_id=a.id JOIN authorization_snapshots s ON s.receipt_sha256=l.receipt_sha256 WHERE s.receipt_id=? ORDER BY a.id', (receipt['receipt_id'],)).fetchall()
+
+
+def _risk_stage(connection, receipt, kind):
+    rows = _risk_scope_attempts(connection, receipt)
+    pattern = ['asr', 'llm'] * receipt['profiles']['asr']['requests']
+    if [row[1] for row in rows] != pattern[:len(rows)] or len(rows) >= len(pattern) or kind != pattern[len(rows)]:
+        _deny()
+    if rows:
+        if connection.execute('SELECT 1 FROM trial_reviews WHERE attempt_id=?', (rows[-1][0],)).fetchone() != (1,):
+            _deny()
+
+
+def confirm_trial_review(attempt_id, approval_ref, *, state_path=STATE_PATH):
+    """Trusted local human review, never automatically called by a UI button."""
+    try:
+        if type(attempt_id) is not int or not isinstance(approval_ref, str) or not approval_ref.strip() or len(approval_ref.encode()) > 4096:
+            _deny()
+        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT receipt_json,frozen_reason FROM metadata').fetchall()
+            if len(row) != 1 or row[0][1] is not None:
+                _deny()
+            receipt, _ = _parse_receipt(row[0][0].encode())
+            if receipt['schema_version'] != SCHEMA_RISK:
+                _deny()
+            _history_v3(connection, receipt)
+            rows = _risk_scope_attempts(connection, receipt)
+            if not rows or rows[-1][0] != attempt_id:
+                _deny()
+            connection.execute('CREATE TABLE IF NOT EXISTS trial_reviews (attempt_id INTEGER PRIMARY KEY, approval_ref TEXT NOT NULL)')
+            previous = connection.execute('SELECT approval_ref FROM trial_reviews WHERE attempt_id=?', (attempt_id,)).fetchone()
+            if previous is not None and previous != (approval_ref,):
+                _deny()
+            connection.execute('INSERT OR IGNORE INTO trial_reviews VALUES (?,?)', (attempt_id, approval_ref))
+        return {'reviewed': True, 'attempt_id': attempt_id}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        raise TrialGateError() from None
 
 
 def _save_transport_metadata(connection, ident, metadata):
