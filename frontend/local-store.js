@@ -301,6 +301,10 @@
       source: { turn_id: question.turn_id, version: question.version, quote: question.text } } : null;
   }
   const SHORT_ANSWER = /^(?:没有|没|无|不是|有|是|有的|不知道|不清楚|不确定|不记得)[。.!！\s]*$/;
+  function shortAnswerSummary(text) {
+    const parts = typeof text === 'string' ? text.split('；').map(value => value.trim()).filter(Boolean) : [];
+    return parts.length > 0 && parts.every(value => SHORT_ANSWER.test(value));
+  }
   const ANSWER_UNCLEAR = /不知道|不清楚|不确定|不记得|记不清|说不清|可能|也许|好像|大概|如果|假如|假设|万一|担心|害怕|不想说|不愿说|不方便说|拒绝|不回答|没(?:有)?回答|未回答|还没说|没(?:有)?告诉|未告诉|没(?:有)?说清|没(?:有)?提到|没(?:有)?说过|为什么问|问我|您问|你问|刚才说错|更正|纠正|[?？]/;
   const ANSWER_OTHER = /(?:妈妈|爸爸|母亲|父亲|家人|孩子|女儿|儿子|朋友|邻居|他|她|别人)/;
   const ANSWER_PAST = /以前|之前|曾经|过去|去年|前年|昨天|前天|上次|当时|小时候/;
@@ -461,7 +465,7 @@
   function pendingQuestionLines(conversation, coverage = questionCoverage(conversation, conversation.report)) {
     return coverage.pending_questions.map(question => ({
       kind: 'check', text: question, candidate_question: true,
-      tags: [coverage.historical_scope_questions.includes(question) ? '助手历史候选 · 范围需重新核实' : '助手候选 · 未回答'],
+      tags: [coverage.historical_scope_questions.includes(question) ? '助手历史候选 · 范围需重新核实' : '助手候选 · 待核实'],
       source_label: coverage.historical_scope_questions.includes(question)
         ? '历史助手候选，来源范围已变或未确认；不是当前患者事实，也未确认与当前主诉相关'
         : '助手提出的待核实问题，不是患者陈述',
@@ -491,7 +495,7 @@
         collectedCategories.add(category);
         // Short replies keep their valid backend category, but their meaning
         // is displayed only with the actual question and patient original.
-        if (!SHORT_ANSWER.test(line.text)) bySection.get(sectionKey).lines.push(line);
+        if (!shortAnswerSummary(line.text)) bySection.get(sectionKey).lines.push(line);
       }
     }
     const hasCurrentSummary = grouped.some(section => section.lines.some(line => line.kind === 'summary'));
@@ -636,7 +640,7 @@
     const expectedSummaries = analysisSourcesCurrent(conversation, currentContext) ? CLINICAL_CATEGORIES.flatMap(category => {
       const line = groundedReportSummary(conversation.completeness?.clinical_state?.[category], conversation);
       const section = reportSectionFor([category], category === 'main_complaint');
-      return line && section && !SHORT_ANSWER.test(line.text) ? [JSON.stringify([section, line])] : [];
+      return line && section && !shortAnswerSummary(line.text) ? [JSON.stringify([section, line])] : [];
     }).sort() : [];
     const cachedSummaries = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
       .filter(line => line.kind === 'summary').map(line => JSON.stringify([section.key, line]))).sort();

@@ -86,7 +86,7 @@ function assertPending(c, expected) {
   assert.deepEqual(plain(candidates(c).map(line => line.text)), expected);
   for (const line of candidates(c)) {
     assert.equal(line.kind, 'check');
-    assert.deepEqual(plain(line.tags), ['助手候选 · 未回答']);
+    assert.deepEqual(plain(line.tags), ['助手候选 · 待核实']);
     assert.match(line.source_label, /不是患者陈述/);
     assert.equal(line.source_turn_ids, undefined);
     assert.equal(line.source_context_ids, undefined);

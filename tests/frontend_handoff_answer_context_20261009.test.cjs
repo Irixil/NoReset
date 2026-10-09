@@ -97,14 +97,16 @@ test('three actual short answers print their actual assistant questions and pati
   for (let index = 0; index < questions.length; index++) {
     h.setResponse(p => {
       const result = reply(p, questions.slice(index + 1), index === 2 ? 'finish' : 'ask');
-      result.completeness.clinical_state.associated_symptoms = { status: 'known', summary: '没有。',
+      result.completeness.clinical_state.associated_symptoms = { status: 'known', summary: Array(index + 1).fill('没有。').join('；'),
         evidence_turn_ids: p.turns.filter(turn => turn.text === '没有。').map(turn => turn.turn_id), context_ids: [] };
       return result;
     });
     c = await h.say(c, '没有。');
+    assert.equal(lines(c).some(line => line.kind === 'summary' && /^(?:没有。[；]?)+$/.test(line.text)), false,
+      'Single and combined short answers are presented only with their actual questions');
   }
   assertPending(c, []);
-  assert.equal(c.completeness.clinical_state.associated_symptoms.summary, '没有。', 'Backend state is retained as received');
+  assert.equal(c.completeness.clinical_state.associated_symptoms.summary, '没有。；没有。；没有。', 'Backend state is retained as received');
   assert.equal(lines(c).some(line => line.kind === 'summary' && line.text === '没有。'), false,
     'A short No is presented with its question rather than as a standalone summary');
   assert.doesNotMatch(c.report.sections.find(section => section.key === 'verification').lines
