@@ -22,6 +22,8 @@
 
 本地可信 `append_trial` 支持在同一累计账本追加 v3 授权快照，保留旧 attempt、原报价、用量及预占；不从空库创建 v3，不退款、不重算旧价，也不解除冻结。v2/v3 金额硬界模式仍要求完整计费合同界、有效许可与准确来源/请求 SHA。另有独立 `noreset-synthetic-trial-informed-risk-v1` 有限请求模式，只能在所有者明确接受最终费用未知后使用，严格限制次数、时效、精确输入、模型、参数、顺序和逐笔业务审核；它不声称美元硬封顶。该模式的 `remaining_usd:null`、`cost_bound_known:false` 和新条目 `reserved_usd:0` 分别表示金额剩余未知、成本界未知和没有硬界预占，不表示免费、零扣费或释放历史预占。
 
+可信本地 `continue_informed_trial(new_receipt_path,new_state_path,previous_receipt_path=…,previous_state_path=…,closure_path=…,failure_evidence_path=…)` 支持此次明确新批的独立副本：只承接旧3LLM＋已永久关闭的首ASR失败（第4行usage仍未知、原response_invalid冻结保留），绑定完整旧文件与失败证据SHA，复制全部历史，旧ledger/receipt字节不改。旧metadata在副本保留为closed_metadata，新scope只开放1ASR及人工核对后的1LLM，累计最多6次；同一旧receipt＋attempts逻辑历史只有一份固定独占claim，改变SQLite无关字节、文件名或目标路径不能获得第二份许可。旧closed条目不能补报用量、核对成成功或复用剩余名额。此入口不能由HTTP、环境变量、前端按钮或代理接力建立授权；既有v2/v3冻结规则不变。root本进程显式选择新receipt/state，人工审核与派生hash追加仍分别走confirm_trial_review/amend_trial；执行失败仍停止新批，不能自动重建副本。
+
 实际请求先写入对应控制记录，再从同次有界响应校验模型与完整用量；不额外请求计量或重试。Gemini 仅在非负整数 `promptTokenCount + candidatesTokenCount = totalTokenCount` 时把缺省 `thoughtsTokenCount` 规范为0；缺总量、不平衡、非法类型、未知模型和异常结束仍拒绝并停止。该推断只表示同次用量平衡，不表示未知费用为0。LLM wire 上限24000 bytes/输出至多2048，ASR wire 上限3145728 bytes/输出1024/思考0，仅是请求控制，不能代替供应商所有尝试和失败收费的总金额保证。
 
 2026-10-09 曾激活上述独立有限请求许可并实际执行1次合成ASR，因解析失败停止，0次LLM、0次重试；旧3行账本和USD0.9510912历史保守预占保留。该失败批已关闭、账本保持冻结，剩余3次名义次数不自动续用；当前免费诊断不是新收费许可。解析修复已有离线证据，尚未重新调用真实服务；转写输出与参考台词有语义差异，发音尚未独立听取。[实际失败记录](evidence/goal-audit-2026-10-09/real-voice-attempt/README.md)与[免费诊断](evidence/goal-audit-2026-10-09/asr-free-diagnosis/business-diagnosis.md)分别说明实际结果和未测边界。

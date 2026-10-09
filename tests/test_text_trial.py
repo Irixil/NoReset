@@ -44,7 +44,7 @@ def fake_execution(monkeypatch, prepared):
     """No actual authorization, real credentials, HTTP or production ledger."""
     state = SimpleNamespace(rows=[], opens=0, reports=0, config_reads=0, frozen=False,
                             content=document_output(prepared[2]), finish='stop', model=runner.MODEL,
-                            usage={'prompt_tokens': 200, 'completion_tokens': 100,
+                            stops=[], usage={'prompt_tokens': 200, 'completion_tokens': 100,
                                    'completion_tokens_details': {'reasoning_tokens': 0}}, http_error=None)
     hashes = [item['profile'] for item in prepared]
     authority = {'receipt_sha256': 'a' * 64, 'remaining_requests': 3, 'remaining_usd': '1',
@@ -62,10 +62,12 @@ def fake_execution(monkeypatch, prepared):
     monkeypatch.setattr(adapter.Config, 'from_env', config)
 
     def opener(request, timeout):
+        model_client.reset_trial_context()
         state.opens += 1
         assert state.opens == 1
         profile = request._noreset_trial_profile
         request._noreset_trial_attempt_id = 1
+        request._noreset_trial_state_path = 'synthetic-fake-ledger-no-file'
         state.rows.append({'id': 1, 'kind': 'llm', 'request_sha256': runner.digest(request.data),
                            'source_sha256': profile['source_sha256'], 'usage': None,
                            'reserved_usd': '0.3170304'})
@@ -78,7 +80,10 @@ def fake_execution(monkeypatch, prepared):
         return runner.BufferedResponse(runner.encoded(envelope), 200, 'application/json')
     monkeypatch.setattr(model_client, '_open_request', opener)
 
-    def usage(attempt_id, returned_model, metadata):
+    def usage(attempt_id, returned_model, metadata, **kwargs):
+        if kwargs:
+            assert kwargs['state_path'] == 'synthetic-fake-ledger-no-file'
+            assert kwargs['transport_metadata']['protocol'] == 'openai'
         state.reports += 1
         if returned_model != runner.MODEL or not isinstance(metadata, dict):
             state.frozen = True
@@ -88,6 +93,11 @@ def fake_execution(monkeypatch, prepared):
         state.rows[0]['usage'] = normalized
         return normalized
     monkeypatch.setattr(trial_gate, 'report_usage', usage)
+    def stop(attempt_id, reason, **kwargs):
+        assert kwargs['state_path'] == 'synthetic-fake-ledger-no-file'
+        state.stops.append((attempt_id, reason))
+        state.frozen = True
+    monkeypatch.setattr(trial_gate, 'stop_trial', stop)
     return state
 
 
@@ -143,7 +153,8 @@ def test_one_native_request_uses_exact_preview_and_remains_pending(prepared, fak
     fake_execution.content = document_output(item) if kind == 'document' else dialogue_output(item)
     result = runner.execute_one(item, tmp_path)
     assert result['status'] == 'validated_pending_manual_review'
-    assert fake_execution.opens == fake_execution.reports == fake_execution.config_reads == 1
+    assert fake_execution.opens == fake_execution.config_reads == 1
+    assert fake_execution.reports == 2  # Native same-call audit, then idempotent runner audit.
     assert result['attempt_journal']['request_sha256'] == item['profile']['request_sha256']
     assert result['planned_text_requests'] == 3 and result['real_requests_executed'] == 1
     assert result['semantic_review_status'] == result['clinical_review_status'] == 'pending'
@@ -158,7 +169,7 @@ def test_native_validation_failure_retains_response_and_counts_no_retry(prepared
     result = runner.execute_one(prepared[0], tmp_path)
     assert result['status'] == 'failed'
     assert result['failure']['code'] == 'model_schema_invalid'
-    assert fake_execution.opens == fake_execution.reports == 1
+    assert fake_execution.opens == 1 and fake_execution.reports == 2
     artifact = json.loads((tmp_path / 'dialogue1.response.json').read_text())
     assert json.loads(artifact['choices'][0]['content']) == {'not_native_schema': True}
     assert result['meter_usage']['verified'] is True  # Usage is separate from product quality.
@@ -169,7 +180,7 @@ def test_native_blocked_reply_is_quality_failure_even_when_engine_returns_ok(pre
     fake_execution.content = dialogue_output(prepared[0], '可以自行加倍服药。')
     result = runner.execute_one(prepared[0], tmp_path)
     assert result['status'] == 'failed' and result['failure']['code'] == 'model_reply_unsafe'
-    assert fake_execution.opens == fake_execution.reports == 1
+    assert fake_execution.opens == 1 and fake_execution.reports == 2
     assert '自行加倍服药' in (tmp_path / 'dialogue1.response.json').read_text()
 
 

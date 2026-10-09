@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 RECEIPT_PATH = ROOT / 'runtime/synthetic-trial/authorization.json'
 STATE_PATH = ROOT / 'runtime/synthetic-trial/ledger.sqlite3'
+CONTINUATION_CLAIM_ROOT = ROOT / 'runtime/synthetic-trial'
 CAPS = {'llm': (3, 2048, 0), 'asr': (1, 1024, 0), 'ocr': (1, 4096, 1024)}
 MAX_WIRE_BYTES = {'llm': 24000, 'asr': 3 * 1024 * 1024, 'ocr': 3 * 1024 * 1024}
 HASH = re.compile(r'^[a-f0-9]{64}$')
@@ -422,6 +423,7 @@ def trial_journal(*, state_path=STATE_PATH):
     """Non-secret audit metadata only; never raw prompts, media or keys."""
     try:
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=ro', uri=True) as connection:
+            closed = _closed_context(connection)
             connection.row_factory = sqlite3.Row
             rows = connection.execute('SELECT * FROM attempts ORDER BY id').fetchall()
             result = []
@@ -431,6 +433,8 @@ def trial_journal(*, state_path=STATE_PATH):
                 item['pricing'] = json.loads(item.pop('pricing_json'))
                 usage_raw = item.pop('usage_json')
                 item['usage'] = json.loads(usage_raw) if usage_raw else None
+                if closed and item['id'] == closed['failed_attempt_id']:
+                    item['closed_status'] = 'failed_usage_unverified'
                 if item['pricing'].get('status') == 'disclosed_estimate':
                     item['estimated_usd'] = item['pricing']['estimated_usd']
                     item['cost_bound_known'] = False
@@ -452,6 +456,9 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
         frozen = False
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
+            closed = _closed_context(connection)
+            if closed and attempt_id <= closed['failed_attempt_id']:
+                _deny()  # Historical closure is never a late usage-report target.
             row = connection.execute('SELECT input_bound,generated_bound,pricing_json,usage_json,thinking_limit,output_limit FROM attempts WHERE id=?', (attempt_id,)).fetchone()
             if row is None:
                 _deny()
@@ -665,7 +672,7 @@ def _authority_history(connection, head):
     return authorities
 
 
-def _history_v3(connection, receipt):
+def _history_v3(connection, receipt, *, _closed_failure=None):
     metadata = connection.execute('SELECT receipt_sha256 FROM metadata').fetchall()
     if len(metadata) != 1:
         _deny()
@@ -677,6 +684,8 @@ def _history_v3(connection, receipt):
     if set(links) != {row[0] for row in rows}:
         _deny()
     counts, scoped, occupied = {}, {}, 0
+    closed = _closed_context(connection, receipt)
+    failed = closed['failed_attempt_id'] if closed else _closed_failure
     for row in rows:
         ident, kind, wire_sha, source_sha, size, output, thinking, incoming, generated, cost, price_json, usage_json = row
         if links[ident] not in authorities:
@@ -694,10 +703,14 @@ def _history_v3(connection, receipt):
                 or wire_sha not in profile['request_sha256'] or source_sha not in profile['source_sha256']
                 or type(size) is not int or not 0 < size <= profile['max_input_bytes']
                 or type(output) is not int or not 0 < output <= profile['max_output_tokens']
-                or type(thinking) is not int or not 0 <= thinking <= profile['max_thinking_tokens'] or usage_json is None):
+                or type(thinking) is not int or not 0 <= thinking <= profile['max_thinking_tokens']
+                or usage_json is None and ident != failed):
             _deny()
-        usage = json.loads(usage_json, object_pairs_hook=_unique_object)
-        if (not isinstance(usage, dict) or set(usage) != {'returned_model', 'prompt_tokens', 'completion_tokens', 'reasoning_tokens', 'verified'}
+        usage = json.loads(usage_json, object_pairs_hook=_unique_object) if usage_json is not None else None
+        if ident == failed:
+            if usage_json is not None or kind != 'asr':
+                _deny()
+        elif (not isinstance(usage, dict) or set(usage) != {'returned_model', 'prompt_tokens', 'completion_tokens', 'reasoning_tokens', 'verified'}
                 or usage['verified'] is not True or usage['returned_model'] not in pricing['returned_models']
                 or type(usage['prompt_tokens']) is not int or not 0 <= usage['prompt_tokens'] <= incoming
                 or type(usage['completion_tokens']) is not int or not 0 <= usage['completion_tokens'] <= generated
@@ -730,6 +743,8 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
                 _deny()
             previous, budget_sha, raw, _ = rows[0]
             old, _ = _parse_receipt(raw.encode(), historical=True)
+            if _closed_context(connection, old):
+                _deny()  # This explicitly approved pair cannot become another scope.
             if _budget_digest(old) != budget_sha:
                 _deny()
             _, occupied = _history(connection, old, historical=True)
@@ -939,6 +954,9 @@ def stop_trial(attempt_id, reason_code, *, state_path=STATE_PATH):
             _deny()
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
+            closed = _closed_context(connection)
+            if closed and attempt_id <= closed['failed_attempt_id']:
+                _deny()
             if connection.execute('SELECT 1 FROM attempts WHERE id=?', (attempt_id,)).fetchone() != (1,):
                 _deny()
             if connection.execute('SELECT COUNT(*) FROM metadata').fetchone() != (1,):
@@ -946,6 +964,184 @@ def stop_trial(attempt_id, reason_code, *, state_path=STATE_PATH):
             connection.execute('UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,?)', (reason_code,))
         return {'stopped': True, 'attempt_id': attempt_id}
     except (OSError, sqlite3.Error, ValueError, TypeError):
+        raise TrialGateError() from None
+
+
+def _table_exists(connection, name):
+    return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() == (1,)
+
+
+def _continuation_claim_name(closure):
+    # Logical origin identity survives harmless SQLite serialization changes.
+    identity = {field: closure[field] for field in ('previous_receipt_sha256', 'previous_attempts_sha256')}
+    return 'continuation-' + hashlib.sha256(_snapshot(identity).encode()).hexdigest() + '.json'
+
+
+def _continuation_source(state_raw, receipt_raw, closure_raw, evidence_raw, new_raw):
+    """Validate the complete frozen predecessor in memory, never open its file."""
+    closure = json.loads(closure_raw, object_pairs_hook=_unique_object)
+    fields = {'schema_version', 'status', 'authorization_source', 'approval_ref', 'previous_state_sha256',
+              'previous_receipt_sha256', 'previous_attempts_sha256', 'new_receipt_sha256', 'failed_attempt_id',
+              'freeze_reason', 'failed_request_sha256', 'failed_source_sha256', 'failure_evidence_sha256'}
+    if (not isinstance(closure, dict) or set(closure) != fields
+            or closure['schema_version'] != 'noreset-closed-trial-continuation-v1'
+            or closure['status'] != 'permanently_closed_failed'
+            or closure['authorization_source'] != 'explicit_owner_approval'
+            or type(closure['failed_attempt_id']) is not int or closure['failed_attempt_id'] != 4
+            or closure['freeze_reason'] != 'response_invalid'):
+        _deny()
+    for key, raw in [('previous_state_sha256', state_raw), ('previous_receipt_sha256', receipt_raw),
+                     ('new_receipt_sha256', new_raw), ('failure_evidence_sha256', evidence_raw)]:
+        if closure[key] != hashlib.sha256(raw).hexdigest():
+            _deny()
+    old, old_sha = _parse_receipt(receipt_raw, historical=True)
+    new, _ = _parse_receipt(new_raw, historical=True)
+    if (old['schema_version'] != SCHEMA_RISK or new['schema_version'] != SCHEMA_RISK
+            or new['previous_receipt_sha256'] != old_sha or new['receipt_id'] == old['receipt_id']
+            or new['approval_ref'] != closure['approval_ref'] or new['approval_ref'] == old['approval_ref']
+            or new['total_requests'] != 6 or new['planned_text_requests'] != 1
+            or any(profile['requests'] != 1 for profile in new['profiles'].values())):
+        _deny()
+    evidence = json.loads(evidence_raw, object_pairs_hook=_unique_object)
+    if (not isinstance(evidence, dict) or evidence.get('status') != 'failed_first_asr_stopped_without_retry'
+            or evidence.get('freeze_reason') != 'response_invalid'
+            or type(evidence.get('new_attempt_id')) is not int or evidence['new_attempt_id'] != 4
+            or evidence.get('actual_new_posts') != {'asr': 1, 'llm': 0, 'ocr': 0}
+            or any(type(value) is not int for value in evidence['actual_new_posts'].values())
+            or type(evidence.get('cumulative_attempt_rows')) is not int or evidence['cumulative_attempt_rows'] != 4
+            or evidence.get('historical_three_rows_unchanged') is not True
+            or evidence.get('historical_reserved_usd') != '0.9510912'
+            or evidence.get('supplier_final_charge_known') is not False):
+        _deny()
+    with sqlite3.connect(':memory:') as origin:
+        origin.deserialize(state_raw)
+        if origin.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or _table_exists(origin, 'closed_origin'):
+            _deny()
+        metadata = origin.execute('SELECT * FROM metadata').fetchall()
+        if metadata != [(old_sha, _budget_digest(old), _snapshot(old), 'response_invalid')]:
+            _deny()
+        rows = origin.execute('SELECT * FROM attempts ORDER BY id').fetchall()
+        if ([row[0] for row in rows] != [1, 2, 3, 4] or [row[1] for row in rows] != ['llm', 'llm', 'llm', 'asr']
+                or rows[-1][-1] is not None
+                or closure['previous_attempts_sha256'] != hashlib.sha256(_snapshot(rows).encode()).hexdigest()
+                or closure['failed_request_sha256'] != rows[-1][2] or closure['failed_source_sha256'] != rows[-1][3]):
+            _deny()
+        counts, occupied = _history_v3(origin, old, _closed_failure=4)
+        if counts != {'llm': 3, 'asr': 1} or _usd(occupied) != '0.9510912':
+            _deny()
+        authorities = origin.execute('SELECT * FROM authorization_snapshots ORDER BY receipt_sha256').fetchall()
+        links = origin.execute('SELECT * FROM attempt_authorizations ORDER BY attempt_id').fetchall()
+    return closure, metadata, rows, authorities, links
+
+
+def _closed_context(connection, receipt=None):
+    """Only an exact inherited failed row gets an exception; preserve all totals."""
+    exists, metadata_exists = _table_exists(connection, 'closed_origin'), _table_exists(connection, 'closed_metadata')
+    if not exists and not metadata_exists:
+        return None
+    if not exists or not metadata_exists:
+        _deny()
+    proofs = connection.execute('SELECT * FROM closed_origin').fetchall()
+    if len(proofs) != 1:
+        _deny()
+    state_raw, old_raw, new_raw, closure_raw, evidence_raw, claim_path = proofs[0]
+    closure, metadata, old_rows, authorities, links = _continuation_source(state_raw, old_raw, closure_raw, evidence_raw, new_raw)
+    new, new_sha = _parse_receipt(new_raw, historical=True)
+    if receipt is None:
+        current = connection.execute('SELECT receipt_json FROM metadata').fetchall()
+        if len(current) != 1:
+            _deny()
+        receipt, _ = _parse_receipt(current[0][0].encode(), historical=True)
+    if receipt['schema_version'] != SCHEMA_RISK or receipt['receipt_id'] != new['receipt_id'] or _budget_digest(receipt) != _budget_digest(new):
+        _deny()
+    for kind, profile in new['profiles'].items():
+        if receipt['profiles'][kind]['billing'] != profile['billing']:
+            _deny()
+        for field in ('source_sha256', 'request_sha256'):
+            if receipt['profiles'][kind][field][:len(profile[field])] != profile[field]:
+                _deny()
+    state_path = connection.execute('PRAGMA database_list').fetchone()[2]
+    expected_claim = {'schema_version': 'noreset-continuation-claim-v1',
+                      'previous_state_sha256': closure['previous_state_sha256'],
+                      'previous_receipt_sha256': closure['previous_receipt_sha256'],
+                      'new_receipt_sha256': new_sha,
+                      'closure_sha256': hashlib.sha256(closure_raw).hexdigest(),
+                      'state_path': str(Path(state_path).resolve())}
+    if json.loads(Path(claim_path).read_bytes(), object_pairs_hook=_unique_object) != expected_claim:
+        _deny()
+    expected_claim_path = CONTINUATION_CLAIM_ROOT.resolve() / _continuation_claim_name(closure)
+    if Path(claim_path).absolute() != expected_claim_path or Path(claim_path).resolve() != expected_claim_path:
+        _deny()
+    if (connection.execute('SELECT * FROM closed_metadata').fetchall() != metadata
+            or connection.execute('SELECT * FROM attempts WHERE id<=4 ORDER BY id').fetchall() != old_rows
+            or connection.execute('SELECT * FROM attempt_authorizations WHERE attempt_id<=4 ORDER BY attempt_id').fetchall() != links):
+        _deny()
+    for row in authorities:
+        if connection.execute('SELECT * FROM authorization_snapshots WHERE receipt_sha256=?', (row[0],)).fetchall() != [row]:
+            _deny()
+    if connection.execute('SELECT receipt_json FROM authorization_snapshots WHERE receipt_sha256=?', (new_sha,)).fetchone() != (_snapshot(new),):
+        _deny()
+    return closure
+
+
+def continue_informed_trial(receipt_path, state_path, *, previous_receipt_path, previous_state_path,
+                            closure_path, failure_evidence_path):
+    """Trusted one-pair continuation in an independent copy; never called by HTTP.
+
+    Old files and failed usage remain unchanged. A unique source claim prevents
+    creating another allowance from the same permanently closed predecessor.
+    """
+    created = False
+    target = Path(state_path).resolve()
+    try:
+        source, old_receipt_path = Path(previous_state_path).resolve(), Path(previous_receipt_path).resolve()
+        new_receipt_path = Path(receipt_path).resolve()
+        if (target in {source, old_receipt_path, new_receipt_path} or new_receipt_path == old_receipt_path
+                or target.exists() or any(Path(str(source) + suffix).exists() for suffix in ('-wal', '-shm', '-journal'))):
+            _deny()
+        state_raw, old_raw = source.read_bytes(), old_receipt_path.read_bytes()
+        new_raw = new_receipt_path.read_bytes()
+        receipt, digest = _parse_receipt(new_raw)  # Only current authorization must be valid now.
+        closure_raw, evidence_raw = Path(closure_path).read_bytes(), Path(failure_evidence_path).read_bytes()
+        if len(closure_raw) > 65536 or len(evidence_raw) > 65536:
+            _deny()
+        closure, _, _, _, _ = _continuation_source(state_raw, old_raw, closure_raw, evidence_raw, new_raw)
+        claim_path = CONTINUATION_CLAIM_ROOT / _continuation_claim_name(closure)
+        claim = {'schema_version': 'noreset-continuation-claim-v1',
+                 'previous_state_sha256': closure['previous_state_sha256'],
+                 'previous_receipt_sha256': closure['previous_receipt_sha256'], 'new_receipt_sha256': digest,
+                 'closure_sha256': hashlib.sha256(closure_raw).hexdigest(), 'state_path': str(target)}
+        # Claim is exclusive and remains even after failure; never silently retry elsewhere.
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        with claim_path.open('xb') as stream:
+            stream.write(_snapshot(claim).encode())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('xb') as stream:
+            stream.write(state_raw)
+        created = True
+        with sqlite3.connect(target) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('ALTER TABLE metadata RENAME TO closed_metadata')
+            connection.execute('CREATE TABLE metadata (receipt_sha256 TEXT NOT NULL,budget_sha256 TEXT NOT NULL,receipt_json TEXT NOT NULL,frozen_reason TEXT)')
+            connection.execute('INSERT INTO metadata VALUES (?,?,?,NULL)', (digest, _budget_digest(receipt), _snapshot(receipt)))
+            connection.execute('CREATE TABLE closed_origin (state_raw BLOB NOT NULL,receipt_raw BLOB NOT NULL,new_receipt_raw BLOB NOT NULL,closure_json BLOB NOT NULL,evidence_raw BLOB NOT NULL,claim_path TEXT NOT NULL)')
+            connection.execute('INSERT INTO closed_origin VALUES (?,?,?,?,?,?)', (state_raw, old_raw, new_raw, closure_raw, evidence_raw, str(claim_path)))
+            _save_authority(connection, digest, receipt, closure['previous_receipt_sha256'])
+            _history_v3(connection, receipt)
+        if (source.read_bytes() != state_raw or old_receipt_path.read_bytes() != old_raw
+                or any(Path(str(source) + suffix).exists() for suffix in ('-wal', '-shm', '-journal'))):
+            _deny()
+        result = validate_trial_authorization(receipt_path=new_receipt_path, state_path=target)
+        return {'state_path': str(target), 'receipt_sha256': digest, 'claim_path': str(claim_path),
+                'remaining_requests': result['remaining_requests'], 'remaining_usd': None, 'cost_bound_known': False,
+                'historical_reserved_usd': result['historical_reserved_usd'], 'closed_failed_attempt_id': 4}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, InvalidOperation, TrialGateError):
+        if created:
+            try:
+                with sqlite3.connect(target) as connection:
+                    connection.execute("UPDATE metadata SET frozen_reason='continuation_setup_failed'")
+            except sqlite3.Error:
+                pass
         raise TrialGateError() from None
 
 
