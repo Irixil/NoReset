@@ -744,7 +744,7 @@ def _authority_history(connection, head):
     return authorities
 
 
-def _history_v3(connection, receipt, *, _closed_failure=None, _validation_path=None, _depth=0, _closed_unverified_ids=()):
+def _history_v3(connection, receipt, *, _closed_failure=None, _validation_path=None, _depth=0, _closed_unverified_ids=(), _validated_closed_context=None):
     metadata = connection.execute('SELECT receipt_sha256 FROM metadata').fetchall()
     if len(metadata) != 1:
         _deny()
@@ -756,7 +756,16 @@ def _history_v3(connection, receipt, *, _closed_failure=None, _validation_path=N
     if set(links) != {row[0] for row in rows}:
         _deny()
     counts, scoped, occupied = {}, {}, 0
-    closed = _closed_context(connection, receipt, _validation_path=_validation_path, _depth=_depth)
+    if _validated_closed_context is None:
+        closed = _closed_context(connection, receipt, _validation_path=_validation_path, _depth=_depth)
+    else:
+        # Reuse only this source validation's same connection and receipt head;
+        # a checked None is distinct from an unchecked default. No global cache.
+        if (not isinstance(_validated_closed_context, tuple) or len(_validated_closed_context) != 3
+                or _validated_closed_context[0] is not connection
+                or _validated_closed_context[1] != metadata[0][0]):
+            _deny()
+        closed = _validated_closed_context[2]
     failed = closed['failed_attempt_id'] if closed else _closed_failure
     failed_ids = set(closed.get('closed_unverified_attempt_ids', [failed]) if closed else [failed]) | set(_closed_unverified_ids)
     for row in rows:
@@ -1192,7 +1201,8 @@ def _successor_source(state_raw, receipt_raw, closure_raw, evidence_raw, new_raw
                 _deny()
             failed_ids.add(ident)
         _, occupied = _history_v3(origin, old, _validation_path=source_path, _depth=_depth+1,
-                                  _closed_unverified_ids=failed_ids)
+                                  _closed_unverified_ids=failed_ids,
+                                  _validated_closed_context=(origin, old_sha, closed))
         closed = {**(closed or {'failed_attempt_id': 0}), 'closed_unverified_attempt_ids': sorted(failed_ids)}
         authorities = origin.execute('SELECT * FROM authorization_snapshots ORDER BY receipt_sha256').fetchall()
         if any(row[1] == new['receipt_id'] for row in authorities):
