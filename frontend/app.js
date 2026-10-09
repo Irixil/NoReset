@@ -16,7 +16,7 @@ function reducedMotion(){return window.matchMedia?.('(prefers-reduced-motion: re
 function reveal(element,titleSelector){if(!element)return;element.scrollIntoView?.({behavior:reducedMotion()?'auto':'smooth',block:'start'});element.querySelector?.(titleSelector)?.focus?.({preventScroll:true})}
 function clearRecordPanels(){
   detailRequestSerial++;
-  const detail=$('detail');if(detail){detail.classList.add('hidden');detail.innerHTML=''}
+  const detail=$('detail');if(detail){if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(detail);detail.classList.add('hidden');detail.innerHTML=''}
   const detailTitle=$('detailPageTitle');if(detailTitle)detailTitle.textContent='记录详情';
   const handoff=$('handoff');if(handoff){handoff.classList.add('hidden');handoff.innerHTML=''}
   const banner=$('dangerBanner');if(banner){banner.classList.add('hidden');banner.innerHTML=''}
@@ -26,6 +26,7 @@ function showView(id){
   const recordingActive=mediaRecorder?.state==='recording';
   const leavingConversation=document.querySelector?.('.view.active')?.id==='voiceView'&&id!=='voiceView';
   if(id!=='voiceView'&&(recordingActive||voicePermissionPending||voiceUploadPending)){toast(voicePermissionPending?'正在等待麦克风权限，请稍候':'正在录音或保留原件，请稍候');reveal($('voiceView'),'h1');return false}
+  const previousView=document.querySelector?.('.view.active');if(previousView?.id!==id&&typeof releaseOriginalsIn==='function')releaseOriginalsIn(previousView);
   if(leavingConversation)void pauseConversation();
   // Clear record-specific panels whenever navigation starts so an older event
   // cannot leak into the next screen or appear as the newly selected record.
@@ -98,6 +99,7 @@ async function refreshVoiceOnlineStatus(){
   }
 }
 async function api(path,opt={},retried=false){
+  if(opt.method==='POST'&&/^\/api\/conversations\/[^/]+\/(?:pause|finish)$/.test(path)&&typeof releaseOriginalsIn==='function')releaseOriginalsIn($('voiceConversationTurns'));
   if(localMode)return globalThis.HealthLocal.request(path,opt);
   const h={...(opt.body instanceof FormData ? {} : {'Content-Type':'application/json'}),...(opt.headers||{})};
   if(token)h['X-Session-Token']=token;
@@ -255,6 +257,29 @@ async function continueTrialVoice(){
   }catch{setVoiceStatus('本次回复未完成，原话和录音已保留；重新进入不会再次发送。','error');return false}
   finally{saveBusy=false;renderVoiceConversation();setVoiceComposerEnabled(true)}
 }
+async function showConversationOriginal(turn,box,conversation){
+  if(!box||turn?.source_kind!=='audio_transcript'||!turn.media_id||isMockContent(turn))return false;
+  box.textContent='正在读取本机原录音…';
+  try{
+    const x=await api('/api/media/'+encodeURIComponent(turn.media_id));
+    if(!box.isConnected&&box.isConnected!==undefined)return false;
+    if(!x.r.ok||!x.j.media){box.textContent='这份临时录音已清理或暂时无法读取；识别文字与修改历史仍保留。';return false}
+    const media=x.j.media;
+    if(media.media_id!==turn.media_id||media.kind!=='audio'||(media.conversation_id&&media.conversation_id!==conversation?.conversation_id)){
+      box.textContent='原录音与这段原话的来源不一致，请重新打开当前记录。';return false;
+    }
+    return await openOriginal(turn.media_id,{box,media});
+  }catch{box.textContent='原录音暂时无法读取；文字仍保留，可以稍后重新打开。';return false}
+}
+function bindConversationSourceActions(box,conversation){
+  box.querySelectorAll('[data-turn-original]').forEach(button=>button.onclick=async()=>{
+    const turn=(conversation?.turns||[]).find(item=>item.turn_id===button.dataset.turnOriginal&&item.role==='elder'&&!item.superseded);
+    const target=button.closest('.chat-bubble')?.querySelector('.voice-audio-original');
+    if(button.disabled||!turn||!target)return;button.disabled=true;
+    try{await showConversationOriginal(turn,target,conversation)}finally{button.disabled=false}
+  });
+  box.querySelectorAll('[data-turn-source]').forEach(button=>button.onclick=()=>showDetail(button.dataset.turnSource));
+}
 function voiceTurnHtml(turn){
   const assistant=turn.role==='assistant'||turn.side==='assistant';
   const mock=isMockContent(turn);
@@ -273,20 +298,23 @@ function voiceTurnHtml(turn){
       else if(!mock&&!turn.ai_failed)content+=`<div class="chat-inline-actions"><button type="button" data-voice-replay>再听一遍</button></div>`;
       if(['urgent','soon_evaluation'].includes(turn.action)&&!turn.ai_failed)content+='<small>固定安全提醒 · 不包含诊断或用药建议</small>';
     }else{
-      const source=mock?'模拟识别结果（非患者原话）':turn.source_kind==='audio_transcript'?'语音已转成文字':'已加密保存在本机';
-      content+=`<small>${escapeHtml(source)}${turn.version>1?` · 已修改，第 ${turn.version} 版`:''}</small>${mock?'':'<button class="chat-edit-link" type="button" data-voice-turn-edit>修改</button>'}`;
+      const audio=turn.source_kind==='audio_transcript',source=mock?'模拟识别结果（非患者原话）':audio?'语音识别文字 · 请核对':'已加密保存在本机';
+      content+=`<small>${escapeHtml(source)}${turn.version>1?` · 已修改，第 ${turn.version} 版`:''}</small>${mock?'':`<button class="chat-edit-link" type="button" data-voice-turn-edit>${audio?'修改识别文字':'修改'}</button>`}`;
+      if(!mock&&audio&&turn.media_id)content+=`<button class="chat-edit-link" type="button" data-turn-original="${escapeHtml(turn.turn_id)}" data-voice-original="${escapeHtml(turn.media_id)}">对照原录音</button><div class="voice-audio-original" style="max-width:100%" aria-live="polite"></div>`;
     }
   }
   return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'}${turn.pending?' pending-turn':''}" data-voice-turn="${escapeHtml(turn.turn_id||'')}">${avatar}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}${turn.error?' error-bubble':''}${editing?' editing-bubble':''}">${content}</div></article>`;
 }
 function renderVoiceConversation(){
   const box=$('voiceConversationTurns');if(!box)return;
+  if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(box);
   const turns=(activeConversation?.turns||[]).filter(turn=>!turn.superseded);
   box.innerHTML=[...turns,pendingConversationTurn].filter(Boolean).map(voiceTurnHtml).join('');
   if(activeConversation?.trial_control){const control=activeConversation.trial_control;box.innerHTML+=`<div class="chat-turn"><div class="chat-bubble"><p>${escapeHtml(trialVoiceMessage(control))}</p>${control.state==='review_required'?`<button class="chat-action" type="button" data-trial-continue ${saveBusy?'disabled':''}>核对并获准后继续一次</button>`:''}</div></div>`;box.querySelector('[data-trial-continue]')?.addEventListener('click',continueTrialVoice)}
   box.querySelectorAll('[data-voice-turn-edit]').forEach(button=>button.onclick=()=>beginVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn));
   box.querySelectorAll('[data-voice-turn-cancel]').forEach(button=>button.onclick=cancelVoiceTurnEdit);
   box.querySelectorAll('[data-voice-turn-save]').forEach(button=>button.onclick=()=>saveVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn,button.closest('.chat-bubble')?.querySelector('[data-voice-turn-input]')?.value||''));
+  bindConversationSourceActions(box,activeConversation);
   box.querySelectorAll('[data-voice-replay]').forEach(button=>button.onclick=()=>{const turn=turnById(button.closest('[data-voice-turn]')?.dataset.voiceTurn);if(turn)speakAssistant(turn,true)});
   box.querySelectorAll('[data-voice-retry]').forEach(button=>button.onclick=()=>retryConversationReply(button));
   const editingTurn=conversationEditingTurnId;
@@ -539,9 +567,9 @@ async function showVoiceMediaResult(media){
       const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));
       if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){
         const voiceVisible=document.querySelector?.('.view.active')?.id==='voiceView';
-        syncConversation(saved.j.conversation,{speak:voiceVisible});const paused=await api(`/api/conversations/${encodeURIComponent(media.conversation_id)}/pause`,{method:'POST',body:'{}'});if(paused.r.ok&&paused.j.conversation)activeConversation=paused.j.conversation;
+        syncConversation(saved.j.conversation,{speak:voiceVisible});
       }
-      setVoiceStatus('语音已转成文字，原话和报告都已保存。','ok');return;
+      setVoiceStatus('识别文字和报告已保存，请对照原录音核对。离开或结束后临时录音会清理，文字与修改历史保留。','ok');return;
     }
     if(activeConversation?.conversation_id!==media.conversation_id){setVoiceStatus('语音文字已保存，但这段录音还没有接入原来的对话。请回到原对话核对；录音原件仍保留。','error');return}
     if(media.conversation_link_error||media.conversation_link_interrupted){prepareMediaRetry(media,text);setVoiceStatus('识别文字和录音原件已保留；加入对话没有完成。请核对下方文字后点发送重试。','error');return}
@@ -553,7 +581,7 @@ async function showVoiceMediaResult(media){
     if(media.conversation_turn_id&&media.conversation_id){
       const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));
       if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){
-        syncConversation(saved.j.conversation);const paused=await api(`/api/conversations/${encodeURIComponent(media.conversation_id)}/pause`,{method:'POST',body:'{}'});if(paused.r.ok&&paused.j.conversation)activeConversation=paused.j.conversation;
+        syncConversation(saved.j.conversation);
       }
       setVoiceStatus('语音已转成文字，原话和报告都已保存。','ok');
     }else await submitConversationText(text,{source_kind:'audio_transcript',record_id:rid,media_id:media.media_id});
@@ -601,6 +629,7 @@ async function loadConversation(){
   }finally{conversationLoading=false;if(activeConversation)setVoiceComposerEnabled(true)}
 }
 async function pauseConversation(){
+  if(typeof releaseOriginalsIn==='function')releaseOriginalsIn($('voiceConversationTurns'));
   if(!activeConversation?.conversation_id)return;
   if(activeConversation.trial_control)return;
   try{const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/pause`,{method:'POST',body:'{}'});if(x.r.ok&&x.j.conversation)activeConversation=x.j.conversation}catch{}
@@ -665,7 +694,7 @@ function detailHtml(e,{organizeFailed=false,relatedRecords=null}={}){
 function renderDetail(e,options={}){
   const mock=isMockContent(e);current=e;safetyBanner(mock||documentNeedsReview(e)?null:e.local_safety);
   const pageTitle=$('detailPageTitle');if(pageTitle)pageTitle.textContent='单条记录详情';
-  const d=$('detail');d.classList.remove('hidden');d.innerHTML=(mock?`<p class="status error">${escapeHtml(mockWarning)}</p>`:'')+detailHtml(e,options);
+  const d=$('detail');if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(d);d.classList.remove('hidden');d.innerHTML=(mock?`<p class="status error">${escapeHtml(mockWarning)}</p>`:'')+detailHtml(e,options);
   if($('documentOriginalBtn'))$('documentOriginalBtn').onclick=()=>showDocumentOriginals(e.record_id);
   if($('sourceReviewCheck'))$('sourceReviewCheck').onchange=()=>{$('sourceReviewBtn').disabled=!$('sourceReviewCheck').checked};
   if($('sourceReviewBtn'))$('sourceReviewBtn').onclick=async()=>{
@@ -684,7 +713,9 @@ async function loadRelatedHistory(e){const request=detailRequestSerial,ids=Array
 function conversationTurnTime(turn){return turn?.created_at?new Date(turn.created_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function conversationTranscriptTurnHtml(turn){
   const assistant=turn.role==='assistant',mock=isMockContent(turn),speaker=assistant?'小零':'我',time=conversationTurnTime(turn),history=!assistant&&!mock&&turn.versions?.length?`<details class="turn-history"><summary>查看修改前文字</summary>${turn.versions.map(version=>`<p>第 ${escapeHtml(version.version)} 版：${escapeHtml(version.text||'')}</p>`).join('')}</details>`:'';
-  return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'} archive-chat-turn">${assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':''}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}">${mock?`<small class="mock-content-warning">${escapeHtml(mockWarning)}</small>`:''}<p>${escapeHtml(turn.text||'')}</p><small>${mock?'模拟内容':speaker}${time?` · ${escapeHtml(time)}`:''}${!assistant&&!mock&&turn.version>1?' · 已修改':''}</small>${history}</div></article>`;
+  const audio=!assistant&&!mock&&turn.source_kind==='audio_transcript';
+  const sourceActions=audio?`${turn.record_id?`<button class="chat-edit-link" type="button" data-turn-source="${escapeHtml(turn.record_id)}">核对/修改识别文字</button>`:''}${turn.media_id?`<button class="chat-edit-link" type="button" data-turn-original="${escapeHtml(turn.turn_id)}" data-voice-original="${escapeHtml(turn.media_id)}">对照原录音</button><div class="voice-audio-original" style="max-width:100%" aria-live="polite"></div>`:''}`:'';
+  return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'} archive-chat-turn">${assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':''}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}">${mock?`<small class="mock-content-warning">${escapeHtml(mockWarning)}</small>`:''}<p>${escapeHtml(turn.text||'')}</p><small>${mock?'模拟内容':audio?'语音识别文字 · 请核对':speaker}${time?` · ${escapeHtml(time)}`:''}${!assistant&&!mock&&turn.version>1?` · 已修改，第 ${escapeHtml(turn.version)} 版`:''}</small>${sourceActions}${history}</div></article>`;
 }
 function conversationSafety(conversation){
   const elderTurns=elderArchiveTurns(conversation).filter(turn=>!isMockContent(turn)),danger=elderTurns.find(turn=>turn.local_safety?.danger_detected),review=elderTurns.find(turn=>turn.local_safety?.clinical_review_required);
@@ -699,7 +730,8 @@ function conversationDetailHtml(conversation){
 function renderConversationDetail(conversation){
   current=conversation;safetyBanner(conversationSafety(conversation));
   const pageTitle=$('detailPageTitle');if(pageTitle)pageTitle.textContent=`${conversationDateLabel(conversation)}完整对话`;
-  const d=$('detail');d.classList.remove('hidden');d.innerHTML=conversationDetailHtml(conversation);
+  const d=$('detail');if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(d);d.classList.remove('hidden');d.innerHTML=conversationDetailHtml(conversation);
+  bindConversationSourceActions(d,conversation);
 }
 async function showConversationDetail(id){
   if(!showView('recordDetailView'))return;
@@ -906,4 +938,4 @@ if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('fee
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 health().then(loadEvents);
-if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=real-acceptance-20260930-7',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});
+if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=audio-review-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

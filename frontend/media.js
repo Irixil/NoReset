@@ -3,6 +3,7 @@ let mediaItems=[], uploadBusy=false, selectedPhoto=null, pendingRecordingBlob=nu
 const localMediaJobs=new Map();
 const recognitionBusy=new Set();
 const originalUrls=new Map();
+const originalTargets=new Map();
 const mediaStatus=$('mediaStatus');
 async function readBlobBytes(source){
   if(typeof FileReader!=='undefined'){
@@ -132,6 +133,7 @@ async function loadMedia(){
   mediaItems=j.media||[];renderMedia();return true;
 }
 function renderMedia(){
+  releaseOriginalsIn($('archivePhotos'));
   $('archivePhotoCount').textContent=mediaItems.filter(m=>m.kind==='image'&&m.save_status==='saved').length;
   $('archivePhotos').innerHTML=mediaItems.length?latestMediaFirst(mediaItems).map(m=>{
     const mock=isMockMedia(m);
@@ -148,20 +150,40 @@ function renderMedia(){
   document.querySelectorAll('[data-recognize]').forEach(b=>b.onclick=()=>recognizeMedia(b.dataset.recognize));
 }
 function latestMediaFirst(items){return items.slice().sort((a,b)=>{const at=Date.parse(a.created_at||a.updated_at||'')||0;const bt=Date.parse(b.created_at||b.updated_at||'')||0;return bt-at||String(b.media_id||'').localeCompare(String(a.media_id||''))})}
+function releaseOriginal(id){
+  const node=originalTargets.get(id)?.node;
+  try{node?.pause?.();node?.removeAttribute?.('src');node?.load?.()}catch{}
+  if(originalUrls.has(id))URL.revokeObjectURL(originalUrls.get(id));
+  originalUrls.delete(id);originalTargets.delete(id);
+}
+function releaseOriginalsIn(container){
+  if(!container)return;
+  for(const [id,target] of originalTargets){
+    if(target.box===container||container.contains?.(target.box)||target.box?.isConnected===false)releaseOriginal(id);
+  }
+}
 async function openOriginal(id,{box=null,media=null}={}){
+  let url,target;
   try{
-    if(originalUrls.has(id))URL.revokeObjectURL(originalUrls.get(id));
-    let url;
+    const m=media||mediaItems.find(m=>m.media_id===id);box=box||$('media-'+id)?.querySelector('.media-result');
+    if(!m||!box||box.isConnected===false)throw new Error('原件暂时无法读取');
+    releaseOriginalsIn(box);releaseOriginal(id);
+    target={box,node:null};originalTargets.set(id,target);
     if(globalThis.HealthLocal?.active)url=await globalThis.HealthLocal.originalObjectUrl(id);
     else{await health();const r=await fetch(API+`/api/media/${id}/original`,{credentials:'include',headers:{'X-Session-Token':token}});if(!r.ok)throw new Error('原件暂时无法读取');url=URL.createObjectURL(await r.blob());}
+    if(box.isConnected===false||originalTargets.get(id)!==target){URL.revokeObjectURL(url);if(originalTargets.get(id)===target)originalTargets.delete(id);return false}
     originalUrls.set(id,url);
-    const m=media||mediaItems.find(m=>m.media_id===id);box=box||$('media-'+id)?.querySelector('.media-result');
-    if(!m||!box)throw new Error('原件暂时无法读取');
-    const node=document.createElement(m.kind==='audio'?'audio':'img');node.src=url;
-    if(m.kind==='audio')node.controls=true;else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
+    const node=document.createElement(m.kind==='audio'?'audio':'img');target.node=node;node.src=url;
+    if(m.kind==='audio'){node.controls=true;node.style.maxWidth='100%';}else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
     box.replaceChildren(node);
     if(m.kind==='image'){const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';link.textContent='放大查看原件';box.append(link);}
-  }catch(e){if(box)box.textContent='原件暂时无法读取，请重新打开核对。';else mediaMessage(e.message);}
+    return true;
+  }catch(e){
+    if(url&&originalUrls.get(id)!==url)URL.revokeObjectURL(url);
+    if(originalTargets.get(id)===target)releaseOriginal(id);
+    if(box&&box.isConnected!==false)box.textContent='原件暂时无法读取，请重新打开核对。';else if(!box)mediaMessage(e.message);
+  }
+  return false;
 }
 async function showDocumentOriginals(recordId){
   const box=$('documentOriginals'),button=$('documentOriginalBtn');if(!box)return;

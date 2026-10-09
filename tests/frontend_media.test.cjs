@@ -416,7 +416,7 @@ test('pending audio-to-conversation link never posts a duplicate elder turn; per
   await h.run('showVoiceMediaResult(testLinked)');
   assert.equal(h.requests.filter(request => request.route.endsWith('/turns')).length, 0);
   assert.equal(h.requests.filter(request => request.route === '/api/conversations/conversation_test').length, 1);
-  assert.equal(h.requests.filter(request => request.route.endsWith('/pause')).length, 1);
+  assert.equal(h.requests.filter(request => request.route.endsWith('/pause')).length, 0, 'showing ASR text leaves time to compare the original before explicit pause');
   assert.deepEqual(h.run('activeConversation.turns.map(turn=>turn.turn_id)'), ['turn_00000001']);
 });
 
