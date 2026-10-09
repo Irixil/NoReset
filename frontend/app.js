@@ -842,8 +842,6 @@ function startSilenceWatch(stream){
 }
 async function startVoice(){
   if(typeof recognitionBusy!=='undefined'&&recognitionBusy.size){setVoiceStatus('这段语音还在识别或保存，请等完成。');return}
-  const trial=await globalThis.HealthLocal?.trialVoiceState?.();
-  if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),trial.state==='stopped'?'error':'ok');return}
   if(voicePermissionPending||voiceUploadPending)return;
   if(mediaRecorder?.state==='recording'||$('recordBtn').classList.contains('recording')){$('finishVoiceBtn').onclick?.();return}
   const Recorder=globalThis.MediaRecorder,getUserMedia=globalThis.navigator?.mediaDevices?.getUserMedia;
@@ -852,10 +850,16 @@ async function startVoice(){
     const insecure=globalThis.isSecureContext===false||(protocol==='http:'&&!['localhost','127.0.0.1','::1'].includes(host));
     $('voiceHint').textContent=insecure?'当前页面不是安全连接，浏览器不开放麦克风；请使用安全连接，或到“看病资料”上传已有录音、直接输入文字':'此浏览器暂不支持直接录音；您可以到“看病资料”上传已有录音，或直接输入文字';setVoiceStatus($('voiceHint').textContent,'error');return;
   }
-  globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
+  globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='正在准备录音，请稍候';setVoiceStatus('正在准备录音…');
   const permissionGeneration=++voicePermissionGeneration,conversationId=activeConversation?.conversation_id;
-  let stream;
+  let stream,preflightReady=false;
   try{
+    const trial=await globalThis.HealthLocal?.trialVoiceState?.();
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      $('voiceHint').textContent='本次录音准备已取消；麦克风未开启。';setVoiceStatus($('voiceHint').textContent);return;
+    }
+    if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),trial.state==='stopped'?'error':'ok');return}
+    preflightReady=true;$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
     stream=await getUserMedia.call(globalThis.navigator.mediaDevices,{audio:true});
     const lateTrial=await globalThis.HealthLocal?.trialVoiceState?.();
     if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||lateTrial&&lateTrial.state!=='completed'||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
@@ -870,6 +874,7 @@ async function startVoice(){
     mediaRecorder.start();const autoStop=startSilenceWatch(stream);startedAt=Date.now();timerId=setInterval(updateTimer,1000);$('voiceHint').textContent=autoStop?'正在听，停顿约 3 秒会自动结束':'正在录音；请听完后按“结束这句话”';setVoiceStatus(autoStop?'您慢慢说；停顿约 3 秒会自动保存并回复。':'您慢慢说；听完后按“结束这句话”，录音会自动保存。');
   }catch(e){
     stream?.getTracks().forEach(t=>t.stop());mediaRecorder=null;clearInterval(timerId);timerId=null;
+    if(!preflightReady){$('voiceHint').textContent='暂时无法确认录音状态；麦克风未开启，请重试。';setVoiceStatus($('voiceHint').textContent,'error');return}
     const name=e?.name||'';
     const message=name==='NotAllowedError'||name==='PermissionDeniedError'?'麦克风权限未允许；您可以在浏览器设置中开启，或直接输入文字。':name==='NotFoundError'||name==='DevicesNotFoundError'?'没有找到可用麦克风；请检查设备，或直接输入文字。':name==='NotReadableError'||name==='TrackStartError'?'麦克风正在被其他应用使用；请关闭后重试，或直接输入文字。':name==='SecurityError'||globalThis.location?.protocol==='http:'&&!['localhost','127.0.0.1'].includes(globalThis.location?.hostname)?'当前页面不允许使用麦克风；请在安全连接中打开，或直接输入文字。':'麦克风未能开启；请检查权限或设备，也可以上传已有录音或直接输入文字。';
     $('voiceHint').textContent=message;setVoiceStatus(message,'error');
@@ -939,4 +944,4 @@ if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('fee
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 health().then(loadEvents);
-if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=audio-recovery-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});
+if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=mic-preflight-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

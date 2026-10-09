@@ -98,15 +98,15 @@ function captureHarness(){
   class Recorder{static isTypeSupported(){return false}constructor(stream){this.stream=stream;this.state='inactive'}start(){starts++;this.state='recording'}stop(){this.state='inactive'}}
   const context=vm.createContext({MediaRecorder:Recorder,navigator:{mediaDevices:{getUserMedia:()=>new Promise(r=>release=r)}},HealthLocal:{trialVoiceState:async()=>context.trial},trial:null,recognitionBusy:new Set(),activeConversation:{conversation_id:'synthetic_a'},voicePermissionGeneration:0,voicePermissionPending:false,voiceUploadPending:false,mediaRecorder:null,chunks:[],elapsedMs:0,timerId:null,startedAt:0,$:el,setVoiceStatus:m=>el('status').textContent=m,trialVoiceMessage:()=> '试验已停止',speechSynthesis:{cancel(){}},setRecording(){},updateTimer(){},clearInterval(){},setInterval:()=>1,startSilenceWatch:()=>false,stopSilenceWatch(){}});
   const source=fs.readFileSync(require.resolve('../frontend/app.js'),'utf8');vm.runInContext(source.slice(source.indexOf('async function startVoice('),source.indexOf("$('recordBtn').onclick=startVoice")),context);
-  return{context,el,run:c=>vm.runInContext(c,context),release:()=>release({getTracks:()=>[{stop(){stops++}},{stop(){stops++}}]}),counts:()=>({starts,stops})};
+  return{context,el,run:c=>vm.runInContext(c,context),permissionRequested:()=>typeof release==='function',release:()=>release({getTracks:()=>[{stop(){stops++}},{stop(){stops++}}]}),counts:()=>({starts,stops})};
 }
 test('late synthetic microphone permission after shared stop closes all tracks without starting recording',async()=>{
-  const h=captureHarness(),pending=h.run('startVoice()');while(!h.context.voicePermissionPending)await new Promise(setImmediate);
+  const h=captureHarness(),pending=h.run('startVoice()');while(!h.permissionRequested())await new Promise(setImmediate);
   h.context.trial={state:'stopped'};h.release();await pending;assert.deepEqual(h.counts(),{starts:0,stops:2});assert.equal(h.context.voicePermissionPending,false);
 });
 test('cancel generation and changed conversation both reject late synthetic microphone permission',async()=>{
   for(const cancel of ['stopVoice("已暂停")','activeConversation={conversation_id:"synthetic_b"}']){
-    const h=captureHarness(),pending=h.run('startVoice()');while(!h.context.voicePermissionPending)await new Promise(setImmediate);h.run(cancel);h.release();await pending;assert.deepEqual(h.counts(),{starts:0,stops:2});
+    const h=captureHarness(),pending=h.run('startVoice()');while(!h.permissionRequested())await new Promise(setImmediate);h.run(cancel);h.release();await pending;assert.deepEqual(h.counts(),{starts:0,stops:2});
   }
 });
 test('shared review or stop arising during online session wait prevents ordinary late model send',async()=>{
