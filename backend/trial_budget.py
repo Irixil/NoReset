@@ -209,9 +209,9 @@ def _authority(descriptor):
         raise TrialBudgetError() from None
 
 
-def _connect(descriptor):
+def _connect(descriptor, *, readonly=False):
     record, path = _authority(descriptor)
-    db = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=10)
+    db = sqlite3.connect(path.as_uri() + ('?mode=ro' if readonly else '?mode=rw'), uri=True, timeout=10)
     try:
         if db.execute('SELECT authorization_sha256,record_json FROM metadata').fetchall() != [
                 (descriptor['authorization_sha256'], _encode(record))]:
@@ -222,7 +222,7 @@ def _connect(descriptor):
         raise
 
 
-def _receipt_binding(descriptor, receipt, authority):
+def _receipt_binding(descriptor, receipt, authority, *, historical=False):
     if (not isinstance(receipt, dict) or receipt.get('schema_version') != RECEIPT_SCHEMA
             or receipt.get('status') != 'approved' or receipt.get('authorization_source') != 'explicit_owner_approval'
             or receipt.get('synthetic_only') is not True or receipt.get('cumulative_budget') != descriptor):
@@ -230,7 +230,8 @@ def _receipt_binding(descriptor, receipt, authority):
     _text(receipt.get('receipt_id')); _text(receipt.get('approval_ref'))
     approved, expires = _time(receipt.get('approved_at')), _time(receipt.get('expires_at'))
     now = datetime.now(timezone.utc)
-    if (not _time(authority['effective_at']) <= approved <= now < expires
+    if (not _time(authority['effective_at']) <= approved <= now
+            or (not historical and now >= expires)
             or expires - approved > timedelta(minutes=60) or expires <= approved):
         _deny()
     sequence, profiles = receipt.get('request_sequence'), receipt.get('profiles')
@@ -272,7 +273,7 @@ def _receipt_binding(descriptor, receipt, authority):
                 or billing.get('complete_cost_bound_known') is not False
                 or billing.get('internal_billable_attempts_known') is not False
                 or billing.get('completion_tokens_include_reasoning') is not True
-                or _time(billing.get('expires_at')) <= now):
+                or (_time(billing.get('expires_at')) <= now and not historical)):
             _deny()
         aliases = billing.get('returned_models')
         allowed_aliases = {'deepseek-flash', 'deepseek-v4-flash'} if kind == 'llm' else {'gemini-2.5-flash-lite'}
@@ -312,6 +313,41 @@ def validate_batch(descriptor, *, receipt):
             if previous != (binding, 'active'):
                 _deny()
         return budget_snapshot(descriptor)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError):
+        raise TrialBudgetError() from None
+
+
+def batch_status(descriptor, *, receipt):
+    """Read a closed batch's frozen binding and counts in one read transaction.
+
+    Historical expiry permits inspection only; live register/reserve validation
+    stays strict. Native recovery must separately bind the original receipt
+    bytes, since the frozen budget digest excludes approval/source/wire amends.
+    No missing allocation or exception is interpreted as a zero count.
+    """
+    try:
+        db, authority = _connect(descriptor, readonly=True)
+        with closing(db), db:
+            db.execute('BEGIN')
+            if not isinstance(receipt, dict):
+                _deny()
+            ident = receipt.get('receipt_id')
+            _text(ident)
+            previous = db.execute(
+                'SELECT binding_sha256,status,closure_reason,registered_json FROM batches WHERE receipt_id=?',
+                (ident,)).fetchone()
+            if previous is None or previous[1] != 'closed':
+                _deny()
+            _text(previous[2])
+            binding, _ = _receipt_binding(descriptor, receipt, authority, historical=True)
+            registered = json.loads(previous[3], object_pairs_hook=_unique)
+            stored_binding, _ = _receipt_binding(descriptor, registered, authority, historical=True)
+            if previous[0] != binding or previous[0] != stored_binding or registered['receipt_id'] != ident:
+                _deny()
+            count = db.execute('SELECT COUNT(*) FROM allocations WHERE receipt_id=?', (ident,)).fetchone()[0]
+            active = db.execute("SELECT COUNT(*) FROM batches WHERE status='active'").fetchone()[0]
+        return {'receipt_id': ident, 'binding_sha256': binding, 'closed': True,
+                'closure_reason': previous[2], 'allocations': count, 'global_active_batches': active}
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError):
         raise TrialBudgetError() from None
 

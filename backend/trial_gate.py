@@ -1230,6 +1230,8 @@ def _successor_context(connection, receipt=None, *, _validation_path=None, _dept
     if not rows or [row[0] for row in rows] != list(range(1, len(rows)+1)):
         _deny()
     _, state_raw, old_raw, new_raw, closure_raw, evidence_raw, claim_path, source_path = rows[-1]
+    from .trial_snapshot import load_snapshot
+    state_raw = load_snapshot(state_raw, CONTINUATION_CLAIM_ROOT)
     if not isinstance(source_path, str) or str(Path(source_path).resolve()) != source_path:
         _deny()
     closure, tables, _, closed = _successor_source(state_raw, old_raw, closure_raw, evidence_raw, new_raw,
@@ -1250,7 +1252,12 @@ def _successor_context(connection, receipt=None, *, _validation_path=None, _dept
                 _deny()
     state_path = _validation_path or connection.execute('PRAGMA database_list').fetchone()[2]
     expected_claim_path = CONTINUATION_CLAIM_ROOT.resolve() / _successor_claim_name(closure)
-    if Path(claim_path).absolute() != expected_claim_path or Path(claim_path).resolve() != expected_claim_path:
+    provided_claim_path = Path(claim_path).absolute()
+    recovered_name = re.escape(expected_claim_path.stem) + r'-recovery-[a-f0-9]{64}\.json'
+    if (provided_claim_path.parent != expected_claim_path.parent
+            or provided_claim_path != provided_claim_path.resolve()
+            or not (provided_claim_path == expected_claim_path
+                    or re.fullmatch(recovered_name, provided_claim_path.name))):
         _deny()
     expected_claim = {'schema_version': 'noreset-scope-successor-claim-v1',
         'previous_receipt_sha256': closure['previous_receipt_sha256'],
@@ -1258,7 +1265,21 @@ def _successor_context(connection, receipt=None, *, _validation_path=None, _dept
         'previous_state_sha256': closure['previous_state_sha256'],
         'new_receipt_sha256': new_sha, 'closure_sha256': hashlib.sha256(closure_raw).hexdigest(),
         'state_path': str(Path(state_path).resolve())}
-    if json.loads(Path(claim_path).read_bytes(), object_pairs_hook=_unique_object) != expected_claim:
+    actual_claim = json.loads(Path(claim_path).read_bytes(), object_pairs_hook=_unique_object)
+    if not isinstance(actual_claim, dict):
+        _deny()
+    if actual_claim.get('schema_version') == 'noreset-scope-successor-recovered-claim-v1':
+        from .trial_recovery import verify_consumed_recovery
+        _, recovery_sha, consumed_path = verify_consumed_recovery(actual_claim['recovery_path'],
+            source_path=source_path, source_sha256=closure['previous_state_sha256'],
+            old_receipt_sha256=closure['previous_receipt_sha256'], new_receipt_sha256=new_sha,
+            target=state_path, expected_failed_claim_path=expected_claim_path)
+        expected_claim_path = expected_claim_path.with_name(expected_claim_path.stem+'-recovery-'+recovery_sha+'.json')
+        expected_claim.update(schema_version='noreset-scope-successor-recovered-claim-v1',
+                              recovery_path=actual_claim['recovery_path'], recovery_sha256=recovery_sha,
+                              consumed_path=consumed_path)
+    if (Path(claim_path).absolute() != expected_claim_path or Path(claim_path).resolve() != expected_claim_path
+            or actual_claim != expected_claim):
         _deny()
     # Original schemas and every original row survive, including proof chains,
     # usage, reviews and response metadata. Only this scope's new rows may grow.
@@ -1294,7 +1315,7 @@ def _successor_context(connection, receipt=None, *, _validation_path=None, _dept
 
 
 def succeed_informed_trial(receipt_path, state_path, *, previous_receipt_path, previous_state_path,
-                           closure_path, failure_evidence_path):
+                           closure_path, failure_evidence_path, recovery_path=None):
     """Explicit local new approval, independent state, immutable stopped history.
 
     No HTTP handler can create this successor. Closed unknown attempts retain
@@ -1319,6 +1340,18 @@ def succeed_informed_trial(receipt_path, state_path, *, previous_receipt_path, p
             'previous_attempts_sha256': closure['previous_attempts_sha256'],
             'previous_state_sha256': closure['previous_state_sha256'], 'new_receipt_sha256': digest,
             'closure_sha256': hashlib.sha256(closure_raw).hexdigest(), 'state_path': str(target)}
+        if recovery_path is not None:
+            from .trial_recovery import verify_consumed_recovery
+            _, recovery_sha, consumed_path = verify_consumed_recovery(recovery_path,
+                source_path=str(source), source_sha256=closure['previous_state_sha256'],
+                old_receipt_sha256=closure['previous_receipt_sha256'], new_receipt_sha256=digest,
+                target=target, expected_failed_claim_path=claim_path, observe_owner=True)
+            claim_path = claim_path.with_name(claim_path.stem+'-recovery-'+recovery_sha+'.json')
+            claim.update(schema_version='noreset-scope-successor-recovered-claim-v1',
+                         recovery_path=str(Path(recovery_path).resolve()), recovery_sha256=recovery_sha,
+                         consumed_path=consumed_path)
+        from .trial_snapshot import store_snapshot
+        stored_state = store_snapshot(state_raw, CONTINUATION_CLAIM_ROOT)
         claim_path.parent.mkdir(parents=True, exist_ok=True)
         with claim_path.open('xb') as stream:
             stream.write(_snapshot(claim).encode())
@@ -1330,7 +1363,7 @@ def succeed_informed_trial(receipt_path, state_path, *, previous_receipt_path, p
             connection.execute('BEGIN IMMEDIATE')
             connection.execute('CREATE TABLE IF NOT EXISTS scope_successors (id INTEGER PRIMARY KEY,state_raw BLOB NOT NULL,receipt_raw BLOB NOT NULL,new_receipt_raw BLOB NOT NULL,closure_json BLOB NOT NULL,evidence_raw BLOB NOT NULL,claim_path TEXT NOT NULL,source_path TEXT NOT NULL)')
             connection.execute('INSERT INTO scope_successors(state_raw,receipt_raw,new_receipt_raw,closure_json,evidence_raw,claim_path,source_path) VALUES (?,?,?,?,?,?,?)',
-                (state_raw, old_raw, new_raw, closure_raw, evidence_raw, str(claim_path), str(source)))
+                (stored_state, old_raw, new_raw, closure_raw, evidence_raw, str(claim_path), str(source)))
             connection.execute('CREATE TABLE IF NOT EXISTS closed_scope_metadata (receipt_sha256 TEXT PRIMARY KEY,old_receipt_sha256 TEXT NOT NULL,budget_sha256 TEXT NOT NULL,receipt_json TEXT NOT NULL,frozen_reason TEXT NOT NULL)')
             connection.execute('INSERT INTO closed_scope_metadata VALUES (?,?,?,?,?)', (closure['previous_receipt_sha256'], *tables['metadata'][1][0]))
             _save_authority(connection, digest, receipt, closure['previous_receipt_sha256'])
