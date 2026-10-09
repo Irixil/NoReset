@@ -156,7 +156,9 @@ test('source changed while risk manifest loads cannot authorize or overwrite an 
   await h.api.vault.put('conversation:' + original.conversation_id, updated);
   release();
   const result = await sending;
-  assert.equal(result.j.conversation.last_ai_metadata.ai_failed, true);
+  assert.equal(result.j.result_discarded, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.j.conversation)), updated,
+    'discarding an obsolete risk reply must not append a failure or revise the newer source');
   assert.equal(result.j.conversation.turns.find(turn => turn.role === 'elder').text, '纯虚构：更正后的原话');
   assert.equal((result.j.conversation.report.reviewed_risk_assessments || []).length, 0);
 });

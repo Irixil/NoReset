@@ -877,6 +877,19 @@
   }
 
   async function appendAssistantResult(conversation, result) {
+    const sendingVersion = conversation.version;
+    const sendingSources = JSON.stringify(analysisSources(conversation));
+    let storedConversation = await vault.get(conversationKey(conversation.conversation_id));
+    let currentContext = await healthContext();
+    const sourceUnchanged = latest => latest && latest.version === sendingVersion
+      && JSON.stringify(analysisSources(latest, currentContext)) === sendingSources;
+    if (!storedConversation) throw new Error('conversation_not_found');
+    if (!sourceUnchanged(storedConversation)) return { conversation: storedConversation, applied: false };
+    // The result belongs to the sending snapshot, including its selected
+    // context. Never rebind an old analysis to newer patient wording.
+    const sendingContext = conversation.health_context;
+    const sendingContextVersion = conversation.health_context_version;
+    conversation = { ...excludeMockFacts(storedConversation), health_context: sendingContext, health_context_version: sendingContextVersion };
     const localUrgent = result.j?.action === 'urgent' && result.j?.provider === 'LocalDangerRule'
       && result.j?.assistant_text === safety.DANGER_REMINDER && elderTurns(conversation).at(-1)?.local_safety?.danger_detected;
     const riskRequested = !localUrgent && (['soon_evaluation', 'urgent'].includes(result.j?.action)
@@ -886,9 +899,11 @@
       // Ordinary turns add no config request. A reviewed notice needs the live
       // trusted manifest, never approval fields authored by the model itself.
       const config = await cloudFetch('/api/app/config', {}, 8000);
-      const latest = await vault.get(conversationKey(conversation.conversation_id));
-      if (!latest) throw new Error('conversation_not_found');
-      conversation = latest;
+      storedConversation = await vault.get(conversationKey(conversation.conversation_id));
+      currentContext = await healthContext();
+      if (!storedConversation) throw new Error('conversation_not_found');
+      if (!sourceUnchanged(storedConversation)) return { conversation: storedConversation, applied: false };
+      conversation = { ...excludeMockFacts(storedConversation), health_context: sendingContext, health_context_version: sendingContextVersion };
       riskAssessment = config.r.ok ? safety.validateReviewedRisk(result.j.risk_assessment,
         config.j.reviewed_risk_rules, elderTurns(conversation)) : null;
       if (riskAssessment && (result.j.action !== riskAssessment.level || result.j.assistant_text !== riskAssessment.notice)) riskAssessment = null;
@@ -917,9 +932,16 @@
       relevant_health_context: safeResult && result.j.completeness ? (conversation.health_context || []).filter(item => result.j.completeness.relevant_context_ids?.includes(item.context_id)) : conversation.relevant_health_context || [],
       last_ai_metadata: safeResult ? { provider: result.j.provider, model_id: result.j.model_id, prompt_version: result.j.prompt_version, trace_id: result.j.trace_id } : { ai_failed: true, error: result.j?.error || 'ai_conversation_failed' },
     };
-    const current = invalidateChangedAnalysis(next, await healthContext());
+    const current = invalidateChangedAnalysis(next, currentContext);
     current.report = buildConversationReport(current, conversation.report);
-    return saveConversation(current);
+    const saved = { ...current, version: conversation.version + 1, updated_at: now() };
+    const contextGuard = conversation.selected_context_ids?.length ? [{ key: HEALTH_CONTEXT_KEY, value: currentContext }] : [];
+    if (await vault.putIfUnchanged(conversationKey(conversation.conversation_id), storedConversation, saved, contextGuard)) {
+      return { conversation: saved, applied: true };
+    }
+    const latest = await vault.get(conversationKey(conversation.conversation_id));
+    if (!latest) throw new Error('conversation_not_found');
+    return { conversation: latest, applied: false };
   }
 
   async function conversationReply(conversation, trialContinue = false) {
@@ -1053,7 +1075,9 @@
       try { result = await conversationReply(latest, true); } catch { result = fail(0, 'network_unavailable'); }
       const marker = trialMarker(result.j);
       if (marker?.state === 'stopped') result = fail(422, 'trial_stopped');
-      latest = await appendAssistantResult(latest, result);
+      const appended = await appendAssistantResult(latest, result);
+      latest = appended.conversation;
+      if (!appended.applied) return ok(202, { ok: true, conversation: latest, result_discarded: true, trial_control: latest.trial_control });
       latest = await saveTrialConversation(latest, { ...control, state: latest.last_ai_metadata?.ai_failed ? 'stopped' : 'completed' });
       const media = await vault.get(mediaKey(control.media_id));
       if (media) await vault.put(mediaKey(control.media_id), { ...media, trial_control: latest.trial_control });
@@ -1067,13 +1091,9 @@
         const pending = pendingElderTurn(latest);
         if (!pending) return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest });
         const result = await conversationReply(latest);
-        latest = excludeMockFacts(await vault.get(conversationKey(conversationId)));
-        const stillPending = pendingElderTurn(latest);
-        if (!stillPending || stillPending.turn_id !== pending.turn_id) {
-          return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest });
-        }
-        latest = await appendAssistantResult(latest, result);
-        return ok(result.r.ok ? 200 : 202, { ok: true, recovered: true, ai_failed: !!latest.last_ai_metadata?.ai_failed, conversation: latest });
+        const appended = await appendAssistantResult(latest, result);
+        latest = appended.conversation;
+        return ok(result.r.ok ? 200 : 202, { ok: true, recovered: appended.applied, result_discarded: !appended.applied, ai_failed: !!latest.last_ai_metadata?.ai_failed, conversation: latest });
       })();
     }
     if (parts[3] === 'turns' && parts.length === 4 && method === 'POST') {
@@ -1127,9 +1147,10 @@
       // Save its source and report, then wait for the user to return for a reply.
       if (backgroundInactive) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id });
       const result = await conversationReply(conversation);
-      conversation = await appendAssistantResult(conversation, result);
+      const appended = await appendAssistantResult(conversation, result);
+      conversation = appended.conversation;
       if (body.keep_media_until_pause !== true) await cleanupTemporaryAudio(body.media_id);
-      return ok(result.r.ok ? 201 : 202, { ok: true, created: true, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation, turn_id: userTurn.turn_id });
+      return ok(result.r.ok ? 201 : 202, { ok: true, created: true, result_discarded: !appended.applied, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation, turn_id: userTurn.turn_id });
     }
     if (parts[3] === 'turns' && parts[4] && method === 'POST') {
       const turnId = decodeURIComponent(parts[4]);
@@ -1179,8 +1200,9 @@
         return ok(200, { ok: true, conversation, trial_control: conversation.trial_control });
       }
       const result = await conversationReply(conversation);
-      conversation = await appendAssistantResult(conversation, result);
-      return ok(200, { ok: true, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation });
+      const appended = await appendAssistantResult(conversation, result);
+      conversation = appended.conversation;
+      return ok(200, { ok: true, result_discarded: !appended.applied, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation });
     }
     if (parts[3] === 'pause' && method === 'POST') {
       if (!conversation.trial_control) for (const turn of elderTurns(conversation)) await cleanupTemporaryAudio(turn.media_id);

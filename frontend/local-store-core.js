@@ -106,6 +106,10 @@
     return `${config.version}:${config.restore_generation || ''}:${toBase64(config.salt)}:${toBase64(config.wrapped.iv)}:${toBase64(config.wrapped.cipher)}`;
   }
 
+  function documentFingerprint(document) {
+    return document ? JSON.stringify(serialise(document)) : null;
+  }
+
   class MemoryDocumentStore {
     constructor() {
       this.meta = new Map();
@@ -116,9 +120,12 @@
     async getDoc(key) { return this.docs.has(key) ? structuredClone(this.docs.get(key)) : undefined; }
     async putDoc(value) { this.docs.set(value.key, structuredClone(value)); }
     async deleteDoc(key) { this.docs.delete(key); }
-    async mutateDocs(puts = [], deletes = [], expectedVault = null) {
+    async mutateDocs(puts = [], deletes = [], expectedVault = null, expectedDocuments = []) {
       if (expectedVault && vaultFingerprint(this.meta.get('vault')) !== expectedVault) {
         throw new Error('vault_changed_requires_unlock');
+      }
+      if (expectedDocuments.some(item => documentFingerprint(this.docs.get(item.key)) !== documentFingerprint(item.document))) {
+        throw new Error('document_changed');
       }
       const next = new Map(this.docs);
       for (const key of deletes) next.delete(key);
@@ -175,7 +182,7 @@
     getDoc(key) { return this.request('docs', 'readonly', store => store.get(key)); }
     putDoc(value) { return this.request('docs', 'readwrite', store => store.put(value)); }
     deleteDoc(key) { return this.request('docs', 'readwrite', store => store.delete(key)); }
-    async mutateDocs(puts = [], deletes = [], expectedVault = null) {
+    async mutateDocs(puts = [], deletes = [], expectedVault = null, expectedDocuments = []) {
       const db = await this.open();
       return new Promise((resolve, reject) => {
         // Check the persistent key and commit documents in the same transaction.
@@ -204,16 +211,31 @@
             fail(error);
           }
         };
+        const checkDocuments = () => {
+          if (!expectedDocuments.length) { commit(); return; }
+          let remaining = expectedDocuments.length;
+          for (const item of expectedDocuments) {
+            const current = store.get(item.key);
+            current.onsuccess = () => {
+              if (settled) return;
+              if (documentFingerprint(current.result) !== documentFingerprint(item.document)) {
+                fail(new Error('document_changed'));
+                transaction.abort();
+              } else if (--remaining === 0) commit();
+            };
+            current.onerror = () => fail(current.error || new Error('indexeddb_transaction_failed'));
+          }
+        };
         if (expectedVault) {
           const config = transaction.objectStore('meta').get('vault');
           config.onsuccess = () => {
             if (vaultFingerprint(config.result) !== expectedVault) {
               fail(new Error('vault_changed_requires_unlock'));
               transaction.abort();
-            } else commit();
+            } else checkDocuments();
           };
           config.onerror = () => fail(config.error || new Error('indexeddb_transaction_failed'));
-        } else commit();
+        } else checkDocuments();
       });
     }
     async listDocs(prefix = '') {
@@ -298,9 +320,9 @@
         throw new Error('vault_changed_requires_unlock');
       }
     }
-    async commitDocuments(documents, deletes, expectedVault) {
+    async commitDocuments(documents, deletes, expectedVault, expectedDocuments = []) {
       if (typeof this.driver.mutateDocs !== 'function') throw new Error('atomic_storage_unavailable');
-      try { await this.driver.mutateDocs(documents, deletes, expectedVault); }
+      try { await this.driver.mutateDocs(documents, deletes, expectedVault, expectedDocuments); }
       catch (error) {
         if (error.message === 'vault_changed_requires_unlock') this.lock();
         throw error;
@@ -311,6 +333,28 @@
       await this.ensureCurrentVault(fingerprint);
       const encrypted = await encryptBytes(dataKey, encoder.encode(JSON.stringify(value)), `bingli:doc:${key}`);
       await this.commitDocuments([{ key, format: 'json', encrypted, updatedAt: new Date().toISOString() }], [], fingerprint);
+    }
+    async putIfUnchanged(key, expectedValue, value, unchanged = []) {
+      const dataKey = this.requireKey(), fingerprint = this.vaultFingerprint;
+      await this.ensureCurrentVault(fingerprint);
+      const document = await this.driver.getDoc(key);
+      if (JSON.stringify(await this.decode(document)) !== JSON.stringify(expectedValue)) return false;
+      const expectedDocuments = [{ key, document }];
+      for (const item of unchanged) {
+        const guard = await this.driver.getDoc(item.key);
+        if (JSON.stringify(await this.decode(guard)) !== JSON.stringify(item.value)) return false;
+        expectedDocuments.push({ key: item.key, document: guard });
+      }
+      const encrypted = await encryptBytes(dataKey, encoder.encode(JSON.stringify(value)), `bingli:doc:${key}`);
+      try {
+        // Check the exact encrypted record and write in one transaction. An
+        // edit, deletion or replacement during encryption must win in all tabs.
+        await this.commitDocuments([{ key, format: 'json', encrypted, updatedAt: new Date().toISOString() }], [], fingerprint, expectedDocuments);
+        return true;
+      } catch (error) {
+        if (error.message === 'document_changed') return false;
+        throw error;
+      }
     }
     async putBinary(key, value, metadata = {}) {
       const dataKey = this.requireKey(), fingerprint = this.vaultFingerprint;
