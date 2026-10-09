@@ -249,6 +249,37 @@ def _easy_single_question(question: str) -> bool:
     return len(presence) <= 1 and not (presence and "、" in question[presence[0].end():])
 
 
+def _question_in_scope(question: str, category: str | None, state: dict[str, dict[str, Any]]) -> bool:
+    if _QUESTION_SCOPE.search(question):
+        return True
+    complaint = state["main_complaint"]
+    if category != "symptom_character" or complaint["status"] != "known" or not complaint["evidence_turn_ids"]:
+        return False
+    # A natural choice about an already sourced symptom need not contain a
+    # legacy field word. Require the same literal complaint in a narrow choice
+    # shape and reject recognised extra symptoms or diagnostic premises.
+    choice = re.fullmatch(
+        r"(?P<subject>[^，。！？；,!?;、]{1,40})(?:的时候|时)"
+        r"(?P<first>(?:有|是)[^，。！？；,!?;、]{1,16})吗[，,]?\s*还是"
+        r"(?P<second>[^，。！？；,!?;、]{1,16})[？?]",
+        question,
+    )
+    if not choice:
+        return False
+    if _normalise_text(choice.group("subject")) not in _normalise_text(complaint["summary"]):
+        return False
+    if re.search(r"和|或|并|另外|同时|伴随|以及|还有|病|炎|癌|症|感染|药|检查", question):
+        return False
+    anchors = set(_PATTERNS["main_complaint"].findall(complaint["summary"]))
+    question_symptoms = (_PATTERNS["main_complaint"].findall(question)
+                         + _PATTERNS["associated_symptoms"].findall(question))
+    return any(
+        anchor in choice.group("subject") and anchor in choice.group("second")
+        and all(symptom == anchor for symptom in question_symptoms)
+        for anchor in anchors
+    )
+
+
 def _correction_context_span(text: str, match) -> tuple[int, int]:
     separators = "。！？；.!?;\n"
     start = max((text.rfind(char, 0, match.start()) for char in separators), default=-1) + 1
@@ -830,7 +861,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         candidate = assessment["candidate_question"]
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
         fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
-        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _QUESTION_SCOPE.search(candidate) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions:
+        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions:
             next_category = proposed
             assistant_text = _response_text(reply, candidate)
             if _unsafe_reply(assistant_text) or _NON_HEALTH_ACTION.search(assistant_text):
@@ -864,7 +895,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
 
         candidate = assessment["candidate_question"] if proposed == next_category else ""
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
-        candidate_is_valid = bool(candidate and _QUESTION_SCOPE.search(candidate) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions)
+        candidate_is_valid = bool(candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions)
         if next_category and candidate_is_valid:
             previous_count = controller["question_counts"].get(next_category, 0)
             assistant_text = _response_text(reply, candidate)
