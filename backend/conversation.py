@@ -249,10 +249,80 @@ def _easy_single_question(question: str) -> bool:
     return len(presence) <= 1 and not (presence and "、" in question[presence[0].end():])
 
 
+def _presence_items(question: str):
+    """Read only an explicit presence list, preserving its shared qualifier.
+
+    Ambiguous negation/conditions and other clauses stay blocked. This is a
+    narrow grammar, not a general medical or Chinese sentence parser.
+    """
+    presence = list(re.finditer(r"有没有|有无|是否(?:还)?有|同时(?:还)?有|还(?:会|有)", question))
+    if len(presence) != 1 or not re.fullmatch(r"[^。！？；.!?;]+[？?]", question):
+        return None
+    match = presence[0]
+    prefix, body = question[:match.end()], question[match.end():-1]
+    if (_DECLINED.search(question)
+            or re.search(r"如果|假如|假设|要是|若|可能|不确定|不一定|并非|不是|但|却|虽", question)):
+        return None
+    suffix = "的情况" if body.endswith("的情况") else ""
+    if suffix:
+        body = body[:-len(suffix)]
+    items = re.split(r"、|或者|或", body)
+    # ponytail: conservative phrase grammar; unsupported wording stays blocked.
+    if not items or any(
+        not re.fullmatch(r"发(?:烧|热)|嗓子疼|咽痛|喘不上气|气短|胸口不舒服", item)
+        for item in items
+    ):
+        return None
+    return prefix, items, suffix, question[-1]
+
+
+def _presence_item_key(item: str) -> str:
+    # Only skip already asked wording; never rewrite a patient fact or output.
+    return {"发热": "发烧", "咽痛": "嗓子疼", "气短": "喘不上气"}.get(item, item)
+
+
+def _single_candidate_question(question: str, category: str | None, asked_questions: list[str]) -> str:
+    if _unsafe_reply(question) or _NON_HEALTH_ACTION.search(question):
+        return ""
+    if _normalise_text(question) in {_normalise_text(item) for item in asked_questions}:
+        return ""
+    if category != "associated_symptoms":
+        return question
+    parts = _presence_items(question)
+    if not parts:
+        # Never rescue a compound candidate whose qualifiers cannot be kept.
+        return "" if re.search(r"有没有|有无|是否(?:还)?有|、|或者", question) else question
+    prefix, items, suffix, ending = parts
+    asked_items = {
+        _presence_item_key(item)
+        for previous in asked_questions
+        if (previous_parts := _presence_items(previous))
+        for item in previous_parts[1]
+    }
+    item = next((item for item in items if _presence_item_key(item) not in asked_items), None)
+    return prefix + item + suffix + ending if item else ""
+
+
 def _question_in_scope(question: str, category: str | None, state: dict[str, dict[str, Any]]) -> bool:
+    complaint = state["main_complaint"]
+    if category == "associated_symptoms" and (parts := _presence_items(question)):
+        if complaint["status"] == "known" and complaint["evidence_turn_ids"] and len(parts[1]) == 1:
+            prefix = parts[0]
+            stem = re.sub(r"(?:有没有|有无|是否(?:还)?有)$", "", prefix)
+            anchored = re.fullmatch(
+                r"(?:除了(?P<except>[^，。！？；,!?;、]{1,40})[，,](?:这几天|今天|最近|现在)?|"
+                r"(?:这几天|今天|最近|现在)?(?P<during>[^，。！？；,!?;、]{1,40})(?:的时候|时)[，,]?)", stem,
+            )
+            if anchored:
+                subject = anchored.group("except") or anchored.group("during")
+                return bool(
+                    _normalise_text(subject) in _normalise_text(complaint["summary"])
+                    and not re.search(r"和|或|并|因为|导致|病|炎|癌|症|感染|药|检查", subject)
+                    and _PATTERNS["main_complaint"].search(subject)
+                )
+        return False
     if _QUESTION_SCOPE.search(question):
         return True
-    complaint = state["main_complaint"]
     if category != "symptom_character" or complaint["status"] != "known" or not complaint["evidence_turn_ids"]:
         return False
     # A natural choice about an already sourced symptom need not contain a
@@ -1032,6 +1102,9 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         latest, meta_feedback=meta_feedback,
         diagnosis_request=diagnosis_request, correction=correction,
     )
+    candidate_question = _single_candidate_question(
+        assessment["candidate_question"], assessment["question_category"], controller["asked_questions"],
+    )
     if explicit_finish:
         # Closing a session needs no model-authored recap, which can invent
         # facts even when every structured fact has a valid source.
@@ -1045,7 +1118,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         proposed = assessment["question_category"] if assessment["suggested_action"] == "ask" else None
         context_to_verify = [ref for ref in assessment["relevant_context_ids"] if ref not in controller["linked_context_ids"]]
         eligible = [category for category in CATEGORIES if (clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and category not in controller["closed_categories"] and controller["question_counts"].get(category, 0) < 2]
-        candidate = assessment["candidate_question"]
+        candidate = candidate_question
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
         fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
         if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions:
@@ -1080,7 +1153,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         if proposed in eligible and not (fatigue and assessment["question_importance"] != "essential"):
             next_category = proposed
 
-        candidate = assessment["candidate_question"] if proposed == next_category else ""
+        candidate = candidate_question if proposed == next_category else ""
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
         candidate_is_valid = bool(candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions)
         if next_category and candidate_is_valid:
