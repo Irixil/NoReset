@@ -31,9 +31,15 @@
     return { review_required: true, state: valid && marker.stopped !== true ? 'review_required' : 'stopped' };
   }
   async function trialVoiceState() { return await vault.get(TRIAL_VOICE_KEY) || null; }
-  async function saveTrialConversation(conversation, control) {
+  function sameTrialOwner(a, b) {
+    return a && b && typeof a.conversation_id === 'string' && a.conversation_id
+      && typeof a.turn_id === 'string' && a.turn_id && Number.isInteger(a.turn_version) && a.turn_version > 0
+      && a.conversation_id === b.conversation_id && a.turn_id === b.turn_id && a.turn_version === b.turn_version
+      && (a.media_id ?? null) === (b.media_id ?? null);
+  }
+  async function saveTrialConversation(conversation, control, extraPuts = [], unchanged = []) {
     const saved = { ...conversation, trial_control: control, version: conversation.version + 1, updated_at: now() };
-    await vault.mutate({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }, { key: TRIAL_VOICE_KEY, value: control }] });
+    await vault.mutate({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }, { key: TRIAL_VOICE_KEY, value: control }, ...extraPuts], unchanged });
     return saved;
   }
 
@@ -996,7 +1002,8 @@
       return createConversation(body.local_date);
     }
     const conversationId = decodeURIComponent(parts[2] || '');
-    let conversation = excludeMockFacts(await vault.get(conversationKey(conversationId)));
+    const storedConversation = await vault.get(conversationKey(conversationId));
+    let conversation = excludeMockFacts(storedConversation);
     if (!conversation) return fail(404, 'conversation_not_found');
     if (parts.length === 3 && method === 'DELETE') {
       if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
@@ -1066,11 +1073,13 @@
     if (parts[3] === 'trial-continue' && method === 'POST') {
       let latest = await vault.get(conversationKey(conversationId));
       const control = latest?.trial_control, global = await trialVoiceState();
-      if (!control || control.state !== 'review_required' || global?.state !== 'review_required' || global.turn_id !== control.turn_id) return fail(409, 'trial_stopped_or_not_pending', { conversation: latest });
+      if (!control || control.state !== 'review_required' || global?.state !== 'review_required' || !sameTrialOwner(control, global)
+        || control.conversation_id !== conversationId) return fail(409, 'trial_stopped_or_not_pending', { conversation: latest });
       const turn = elderTurns(latest).at(-1), event = turn?.record_id ? await readEvent(turn.record_id) : null;
       if (Number(body.expected_version) !== latest.version || body.turn_id !== control.turn_id || Number(body.turn_version) !== control.turn_version
         || turn?.turn_id !== control.turn_id || turn?.version !== control.turn_version || !event || event.raw_text !== turn.text) return fail(409, 'trial_source_changed', { conversation: latest });
-      latest = await saveTrialConversation(latest, { ...control, state: 'continuing' });
+      latest = await saveTrialConversation(latest, { ...control, state: 'continuing' }, [], [{ key: conversationKey(conversationId), value: latest }, { key: TRIAL_VOICE_KEY, value: global }]);
+      const continuingControl = latest.trial_control;
       let result;
       try { result = await conversationReply(latest, true); } catch { result = fail(0, 'network_unavailable'); }
       const marker = trialMarker(result.j);
@@ -1078,7 +1087,7 @@
       const appended = await appendAssistantResult(latest, result);
       latest = appended.conversation;
       if (!appended.applied) return ok(202, { ok: true, conversation: latest, result_discarded: true, trial_control: latest.trial_control });
-      latest = await saveTrialConversation(latest, { ...control, state: latest.last_ai_metadata?.ai_failed ? 'stopped' : 'completed' });
+      latest = await saveTrialConversation(latest, { ...control, state: latest.last_ai_metadata?.ai_failed ? 'stopped' : 'completed' }, [], [{ key: conversationKey(conversationId), value: latest }, { key: TRIAL_VOICE_KEY, value: continuingControl }]);
       const media = await vault.get(mediaKey(control.media_id));
       if (media) await vault.put(mediaKey(control.media_id), { ...media, trial_control: latest.trial_control });
       return ok(latest.trial_control.state === 'completed' ? 200 : 202, { ok: true, conversation: latest, ai_failed: latest.trial_control.state === 'stopped', trial_control: latest.trial_control });
@@ -1108,11 +1117,22 @@
         return ok(200, { ok: true, created: false, conversation: saved, turn_id: replay.turn_id });
       }
       const sourceMedia = body.media_id ? await vault.get(mediaKey(body.media_id)) : null;
-      const controlled = sourceMedia?.trial_control;
+      let controlled = sourceMedia?.trial_control;
       const trial = await trialVoiceState();
+      const controlledText = !controlled && conversation.trial_control && !body.media_id && !body.record_id
+        && (!body.source_kind || body.source_kind === 'elder');
+      if (controlledText) {
+        const control = conversation.trial_control, last = elderTurns(conversation).at(-1);
+        if (control.state !== 'completed' || trial?.state !== 'completed' || !sameTrialOwner(control, trial)
+          || control.conversation_id !== conversationId || last?.turn_id !== control.turn_id || last?.version !== control.turn_version) {
+          return fail(409, trial?.state === 'stopped' || control.state === 'stopped' ? 'trial_stopped' : 'trial_review_required');
+        }
+        if ((await mediaList()).some(item => item.kind === 'audio' && item.recognition_status === 'processing')) return fail(409, 'audio_recognition_in_progress');
+        controlled = { review_required: true, state: 'review_required', source_kind: 'elder' };
+      }
       if (trial && trial.state !== 'completed' && !controlled) return fail(409, trial.state === 'stopped' ? 'trial_stopped' : 'trial_review_required');
       if (conversation.trial_control && !controlled) return fail(409, 'trial_review_required');
-      if (controlled && (sourceMedia.conversation_id !== conversationId || sourceMedia.record_id !== body.record_id || sourceMedia.recognition?.text !== text)) return fail(409, 'trial_source_changed');
+      if (controlled && !controlledText && (sourceMedia.conversation_id !== conversationId || sourceMedia.record_id !== body.record_id || sourceMedia.recognition?.text !== text)) return fail(409, 'trial_source_changed');
       if (Number(body.expected_version) !== conversation.version) return fail(409, 'stale_conversation');
       let event;
       if (body.record_id) event = await readEvent(body.record_id);
@@ -1131,7 +1151,7 @@
       if (previous?.role === 'assistant' && ['ask', 'reply'].includes(previous.action) && !mockSource(previous)) {
         userTurn.responding_to = { turn_id: previous.turn_id, text: previous.text };
       }
-      const withUser = {
+      let withUser = {
         ...conversation,
         status: backgroundInactive ? conversation.status : 'active',
         turns: [...conversation.turns, userTurn],
@@ -1139,9 +1159,20 @@
         completeness: conversation.completeness,
         active_episode_start_turn_id: null,
       };
+      if (controlledText) withUser = invalidateChangedAnalysis(withUser, await healthContext());
       withUser.report = buildConversationReport(withUser, conversation.report);
-      conversation = controlled ? await saveTrialConversation({ ...withUser, status: 'paused' }, { ...controlled, conversation_id: conversationId, turn_id: userTurn.turn_id, turn_version: userTurn.version, media_id: body.media_id }) : await saveConversation(withUser);
-      await vault.put(`operation:conversation-turn:${operationKey}`, { conversation_id: conversationId, turn_id: userTurn.turn_id });
+      const operation = { key: `operation:conversation-turn:${operationKey}`, value: { conversation_id: conversationId, turn_id: userTurn.turn_id } };
+      if (controlled) {
+        try {
+          conversation = await saveTrialConversation({ ...withUser, status: 'paused' }, { ...controlled, conversation_id: conversationId, turn_id: userTurn.turn_id, turn_version: userTurn.version, media_id: body.media_id || null }, [operation], [{ key: conversationKey(conversationId), value: storedConversation }, { key: TRIAL_VOICE_KEY, value: trial }]);
+        } catch (error) {
+          // Raw-first saving is intentional. A concurrent stop wins, while its
+          // independently saved source remains available in My Records.
+          if (error.message === 'document_changed') return fail(409, 'trial_source_changed', { raw_text_preserved_on_device: true, source_record_id: event.record_id });
+          throw error;
+        }
+      } else conversation = await saveConversation(withUser);
+      if (!controlled) await vault.put(operation.key, operation.value);
       if (controlled) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id, trial_control: conversation.trial_control });
       // A recognition already in flight can complete after an explicit pause.
       // Save its source and report, then wait for the user to return for a reply.
@@ -1161,13 +1192,27 @@
       const current = conversation.turns[index];
       if (Number(body.expected_version) !== current.version) return fail(409, 'stale_version');
       if (Number(body.expected_conversation_version) !== conversation.version) return fail(409, 'stale_conversation');
+      let trialControl = null, trialGlobal = null;
+      if (conversation.trial_control) {
+        const global = await trialVoiceState();
+        if (!sameTrialOwner(conversation.trial_control, global) || global.conversation_id !== conversationId) return fail(409, 'trial_source_changed');
+        const state = global.state === 'stopped' || conversation.trial_control.state === 'stopped' ? 'stopped'
+          : global.state === 'continuing' || conversation.trial_control.state === 'continuing' ? 'continuing' : 'review_required';
+        trialControl = { ...conversation.trial_control, state };
+        trialGlobal = global;
+      }
       const revisedSafety = safety.scanDanger(text);
       const turns = conversation.turns.map((turn, turnIndex) => {
         if (turnIndex === index) return { ...turn, text, is_mock: false, local_safety: revisedSafety, version: turn.version + 1, edited_at: now(), versions: [...(turn.versions || []), { version: turn.version, text: turn.text, replaced_at: now() }] };
         if (turnIndex > index && turn.role === 'assistant') return { ...turn, superseded: true };
         return turn;
       });
-      const edited = { ...conversation, turns, controller: openingConversationController(), completeness: null, relevant_health_context: [] };
+      const edited = { ...conversation, turns, controller: openingConversationController(), completeness: null, analysis_sources: null, relevant_health_context: [] };
+      if (trialControl) {
+        const latest = elderTurns(edited).at(-1);
+        edited.trial_control = { ...trialControl, conversation_id: conversationId, turn_id: latest.turn_id,
+          turn_version: latest.version, media_id: latest.media_id || null, source_kind: latest.source_kind };
+      }
       edited.report = buildConversationReport(edited, conversation.report);
       const persistCorrection = async () => {
         const puts = [];
@@ -1186,17 +1231,16 @@
         }
         const saved = { ...edited, version: conversation.version + 1, updated_at: now() };
         puts.push({ key: conversationKey(conversationId), value: saved });
+        if (trialControl) puts.push({ key: TRIAL_VOICE_KEY, value: saved.trial_control });
         // Both representations and the history commit together, including when
         // IndexedDB runs out of space or the page closes during a correction.
-        await vault.mutate({ puts });
+        await vault.mutate({ puts, ...(trialControl ? { unchanged: [{ key: conversationKey(conversationId), value: storedConversation }, { key: TRIAL_VOICE_KEY, value: trialGlobal }] } : {}) });
         return ok(200, { conversation: saved });
       };
       const persisted = current.record_id ? await withEventLock(current.record_id, persistCorrection) : await persistCorrection();
       if (!persisted.r.ok) return persisted;
       conversation = persisted.j.conversation;
       if (conversation.trial_control) {
-        const changed = conversation.turns.find(turn => turn.turn_id === turnId);
-        conversation = await saveTrialConversation(conversation, { ...conversation.trial_control, turn_version: changed.version });
         return ok(200, { ok: true, conversation, trial_control: conversation.trial_control });
       }
       const result = await conversationReply(conversation);
@@ -1481,6 +1525,7 @@
       if (path.startsWith('/api/media')) return await mediaRequest(path, options);
       return fail(404, 'not_found');
     } catch (error) {
+      if (error.message === 'document_changed') return fail(409, 'trial_source_changed');
       if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
         active = false; initialisePromise = null;
         return fail(409, error.message);

@@ -384,9 +384,15 @@
       return Promise.all(docs.map(document => this.decode(document)));
     }
     async remove(key) { await this.ensureCurrentVault(); await this.commitDocuments([], [key], this.vaultFingerprint); }
-    async mutate({ puts = [], deletes = [] } = {}) {
+    async mutate({ puts = [], deletes = [], unchanged = [] } = {}) {
       const key = this.requireKey(), fingerprint = this.vaultFingerprint;
       await this.ensureCurrentVault(fingerprint);
+      const expectedDocuments = [];
+      for (const item of unchanged) {
+        const document = await this.driver.getDoc(item.key);
+        if (JSON.stringify(await this.decode(document)) !== JSON.stringify(item.value)) throw new Error('document_changed');
+        expectedDocuments.push({ key: item.key, document });
+      }
       const documents = await Promise.all(puts.map(async item => {
         if (item.format === 'binary') {
           const value = item.value;
@@ -409,7 +415,7 @@
           updatedAt: new Date().toISOString(),
         };
       }));
-      await this.commitDocuments(documents, deletes, fingerprint);
+      await this.commitDocuments(documents, deletes, fingerprint, expectedDocuments);
     }
     async exportArchive() {
       await this.ensureCurrentVault();

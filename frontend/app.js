@@ -241,10 +241,12 @@ function setVoiceStatus(text,tone=''){
 function setVoiceComposerEnabled(enabled){
   if(activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')enabled=false;
   const input=$('voiceTextInput'),send=$('voiceTextSend');
+  if(send)send.textContent=activeConversation?.trial_control?'保存原话':'发送';
   if(input)input.disabled=!enabled;if(send)send.disabled=!enabled||!input?.value.trim();
 }
 function trialVoiceMessage(control){
-  return control?.state==='review_required'?'语音已转成文字，原话和录音已保留。请对照录音核对文字，等待本次试验批准后再继续一次。':control?.state==='completed'?'语音和本次回复已保存；下一段语音仍会先暂停核对。':control?.state==='continuing'?'这次回复已提交，原话和录音已保留。请等结果；重新进入不会再次发送。':'本次语音试验已停止，原话和录音已保留；请等待新的明确处理安排。';
+  if(control?.state==='review_required')return control.source_kind==='elder'&&!control.media_id?'本轮原话已保存在本机，尚未请求回复。请核对文字，等待本次试验批准后再继续一次。':'语音已转成文字，原话和录音已保留。请对照录音核对文字，等待本次试验批准后再继续一次。';
+  return control?.state==='completed'?'原话和本次回复已保存；可补充或纠正，下一轮仍会先保存在本机并暂停核对。':control?.state==='continuing'?'这次回复已提交，原话与已有原件已保留。请等结果；重新进入不会再次发送。':'本次试验已停止，原话与已有原件已保留；请等待新的明确处理安排。';
 }
 async function continueTrialVoice(){
   const control=activeConversation?.trial_control;
@@ -653,8 +655,8 @@ async function submitConversationText(text,extra={}){
   if(extra.keep_media_until_pause===true)body.keep_media_until_pause=true;
   const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/turns`,{method:'POST',headers:{'Idempotency-Key':operationKey},body:JSON.stringify(body)});
   saveBusy=false;pendingConversationTurn=null;
-  if(!x.r.ok||!x.j.conversation){renderVoiceConversation();setVoiceComposerEnabled(true);if(x.r.status===409)void loadConversation();setVoiceStatus(x.r.status===409?'这份对话已在另一个页面更新；已重新读取，刚才输入仍保留，请再发送一次。':'这句话没有确认保存，请保留当前页面后重试。','error');return false}
-  syncConversation(x.j.conversation);setVoiceStatus(x.j.ai_failed?'原话和报告已保存在本机；联网回复没完成，可点对话中的“重试小零回复”，也可以继续打字。':'原话和报告已保存。',x.j.ai_failed?'error':'ok');await loadEvents();return true;
+  if(!x.r.ok||!x.j.conversation){renderVoiceConversation();setVoiceComposerEnabled(true);if(x.j.error==='trial_source_changed'&&x.j.raw_text_preserved_on_device){void loadConversation();setVoiceStatus('这次原话已保存在“我的记录”，尚未接入当前对话；请先核对当前停点，输入仍保留。','error');return false}if(['trial_stopped','trial_review_required'].includes(x.j.error)){setVoiceStatus(x.j.error==='trial_stopped'?'本次试验已停止，这次输入尚未保存；请保留输入。':'请先处理已保存原话的核对停点，这次输入仍保留。','error');return false}if(x.r.status===409)void loadConversation();setVoiceStatus(x.r.status===409?'这份对话已在另一个页面更新；已重新读取，刚才输入仍保留，请再发送一次。':'这句话没有确认保存，请保留当前页面后重试。','error');return false}
+  syncConversation(x.j.conversation);setVoiceStatus(x.j.trial_control?trialVoiceMessage(x.j.trial_control):x.j.ai_failed?'原话和报告已保存在本机；联网回复没完成，可点对话中的“重试小零回复”，也可以继续打字。':'原话和报告已保存。',x.j.ai_failed?'error':'ok');await loadEvents();return true;
 }
 async function saveVoiceSupplement(){
   const input=$('voiceTextInput'),text=input.value.trim();
@@ -958,4 +960,4 @@ if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('fee
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 health().then(loadEvents);
-if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=mic-preflight-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});
+if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=controlled-text-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

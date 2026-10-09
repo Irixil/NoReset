@@ -32,7 +32,9 @@ HASH = re.compile(r'^[a-f0-9]{64}$')
 SCHEMA = 'noreset-synthetic-trial-v2'
 SCHEMA_V3 = 'noreset-synthetic-trial-v3'
 SCHEMA_RISK = 'noreset-synthetic-trial-informed-risk-v1'
-APPEND_SCHEMAS = {SCHEMA_V3, SCHEMA_RISK}
+SCHEMA_RISK_SEQUENCE = 'noreset-synthetic-trial-informed-risk-v2'
+RISK_SCHEMAS = {SCHEMA_RISK, SCHEMA_RISK_SEQUENCE}
+APPEND_SCHEMAS = {SCHEMA_V3, *RISK_SCHEMAS}
 USD_UNITS = Decimal('1000000000')  # Integer nano-USD, never a float ledger.
 
 
@@ -314,10 +316,10 @@ def amend_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
         raise TrialGateError() from None
 
 
-def _history(connection, receipt, *, historical=False):
+def _history(connection, receipt, *, historical=False, _validation_path=None, _depth=0):
     """Recheck each durable reserve; damaged but readable rows fail closed."""
     if receipt['schema_version'] in APPEND_SCHEMAS:
-        return _history_v3(connection, receipt)
+        return _history_v3(connection, receipt, _validation_path=_validation_path, _depth=_depth)
     rows = connection.execute('SELECT kind,request_sha256,source_sha256,wire_bytes,output_limit,thinking_limit,input_bound,generated_bound,reserved_nano_usd,pricing_json,usage_json FROM attempts').fetchall()
     counts, occupied = {}, 0
     for kind, wire_sha, source_sha, wire_bytes, output, thinking, incoming_bound, generated_bound, cost, pricing_json, usage_json in rows:
@@ -407,11 +409,24 @@ def validate_trial_authorization(*, receipt_path=RECEIPT_PATH, state_path=STATE_
             if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt), None)]:
                 _deny()
             counts, occupied = _history(connection, receipt)
-            if receipt['schema_version'] == SCHEMA_RISK:
-                return {'receipt': receipt, 'receipt_sha256': digest, 'remaining_usd': None,
+            if receipt['schema_version'] in RISK_SCHEMAS:
+                result = {'receipt': receipt, 'receipt_sha256': digest, 'remaining_usd': None,
                         'cost_bound_known': False, 'estimated_new_usd': receipt['spend_authorization']['estimated_new_usd'],
                         'historical_reserved_usd': _usd(occupied),
                         'remaining_requests': receipt['total_requests'] - sum(counts.values()), 'frozen': False}
+                if receipt['schema_version'] == SCHEMA_RISK_SEQUENCE:
+                    try:
+                        from . import trial_budget
+                        result['cumulative_budget_status'] = trial_budget.validate_batch(receipt['cumulative_budget'], receipt=receipt)
+                    except (ImportError, OSError, RuntimeError, ValueError, AttributeError):
+                        _deny()
+                    steps = _risk_scope_attempts(connection, receipt)
+                    closed = _closed_context(connection, receipt)
+                    result.update(scope_used_requests=len(steps),
+                        next_kind=receipt['request_sequence'][len(steps)] if len(steps) < len(receipt['request_sequence']) else None,
+                        manual_review_required=bool(steps and connection.execute('SELECT 1 FROM trial_reviews WHERE attempt_id=?', (steps[-1][0],)).fetchone() != (1,)),
+                        protected_through_attempt_id=closed.get('protected_through_attempt_id', closed['failed_attempt_id']) if closed else 0)
+                return result
             budget = int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)
             return {'receipt': receipt, 'receipt_sha256': digest, 'remaining_usd': _usd(budget - occupied),
                     'remaining_requests': receipt['total_requests'] - sum(counts.values()), 'frozen': False}
@@ -433,7 +448,7 @@ def trial_journal(*, state_path=STATE_PATH):
                 item['pricing'] = json.loads(item.pop('pricing_json'))
                 usage_raw = item.pop('usage_json')
                 item['usage'] = json.loads(usage_raw) if usage_raw else None
-                if closed and item['id'] == closed['failed_attempt_id']:
+                if closed and item['id'] in closed.get('closed_unverified_attempt_ids', [closed['failed_attempt_id']]):
                     item['closed_status'] = 'failed_usage_unverified'
                 if item['pricing'].get('status') == 'disclosed_estimate':
                     item['estimated_usd'] = item['pricing']['estimated_usd']
@@ -457,13 +472,14 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             closed = _closed_context(connection)
-            if closed and attempt_id <= closed['failed_attempt_id']:
+            if closed and attempt_id <= closed.get('protected_through_attempt_id', closed['failed_attempt_id']):
                 _deny()  # Historical closure is never a late usage-report target.
             row = connection.execute('SELECT input_bound,generated_bound,pricing_json,usage_json,thinking_limit,output_limit FROM attempts WHERE id=?', (attempt_id,)).fetchone()
             if row is None:
                 _deny()
             incoming_bound, generated_bound, pricing_json, previous, thinking_limit, output_limit = row
             pricing = json.loads(pricing_json)
+            current_receipt, _ = _parse_receipt(connection.execute('SELECT receipt_json FROM metadata').fetchone()[0].encode(), historical=True)
             risk = pricing.get('status') == 'disclosed_estimate'
             strict = 'charge_contract' in pricing or risk
             prompt = usage.get('prompt_tokens') if isinstance(usage, dict) else None
@@ -487,29 +503,75 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
                           'reasoning_tokens': thinking if type(thinking) is int and 0 <= thinking < 2**63 else None,
                           'verified': bool(valid)}
             encoded = _snapshot(normalized)
+            stopped = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
+            if stopped is not None and previous != encoded:
+                _deny()  # A late callback cannot replace a stopped unknown fact.
             if previous is not None and previous != encoded:
                 valid = False
             if not valid:
-                connection.execute('UPDATE metadata SET frozen_reason=?', ('usage_unverified_or_over_bound',))
+                connection.execute('UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,?)', ('usage_unverified_or_over_bound',))
+                current_receipt, _ = _parse_receipt(connection.execute('SELECT receipt_json FROM metadata').fetchone()[0].encode(), historical=True)
                 frozen = True
             if previous is None:
                 connection.execute('UPDATE attempts SET usage_json=? WHERE id=?', (encoded, attempt_id))
             if transport_metadata is not None:
                 _save_transport_metadata(connection, attempt_id, transport_metadata)
+            elif previous is not None and _table_exists(connection, 'transport_metadata'):
+                saved = connection.execute('SELECT metadata_json FROM transport_metadata WHERE attempt_id=?', (attempt_id,)).fetchone()
+                transport_metadata = json.loads(saved[0]) if saved else None
+            observation = None
+            if valid and 'cumulative_budget' in current_receipt:
+                scope_steps = _risk_scope_attempts(connection, current_receipt)
+                indices = [i for i, (ident, _) in enumerate(scope_steps) if ident == attempt_id]
+                if (len(indices) != 1 or not isinstance(transport_metadata, dict)
+                        or not HASH.fullmatch(str(transport_metadata.get('response_sha256', '')))):
+                    connection.execute("UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,'usage_unverified')")
+                    frozen = True
+                else:
+                    kind, wire_sha, source_sha = connection.execute('SELECT kind,request_sha256,source_sha256 FROM attempts WHERE id=?', (attempt_id,)).fetchone()
+                    observation = dict(receipt_id=current_receipt['receipt_id'], slot=indices[0], kind=kind,
+                        source_sha256=source_sha, request_sha256=wire_sha, returned_model=returned_model,
+                        usage=usage, response_sha256=transport_metadata['response_sha256'])
         if frozen:
+            with sqlite3.connect(Path(state_path)) as connection:
+                reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
+            _close_cumulative_budget(current_receipt, reason)
             _deny()  # Raise after the freeze transaction has committed.
+        if observation is not None:
+            try:
+                from . import trial_budget
+                trial_budget.mark_observed(current_receipt['cumulative_budget'], **observation)
+            except (ImportError, OSError, RuntimeError, ValueError, AttributeError):
+                with sqlite3.connect(Path(state_path)) as connection:
+                    connection.execute("UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,'usage_unverified')")
+                    reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
+                _close_cumulative_budget(current_receipt, reason)
+                _deny()
         return normalized
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         raise TrialGateError() from None
 
 
 def _validate_v3(data, *, historical=False):
-    risk = data['schema_version'] == SCHEMA_RISK
+    risk = data['schema_version'] in RISK_SCHEMAS
+    ordered = data['schema_version'] == SCHEMA_RISK_SEQUENCE
     fields = {'schema_version', 'receipt_id', 'status', 'authorization_source', 'approval_ref',
               'synthetic_only', 'expires_at', 'total_requests', 'planned_text_requests',
               'spend_authorization', 'profiles', 'previous_receipt_sha256'}
     if risk:
         fields.add('approved_at')
+    if ordered:
+        fields.update({'request_sequence', 'cumulative_budget'})
+        descriptor = data.get('cumulative_budget')
+        if (not isinstance(descriptor, dict) or set(descriptor) != {'authorization_sha256', 'authorization_path', 'state_path'}
+                or not isinstance(descriptor['authorization_sha256'], str) or not HASH.fullmatch(descriptor['authorization_sha256'])):
+            _deny()
+        for key in ('authorization_path', 'state_path'):
+            value = descriptor[key]
+            if not isinstance(value, str) or not Path(value).is_absolute() or str(Path(value).resolve()) != value:
+                _deny()
+        if descriptor['authorization_path'] == descriptor['state_path']:
+            _deny()
     if (set(data) != fields or data['status'] != 'approved'
             or data['authorization_source'] != 'explicit_owner_approval' or data['synthetic_only'] is not True
             or not isinstance(data['previous_receipt_sha256'], str) or not HASH.fullmatch(data['previous_receipt_sha256'])):
@@ -540,9 +602,11 @@ def _validate_v3(data, *, historical=False):
     if (type(data['total_requests']) is not int or not 0 < data['total_requests'] < 2**31
             or type(data['planned_text_requests']) is not int):
         _deny()
-    if not isinstance(data['profiles'], dict) or set(data['profiles']) != {'llm', 'asr'}:
+    if (not isinstance(data['profiles'], dict)
+            or (not ordered and set(data['profiles']) != {'llm', 'asr'})
+            or (ordered and (not data['profiles'] or not set(data['profiles']) <= {'llm', 'asr'}))):
         _deny()
-    if data['planned_text_requests'] != data['profiles']['llm'].get('requests'):
+    if data['planned_text_requests'] != data['profiles'].get('llm', {}).get('requests', 0):
         _deny()
     for kind, profile in data['profiles'].items():
         expected = {'provider', 'model', 'url', 'requests', 'max_input_bytes', 'max_output_tokens',
@@ -557,15 +621,23 @@ def _validate_v3(data, *, historical=False):
             _deny()
         for field in ('source_sha256', 'request_sha256'):
             values = profile[field]
-            minimum, maximum = (0, 2) if risk and kind == 'llm' else (1, 2) if risk else (1, 5)
+            minimum, maximum = (0, profile['requests']) if ordered else (0, 2) if risk and kind == 'llm' else (1, 2) if risk else (1, 5)
             if (not isinstance(values, list) or not minimum <= len(values) <= maximum
                     or any(not isinstance(value, str) or not HASH.fullmatch(value) for value in values)
                     or len(set(values)) != len(values)):
                 _deny()
+        if ordered and len(profile['source_sha256']) != len(profile['request_sha256']):
+            _deny()
         if not risk and (not isinstance(profile['billing'], dict) or 'charge_contract' not in profile['billing']):
             _deny()  # Legacy estimates do not become new hard contracts.
         _profile_quote(data, kind, historical=historical)
-    if risk and (data['profiles']['asr']['requests'] != data['profiles']['llm']['requests']
+    if ordered:
+        sequence = data['request_sequence']
+        if (not isinstance(sequence, list) or not 1 <= len(sequence) <= 4
+                or any(not isinstance(kind, str) or kind not in data['profiles'] for kind in sequence)
+                or any(sequence.count(kind) != profile['requests'] for kind, profile in data['profiles'].items())):
+            _deny()
+    if risk and ((not ordered and data['profiles']['asr']['requests'] != data['profiles']['llm']['requests'])
             or _decimal(spend['estimated_new_usd']) != sum(_decimal(p['billing']['estimated_usd']) * p['requests'] for p in data['profiles'].values())):
         _deny()
 
@@ -609,7 +681,7 @@ def _risk_quote(kind, profile, *, historical=False):
 
 
 def _profile_quote(receipt, kind, *, historical=False):
-    function = _risk_quote if receipt['schema_version'] == SCHEMA_RISK else _quote
+    function = _risk_quote if receipt['schema_version'] in RISK_SCHEMAS else _quote
     return function(kind, receipt['profiles'][kind], historical=historical)
 
 
@@ -672,7 +744,7 @@ def _authority_history(connection, head):
     return authorities
 
 
-def _history_v3(connection, receipt, *, _closed_failure=None):
+def _history_v3(connection, receipt, *, _closed_failure=None, _validation_path=None, _depth=0, _closed_unverified_ids=()):
     metadata = connection.execute('SELECT receipt_sha256 FROM metadata').fetchall()
     if len(metadata) != 1:
         _deny()
@@ -684,8 +756,9 @@ def _history_v3(connection, receipt, *, _closed_failure=None):
     if set(links) != {row[0] for row in rows}:
         _deny()
     counts, scoped, occupied = {}, {}, 0
-    closed = _closed_context(connection, receipt)
+    closed = _closed_context(connection, receipt, _validation_path=_validation_path, _depth=_depth)
     failed = closed['failed_attempt_id'] if closed else _closed_failure
+    failed_ids = set(closed.get('closed_unverified_attempt_ids', [failed]) if closed else [failed]) | set(_closed_unverified_ids)
     for row in rows:
         ident, kind, wire_sha, source_sha, size, output, thinking, incoming, generated, cost, price_json, usage_json = row
         if links[ident] not in authorities:
@@ -704,11 +777,13 @@ def _history_v3(connection, receipt, *, _closed_failure=None):
                 or type(size) is not int or not 0 < size <= profile['max_input_bytes']
                 or type(output) is not int or not 0 < output <= profile['max_output_tokens']
                 or type(thinking) is not int or not 0 <= thinking <= profile['max_thinking_tokens']
-                or usage_json is None and ident != failed):
+                or usage_json is None and ident not in failed_ids):
             _deny()
         usage = json.loads(usage_json, object_pairs_hook=_unique_object) if usage_json is not None else None
-        if ident == failed:
-            if usage_json is not None or kind != 'asr':
+        if ident in failed_ids:
+            if usage is not None and (not isinstance(usage, dict)
+                    or set(usage) != {'returned_model', 'prompt_tokens', 'completion_tokens', 'reasoning_tokens', 'verified'}
+                    or usage['verified'] is not False):
                 _deny()
         elif (not isinstance(usage, dict) or set(usage) != {'returned_model', 'prompt_tokens', 'completion_tokens', 'reasoning_tokens', 'verified'}
                 or usage['verified'] is not True or usage['returned_model'] not in pricing['returned_models']
@@ -725,7 +800,7 @@ def _history_v3(connection, receipt, *, _closed_failure=None):
         counts[kind] = counts.get(kind, 0) + 1
         occupied += cost
     if (sum(counts.values()) > receipt['total_requests']
-            or receipt['schema_version'] != SCHEMA_RISK and occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
+            or receipt['schema_version'] not in RISK_SCHEMAS and occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
         _deny()
     return counts, occupied
 
@@ -745,6 +820,8 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
             old, _ = _parse_receipt(raw.encode(), historical=True)
             if _closed_context(connection, old):
                 _deny()  # This explicitly approved pair cannot become another scope.
+            if 'cumulative_budget' in old and receipt.get('cumulative_budget') != old['cumulative_budget']:
+                _deny()  # Append cannot discard or replace the cumulative authorization.
             if _budget_digest(old) != budget_sha:
                 _deny()
             _, occupied = _history(connection, old, historical=True)
@@ -752,7 +829,7 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
             if (receipt['previous_receipt_sha256'] != previous or digest == previous
                     or receipt['receipt_id'] == old['receipt_id'] or receipt['approval_ref'] == old['approval_ref']
                     or receipt['total_requests'] != prior_count + sum(p['requests'] for p in receipt['profiles'].values())
-                    or receipt['schema_version'] != SCHEMA_RISK and (old['schema_version'] == SCHEMA_RISK
+                    or receipt['schema_version'] not in RISK_SCHEMAS and (old['schema_version'] in RISK_SCHEMAS
                         or _decimal(receipt['spend_authorization']['amount']) < _decimal(old['spend_authorization']['amount'])
                         or occupied > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS))):
                 _deny()
@@ -830,7 +907,7 @@ def _reserve_v3(meter, receipt, digest, **args):
             or type(thinking) is not int or thinking != 0):
         _deny()
     _wire_limits_v3(kind, wire, output, thinking, args['model'])
-    risk = receipt['schema_version'] == SCHEMA_RISK
+    risk = receipt['schema_version'] in RISK_SCHEMAS
     if risk and kind == 'asr':
         _risk_audio(wire, args['source_sha256'])
     pricing, cost = _profile_quote(receipt, kind)
@@ -842,9 +919,22 @@ def _reserve_v3(meter, receipt, digest, **args):
         if risk:
             _risk_stage(connection, receipt, kind)
         used = connection.execute('SELECT COUNT(*) FROM attempts a JOIN attempt_authorizations l ON l.attempt_id=a.id JOIN authorization_snapshots s ON s.receipt_sha256=l.receipt_sha256 WHERE s.receipt_id=? AND a.kind=?', (receipt['receipt_id'], kind)).fetchone()[0]
+        if receipt['schema_version'] == SCHEMA_RISK_SEQUENCE and (used >= len(profile['source_sha256'])
+                or args['source_sha256'] != profile['source_sha256'][used]
+                or request_sha != profile['request_sha256'][used]):
+            _deny()
         if (used >= profile['requests'] or sum(counts.values()) >= receipt['total_requests']
                 or not risk and occupied + cost > int(_decimal(receipt['spend_authorization']['amount']) * USD_UNITS)):
             raise TrialGateError('trial_budget_exhausted')
+        if 'cumulative_budget' in receipt:
+            try:
+                from . import trial_budget
+                trial_budget.reserve_estimate(receipt['cumulative_budget'], receipt=receipt,
+                    slot=len(_risk_scope_attempts(connection, receipt)), kind=kind,
+                    source_sha256=args['source_sha256'], request_sha256=request_sha,
+                    estimated_upper_usd=pricing['estimated_usd'])
+            except (ImportError, OSError, RuntimeError, ValueError):
+                _deny()  # No durable cumulative allocation means no local send.
         cursor = connection.execute('INSERT INTO attempts(kind,request_sha256,source_sha256,wire_bytes,output_limit,thinking_limit,input_bound,generated_bound,reserved_nano_usd,pricing_json) VALUES (?,?,?,?,?,?,?,?,?,?)',
             (kind, request_sha, args['source_sha256'], len(wire), output, thinking, *_usage_bounds(pricing), cost, _snapshot(pricing)))
         ident = cursor.lastrowid
@@ -894,7 +984,7 @@ def _risk_scope_attempts(connection, receipt):
 
 def _risk_stage(connection, receipt, kind):
     rows = _risk_scope_attempts(connection, receipt)
-    pattern = ['asr', 'llm'] * receipt['profiles']['asr']['requests']
+    pattern = receipt['request_sequence'] if receipt['schema_version'] == SCHEMA_RISK_SEQUENCE else ['asr', 'llm'] * receipt['profiles']['asr']['requests']
     if [row[1] for row in rows] != pattern[:len(rows)] or len(rows) >= len(pattern) or kind != pattern[len(rows)]:
         _deny()
     if rows:
@@ -913,7 +1003,7 @@ def confirm_trial_review(attempt_id, approval_ref, *, state_path=STATE_PATH):
             if len(row) != 1 or row[0][1] is not None:
                 _deny()
             receipt, _ = _parse_receipt(row[0][0].encode())
-            if receipt['schema_version'] != SCHEMA_RISK:
+            if receipt['schema_version'] not in RISK_SCHEMAS:
                 _deny()
             _history_v3(connection, receipt)
             rows = _risk_scope_attempts(connection, receipt)
@@ -955,20 +1045,285 @@ def stop_trial(attempt_id, reason_code, *, state_path=STATE_PATH):
         with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             closed = _closed_context(connection)
-            if closed and attempt_id <= closed['failed_attempt_id']:
+            if closed and attempt_id <= closed.get('protected_through_attempt_id', closed['failed_attempt_id']):
                 _deny()
             if connection.execute('SELECT 1 FROM attempts WHERE id=?', (attempt_id,)).fetchone() != (1,):
                 _deny()
             if connection.execute('SELECT COUNT(*) FROM metadata').fetchone() != (1,):
                 _deny()
             connection.execute('UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,?)', (reason_code,))
+            current_receipt, _ = _parse_receipt(connection.execute('SELECT receipt_json FROM metadata').fetchone()[0].encode(), historical=True)
+            stopped_reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
+        _close_cumulative_budget(current_receipt, stopped_reason)
         return {'stopped': True, 'attempt_id': attempt_id}
     except (OSError, sqlite3.Error, ValueError, TypeError):
         raise TrialGateError() from None
 
 
+def _close_cumulative_budget(receipt, reason_code):
+    if 'cumulative_budget' in receipt:
+        try:
+            from . import trial_budget
+            trial_budget.close_batch(receipt['cumulative_budget'], receipt_id=receipt['receipt_id'], reason=reason_code)
+        except (ImportError, OSError, RuntimeError, ValueError):
+            _deny()  # The local stop stays committed, even if the other meter fails.
+
+
+def close_trial_scope(receipt_path=RECEIPT_PATH, state_path=STATE_PATH, reason_code='owner_stop'):
+    """Trusted local stop, including before the new scope's first reservation.
+
+    Expiry does not prevent containment. This operation never clears an earlier
+    reason, reports usage, touches old attempts or creates any authorization.
+    """
+    try:
+        receipt, digest = _parse_receipt(Path(receipt_path).read_bytes(), historical=True)
+        if receipt['schema_version'] != SCHEMA_RISK_SEQUENCE or reason_code not in {
+                'owner_stop', 'business_validation_failed', 'transport_failed',
+                'response_too_large', 'response_invalid', 'usage_unverified'}:
+            _deny()
+        with sqlite3.connect(Path(state_path).resolve().as_uri()+'?mode=rw', uri=True, timeout=10) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            rows = connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall()
+            if len(rows) != 1 or rows[0][:3] != (digest, _budget_digest(receipt), _snapshot(receipt)):
+                _deny()
+            _closed_context(connection, receipt)
+            connection.execute('UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,?)', (reason_code,))
+            stopped_reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
+        _close_cumulative_budget(receipt, stopped_reason)
+        return {'stopped': True, 'receipt_id': receipt['receipt_id'], 'reason': stopped_reason}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        raise TrialGateError() from None
+
+
 def _table_exists(connection, name):
     return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() == (1,)
+
+
+def _successor_claim_name(closure):
+    identity = {field: closure[field] for field in ('previous_receipt_sha256', 'previous_attempts_sha256')}
+    return 'scope-successor-' + hashlib.sha256(_snapshot(identity).encode()).hexdigest() + '.json'
+
+
+def _successor_source(state_raw, receipt_raw, closure_raw, evidence_raw, new_raw, source_path, *, _depth=0):
+    """Validate an already stopped predecessor, including its inherited proofs.
+
+    Unknown usage needs both the immutable stopped history and the independent
+    non-refundable allocation's closed/unknown proof. It never becomes verified.
+    """
+    closure = json.loads(closure_raw, object_pairs_hook=_unique_object)
+    fields = {'schema_version', 'status', 'authorization_source', 'approval_ref',
+              'previous_state_sha256', 'previous_receipt_sha256', 'previous_attempts_sha256',
+              'new_receipt_sha256', 'last_attempt_id', 'freeze_reason', 'last_request_sha256',
+              'last_source_sha256', 'failure_evidence_sha256'}
+    reasons = {'owner_stop', 'business_validation_failed', 'transport_failed', 'response_too_large',
+               'response_invalid', 'usage_unverified', 'usage_unverified_or_over_bound'}
+    if (not isinstance(closure, dict) or set(closure) != fields
+            or closure['schema_version'] != 'noreset-closed-scope-successor-v1'
+            or closure['status'] != 'permanently_closed'
+            or closure['authorization_source'] != 'explicit_owner_approval'
+            or type(closure['last_attempt_id']) is not int or closure['last_attempt_id'] <= 0
+            or closure['freeze_reason'] not in reasons):
+        _deny()
+    for key, raw in [('previous_state_sha256', state_raw), ('previous_receipt_sha256', receipt_raw),
+                     ('new_receipt_sha256', new_raw), ('failure_evidence_sha256', evidence_raw)]:
+        if closure[key] != hashlib.sha256(raw).hexdigest():
+            _deny()
+    old, old_sha = _parse_receipt(receipt_raw, historical=True)
+    new, _ = _parse_receipt(new_raw, historical=True)
+    if (old['schema_version'] not in APPEND_SCHEMAS or new['schema_version'] != SCHEMA_RISK_SEQUENCE
+            or new['previous_receipt_sha256'] != old_sha or new['receipt_id'] == old['receipt_id']
+            or new['approval_ref'] != closure['approval_ref'] or new['approval_ref'] == old['approval_ref']):
+        _deny()
+    if 'cumulative_budget' in old and new.get('cumulative_budget') != old['cumulative_budget']:
+        _deny()  # New scopes cannot discard the already approved cumulative cap.
+    with sqlite3.connect(':memory:') as origin:
+        origin.deserialize(state_raw)
+        if origin.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+            _deny()
+        metadata = origin.execute('SELECT * FROM metadata').fetchall()
+        if metadata != [(old_sha, _budget_digest(old), _snapshot(old), closure['freeze_reason'])]:
+            _deny()
+        rows = origin.execute('SELECT * FROM attempts ORDER BY id').fetchall()
+        if (not rows or [row[0] for row in rows] != list(range(1, len(rows)+1))
+                or closure['last_attempt_id'] != rows[-1][0]
+                or closure['previous_attempts_sha256'] != hashlib.sha256(_snapshot(rows).encode()).hexdigest()
+                or closure['last_request_sha256'] != rows[-1][2] or closure['last_source_sha256'] != rows[-1][3]
+                or new['total_requests'] != len(rows) + len(new['request_sequence'])):
+            _deny()
+        closed = _closed_context(origin, old, _validation_path=source_path, _depth=_depth+1)
+        failed_ids = set(closed.get('closed_unverified_attempt_ids', [closed['failed_attempt_id']]) if closed else [])
+        latest_usage = json.loads(rows[-1][-1], object_pairs_hook=_unique_object) if rows[-1][-1] is not None else None
+        if (latest_usage is None or isinstance(latest_usage, dict) and latest_usage.get('verified') is False) and rows[-1][0] not in failed_ids:
+            # An owner stop or a new receipt alone cannot close an in-flight
+            # unknown request. Only an actual failure and its prior durable
+            # cumulative allocation allow a different future request.
+            if (old['schema_version'] != SCHEMA_RISK_SEQUENCE or closure['freeze_reason'] not in {
+                    'transport_failed', 'response_too_large', 'response_invalid',
+                    'usage_unverified', 'usage_unverified_or_over_bound'}):
+                _deny()
+            steps = _risk_scope_attempts(origin, old)
+            if not steps or steps[-1][0] != rows[-1][0]:
+                _deny()
+            ident, kind = steps[-1]
+            try:
+                from . import trial_budget
+                allocation = trial_budget.allocation_status(old['cumulative_budget'], receipt_id=old['receipt_id'],
+                    slot=len(steps)-1, kind=kind, source_sha256=rows[-1][3], request_sha256=rows[-1][2])
+            except (ImportError, OSError, RuntimeError, ValueError, AttributeError):
+                _deny()
+            if (allocation['status'] != 'reserved_unknown' or allocation['batch_closed'] is not True
+                    or allocation['closure_reason'] != closure['freeze_reason'] or allocation['observation'] is not None
+                    or allocation['refundable'] is not False
+                    or allocation['reserved_estimate_usd'] != old['profiles'][kind]['billing']['estimated_usd']):
+                _deny()
+            failed_ids.add(ident)
+        _, occupied = _history_v3(origin, old, _validation_path=source_path, _depth=_depth+1,
+                                  _closed_unverified_ids=failed_ids)
+        closed = {**(closed or {'failed_attempt_id': 0}), 'closed_unverified_attempt_ids': sorted(failed_ids)}
+        authorities = origin.execute('SELECT * FROM authorization_snapshots ORDER BY receipt_sha256').fetchall()
+        if any(row[1] == new['receipt_id'] for row in authorities):
+            _deny()
+        evidence = json.loads(evidence_raw, object_pairs_hook=_unique_object)
+        expected = {'schema_version': 'noreset-closed-scope-evidence-v1', 'status': 'permanently_closed',
+                    'last_attempt_id': rows[-1][0], 'freeze_reason': closure['freeze_reason'],
+                    'last_request_sha256': rows[-1][2], 'last_source_sha256': rows[-1][3],
+                    'cumulative_attempt_rows': len(rows), 'historical_reserved_usd': _usd(occupied),
+                    'supplier_final_charge_known': False}
+        if (not isinstance(evidence, dict) or set(evidence) != set(expected) or evidence != expected
+                or type(evidence['last_attempt_id']) is not int or type(evidence['cumulative_attempt_rows']) is not int
+                or evidence['supplier_final_charge_known'] is not False):
+            _deny()
+        tables = {}
+        for name, schema in origin.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            if not re.fullmatch('[a-z_]+', name):
+                _deny()
+            tables[name] = (schema, origin.execute(f'SELECT * FROM {name} ORDER BY rowid').fetchall())
+    return closure, tables, occupied, closed
+
+
+def _successor_context(connection, receipt=None, *, _validation_path=None, _depth=0):
+    rows = connection.execute('SELECT * FROM scope_successors ORDER BY id').fetchall()
+    if not rows or [row[0] for row in rows] != list(range(1, len(rows)+1)):
+        _deny()
+    _, state_raw, old_raw, new_raw, closure_raw, evidence_raw, claim_path, source_path = rows[-1]
+    if not isinstance(source_path, str) or str(Path(source_path).resolve()) != source_path:
+        _deny()
+    closure, tables, _, closed = _successor_source(state_raw, old_raw, closure_raw, evidence_raw, new_raw,
+                                                  source_path, _depth=_depth)
+    new, new_sha = _parse_receipt(new_raw, historical=True)
+    if receipt is None:
+        values = connection.execute('SELECT receipt_json FROM metadata').fetchall()
+        if len(values) != 1:
+            _deny()
+        receipt, _ = _parse_receipt(values[0][0].encode(), historical=True)
+    if receipt['receipt_id'] != new['receipt_id'] or _budget_digest(receipt) != _budget_digest(new):
+        _deny()
+    for kind, profile in new['profiles'].items():
+        if receipt['profiles'][kind]['billing'] != profile['billing']:
+            _deny()
+        for field in ('source_sha256', 'request_sha256'):
+            if receipt['profiles'][kind][field][:len(profile[field])] != profile[field]:
+                _deny()
+    state_path = _validation_path or connection.execute('PRAGMA database_list').fetchone()[2]
+    expected_claim_path = CONTINUATION_CLAIM_ROOT.resolve() / _successor_claim_name(closure)
+    if Path(claim_path).absolute() != expected_claim_path or Path(claim_path).resolve() != expected_claim_path:
+        _deny()
+    expected_claim = {'schema_version': 'noreset-scope-successor-claim-v1',
+        'previous_receipt_sha256': closure['previous_receipt_sha256'],
+        'previous_attempts_sha256': closure['previous_attempts_sha256'],
+        'previous_state_sha256': closure['previous_state_sha256'],
+        'new_receipt_sha256': new_sha, 'closure_sha256': hashlib.sha256(closure_raw).hexdigest(),
+        'state_path': str(Path(state_path).resolve())}
+    if json.loads(Path(claim_path).read_bytes(), object_pairs_hook=_unique_object) != expected_claim:
+        _deny()
+    # Original schemas and every original row survive, including proof chains,
+    # usage, reviews and response metadata. Only this scope's new rows may grow.
+    cutoff = closure['last_attempt_id']
+    for table, (schema, old_rows) in tables.items():
+        if table == 'metadata':
+            expected = (closure['previous_receipt_sha256'], *old_rows[0])
+            if connection.execute('SELECT * FROM closed_scope_metadata WHERE receipt_sha256=?', (expected[0],)).fetchall() != [expected]:
+                _deny()
+            continue
+        if connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() != (schema,):
+            _deny()
+        current = connection.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+        if table in {'attempts', 'attempt_authorizations', 'trial_reviews', 'transport_metadata'}:
+            current = [row for row in current if row[0] <= cutoff]
+            if current != old_rows:
+                _deny()
+        elif table in {'authorization_snapshots', 'closed_scope_metadata'}:
+            if any(row not in current for row in old_rows):
+                _deny()
+        elif table == 'scope_successors':
+            if current[:-1] != old_rows:
+                _deny()
+        elif current != old_rows:
+            _deny()
+    for table in ('trial_reviews', 'transport_metadata'):
+        old_rows = tables.get(table, (None, []))[1]
+        if _table_exists(connection, table) and connection.execute(f'SELECT * FROM {table} WHERE attempt_id<=? ORDER BY rowid', (cutoff,)).fetchall() != old_rows:
+            _deny()  # A new audit table cannot attach a late record to old IDs.
+    if connection.execute('SELECT receipt_json FROM authorization_snapshots WHERE receipt_sha256=?', (new_sha,)).fetchone() != (_snapshot(new),):
+        _deny()
+    return {**(closed or {'failed_attempt_id': 0}), 'protected_through_attempt_id': cutoff}
+
+
+def succeed_informed_trial(receipt_path, state_path, *, previous_receipt_path, previous_state_path,
+                           closure_path, failure_evidence_path):
+    """Explicit local new approval, independent state, immutable stopped history.
+
+    No HTTP handler can create this successor. Closed unknown attempts retain
+    their full failure/allocation proof and cannot be reported or replayed.
+    """
+    target, created = Path(state_path).resolve(), False
+    try:
+        source, old_receipt_path = Path(previous_state_path).resolve(), Path(previous_receipt_path).resolve()
+        receipt_path = Path(receipt_path).resolve()
+        if (target in {source, old_receipt_path, receipt_path} or receipt_path == old_receipt_path or target.exists()
+                or any(Path(str(source)+suffix).exists() for suffix in ('-wal', '-shm', '-journal'))):
+            _deny()
+        state_raw, old_raw, new_raw = source.read_bytes(), old_receipt_path.read_bytes(), receipt_path.read_bytes()
+        receipt, digest = _parse_receipt(new_raw)
+        closure_raw, evidence_raw = Path(closure_path).read_bytes(), Path(failure_evidence_path).read_bytes()
+        if len(closure_raw) > 65536 or len(evidence_raw) > 65536:
+            _deny()
+        closure, tables, _, _ = _successor_source(state_raw, old_raw, closure_raw, evidence_raw, new_raw, str(source))
+        claim_path = CONTINUATION_CLAIM_ROOT.resolve() / _successor_claim_name(closure)
+        claim = {'schema_version': 'noreset-scope-successor-claim-v1',
+            'previous_receipt_sha256': closure['previous_receipt_sha256'],
+            'previous_attempts_sha256': closure['previous_attempts_sha256'],
+            'previous_state_sha256': closure['previous_state_sha256'], 'new_receipt_sha256': digest,
+            'closure_sha256': hashlib.sha256(closure_raw).hexdigest(), 'state_path': str(target)}
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        with claim_path.open('xb') as stream:
+            stream.write(_snapshot(claim).encode())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('xb') as stream:
+            stream.write(state_raw)
+        created = True
+        with sqlite3.connect(target) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('CREATE TABLE IF NOT EXISTS scope_successors (id INTEGER PRIMARY KEY,state_raw BLOB NOT NULL,receipt_raw BLOB NOT NULL,new_receipt_raw BLOB NOT NULL,closure_json BLOB NOT NULL,evidence_raw BLOB NOT NULL,claim_path TEXT NOT NULL,source_path TEXT NOT NULL)')
+            connection.execute('INSERT INTO scope_successors(state_raw,receipt_raw,new_receipt_raw,closure_json,evidence_raw,claim_path,source_path) VALUES (?,?,?,?,?,?,?)',
+                (state_raw, old_raw, new_raw, closure_raw, evidence_raw, str(claim_path), str(source)))
+            connection.execute('CREATE TABLE IF NOT EXISTS closed_scope_metadata (receipt_sha256 TEXT PRIMARY KEY,old_receipt_sha256 TEXT NOT NULL,budget_sha256 TEXT NOT NULL,receipt_json TEXT NOT NULL,frozen_reason TEXT NOT NULL)')
+            connection.execute('INSERT INTO closed_scope_metadata VALUES (?,?,?,?,?)', (closure['previous_receipt_sha256'], *tables['metadata'][1][0]))
+            _save_authority(connection, digest, receipt, closure['previous_receipt_sha256'])
+            connection.execute('UPDATE metadata SET receipt_sha256=?,budget_sha256=?,receipt_json=?,frozen_reason=NULL',
+                (digest, _budget_digest(receipt), _snapshot(receipt)))
+            _history_v3(connection, receipt)
+        if (source.read_bytes() != state_raw or old_receipt_path.read_bytes() != old_raw
+                or any(Path(str(source)+suffix).exists() for suffix in ('-wal', '-shm', '-journal'))):
+            _deny()
+        result = validate_trial_authorization(receipt_path=receipt_path, state_path=target)
+        return {key:result[key] for key in ('receipt_sha256','remaining_requests','remaining_usd','cost_bound_known','historical_reserved_usd')} | {
+            'state_path':str(target), 'claim_path':str(claim_path), 'protected_through_attempt_id':closure['last_attempt_id']}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, InvalidOperation, TrialGateError):
+        if created:
+            with sqlite3.connect(target) as connection:
+                connection.execute("UPDATE metadata SET frozen_reason='successor_setup_failed'")
+        raise TrialGateError() from None
 
 
 def _continuation_claim_name(closure):
@@ -1034,8 +1389,12 @@ def _continuation_source(state_raw, receipt_raw, closure_raw, evidence_raw, new_
     return closure, metadata, rows, authorities, links
 
 
-def _closed_context(connection, receipt=None):
+def _closed_context(connection, receipt=None, *, _validation_path=None, _depth=0):
     """Only an exact inherited failed row gets an exception; preserve all totals."""
+    if _depth > 16:
+        _deny()
+    if _table_exists(connection, 'scope_successors'):
+        return _successor_context(connection, receipt, _validation_path=_validation_path, _depth=_depth)
     exists, metadata_exists = _table_exists(connection, 'closed_origin'), _table_exists(connection, 'closed_metadata')
     if not exists and not metadata_exists:
         return None
@@ -1060,7 +1419,7 @@ def _closed_context(connection, receipt=None):
         for field in ('source_sha256', 'request_sha256'):
             if receipt['profiles'][kind][field][:len(profile[field])] != profile[field]:
                 _deny()
-    state_path = connection.execute('PRAGMA database_list').fetchone()[2]
+    state_path = _validation_path or connection.execute('PRAGMA database_list').fetchone()[2]
     expected_claim = {'schema_version': 'noreset-continuation-claim-v1',
                       'previous_state_sha256': closure['previous_state_sha256'],
                       'previous_receipt_sha256': closure['previous_receipt_sha256'],
