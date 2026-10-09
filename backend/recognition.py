@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 from urllib.parse import quote, urlsplit
 
-from .model_client import _open_request, ModelClientError
+from .model_client import _open_request, ModelClientError, strict_json_loads, _trial_report, _trial_stop, reset_trial_context
 from .trial_gate import is_loopback_url
 
 
@@ -741,14 +741,27 @@ class _OpenAICompatibleProvider:
         )
 
     def _send(self, request: urllib.request.Request) -> str:
+        if hasattr(self, 'trial_control'):
+            del self.trial_control
+        try:
+            return self._send_response(request)
+        except Exception:
+            _trial_stop(request, 'response_invalid')
+            raise
+
+    def _send_response(self, request: urllib.request.Request) -> str:
         try:
             with _open_request(request, self._config.timeout_seconds) as response:
+                status = getattr(response, 'status', None)
+                if status != 200 and (status is not None or type(getattr(request, '_noreset_trial_attempt_id', None)) is int):
+                    raise _safe_error('invalid_provider_response')
                 raw = response.read(self._config.max_response_bytes + 1)
         except ModelClientError as exc:
             if exc.code in {'trial_authorization_required', 'trial_budget_exhausted'}:
                 raise _safe_error(exc.code) from None
             raise _safe_error('provider_unavailable') from None
         except urllib.error.HTTPError as exc:
+            exc.close()  # Never read or capture the remote error body.
             if exc.code in {401, 403}:
                 raise _safe_error("provider_auth_failed") from None
             if exc.code == 429:
@@ -765,10 +778,24 @@ class _OpenAICompatibleProvider:
         if len(raw) > self._config.max_response_bytes:
             raise _safe_error("invalid_provider_response")
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = strict_json_loads(raw.decode('utf-8')) if type(getattr(request, '_noreset_trial_attempt_id', None)) is int else json.loads(raw.decode('utf-8'))
+            protocol = 'gemini' if getattr(request, '_noreset_trial_profile', {}).get('kind') == 'asr' else 'openai'
+            _trial_report(request, payload, raw, protocol=protocol)
+        except ModelClientError as error:
+            if error.code in {'trial_authorization_required', 'trial_budget_exhausted'}:
+                raise _safe_error(error.code) from None
+            raise _safe_error('invalid_provider_response') from None
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise _safe_error("invalid_provider_response") from None
-        return _text_from_response(payload)
+        if type(getattr(request, '_noreset_trial_attempt_id', None)) is int:
+            candidates = payload.get('candidates') if protocol == 'gemini' else payload.get('choices')
+            finish_field, finish = ('finishReason', 'STOP') if protocol == 'gemini' else ('finish_reason', 'stop')
+            if not isinstance(candidates, list) or len(candidates) != 1 or not isinstance(candidates[0], dict) or candidates[0].get(finish_field) != finish:
+                raise _safe_error('incomplete_provider_response')
+        text = _text_from_response(payload)
+        if type(getattr(request, '_noreset_trial_attempt_id', None)) is int and protocol == 'gemini':
+            self.trial_control = {'review_required': True}
+        return text
 
 
 def _text_from_response(payload: Any) -> str:
@@ -894,6 +921,7 @@ def recognize_file(
     采用产品限制。模块始终对供应商响应设置有界读取。
     """
 
+    reset_trial_context()
     if not isinstance(attempt_id, str) or not attempt_id.strip():
         raise _safe_error("invalid_media")
     kind, normalised_type = _validate_kind_and_type(kind, content_type)
@@ -916,10 +944,13 @@ def recognize_file(
         content_type=normalised_type,
         filename=media_path.name,
     )
-    return {
+    result = {
         "text": text,
         "provider": config.name,
         "model": config.model,
         "is_mock": config.name == "mock",
         "attempt_id": attempt_id,
     }
+    if getattr(recognizer, 'trial_control', None) == {'review_required': True}:
+        result['trial_control'] = {'review_required': True}
+    return result

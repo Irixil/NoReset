@@ -38,6 +38,7 @@ function unusableAudioMessage(m){
   return m?.kind==='audio'&&['invalid_media','no_text_detected'].includes(code)?'这段录音没有可识别的声音，请重新录音；原件仍保存在本机。':'';
 }
 function mediaRetryable(m){
+  if(m?.trial_control)return false;
   // The API puts retryability on the current attempt's error.  Accept the
   // compatibility locations too, but never infer that a terminal failure is
   // retryable merely because it has a failed status.
@@ -47,6 +48,7 @@ function mediaRetryable(m){
   return m.recognition?.retryable===true||m.recognition?.error?.retryable===true||m.retryable===true;
 }
 function trialRetryMessage(m){
+  if(m?.trial_control)return m.trial_control.state==='stopped'?'本次语音试验已停止；原件和已识别文字保留，等待明确处理安排。':'本次语音试验已暂停核对；原件和已识别文字保留。';
   const code=m?.recognition?.error?.code;
   return code==='trial_budget_exhausted'?'本次试验额度已用尽；原件已保留，需要新的预算授权后才能手动重试。':code==='trial_authorization_required'?'试验尚未获预算授权；原件已保留，获得授权后可手动重试。':'';
 }

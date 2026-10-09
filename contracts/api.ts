@@ -333,6 +333,10 @@ export type StatelessOrganizeSuccess = LocalSafety & OrganizeResultMeta & {
 
 export type StatelessMediaRecognitionSuccess = {
   ok: true;
+  /** Trusted response-only marker for the controlled synthetic voice trial.
+   * It requires local review before a separately authorized model reply;
+   * it never grants budget, retries, or a provider call. */
+  trial_control?: { review_required: true; stopped?: true };
   recognition: {
     text: string;
     provider: string;

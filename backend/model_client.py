@@ -7,6 +7,7 @@ Errors deliberately exclude server bodies, URLs, credentials and exceptions.
 from __future__ import annotations
 
 import copy
+import contextvars
 import hashlib
 import http.client
 import ipaddress
@@ -18,14 +19,18 @@ import urllib.parse
 import urllib.request
 from typing import Any
 try:
+    from . import trial_gate
     from .trial_gate import authorize_request, TrialGateError
 except ImportError:
+    import trial_gate
     from trial_gate import authorize_request, TrialGateError
 
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 16 * 1024
 MAX_EXTRA_BODY_BYTES = 64 * 1024
+_TRIAL_ATTEMPT = contextvars.ContextVar('noreset_trial_attempt', default=None)
+_TRIAL_STATE = contextvars.ContextVar('noreset_trial_state', default=None)
 PROTECTED_BODY_FIELDS = frozenset({
     'model', 'messages', 'stream', 'stream_options', 'response_format',
     'temperature', 'max_tokens', 'max_completion_tokens', 'n',
@@ -138,12 +143,90 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def reset_trial_context():
+    _TRIAL_ATTEMPT.set(None)
+    _TRIAL_STATE.set(None)
+
+
+def trial_control(*, stopped=False):
+    if type(_TRIAL_ATTEMPT.get()) is not int:
+        return {}
+    return {'review_required': True, **({'stopped': True} if stopped else {})}
+
+
+def stop_current_trial(reason_code):
+    attempt = _TRIAL_ATTEMPT.get()
+    if type(attempt) is int:
+        if _TRIAL_STATE.get() is None:
+            raise ModelClientError('试验计量状态无效', code='trial_authorization_required')
+        trial_gate.stop_trial(attempt, reason_code, state_path=_TRIAL_STATE.get())
+
+
+def _trial_stop(request, reason_code):
+    attempt = getattr(request, '_noreset_trial_attempt_id', None)
+    if type(attempt) is int:
+        state_path = getattr(request, '_noreset_trial_state_path', None)
+        if state_path is None:
+            raise ModelClientError('试验计量状态无效', code='trial_authorization_required')
+        trial_gate.stop_trial(attempt, reason_code, state_path=state_path)
+
+
+def _trial_report(request, envelope, raw, *, protocol='openai'):
+    """Only the actual reserved request can report its own bounded response."""
+    attempt = getattr(request, '_noreset_trial_attempt_id', None)
+    if type(attempt) is not int:
+        return
+    state_path = getattr(request, '_noreset_trial_state_path', None)
+    if state_path is None:
+        raise ModelClientError('试验计量状态无效', code='trial_authorization_required')
+    if not isinstance(envelope, dict):
+        raise ModelClientError('合成试验用量无法验证', code='trial_authorization_required')
+    if protocol == 'gemini':
+        model, usage = envelope.get('modelVersion'), envelope.get('usageMetadata')
+        fields = ('promptTokenCount', 'candidatesTokenCount', 'thoughtsTokenCount', 'totalTokenCount')
+        if (not isinstance(usage, dict) or any(type(usage.get(k)) is not int or usage[k] < 0 for k in fields)
+                or ('toolUsePromptTokenCount' in usage and (type(usage['toolUsePromptTokenCount']) is not int or usage['toolUsePromptTokenCount'] != 0))
+                or usage['totalTokenCount'] != usage['promptTokenCount'] + usage['candidatesTokenCount'] + usage['thoughtsTokenCount']):
+            raise ModelClientError('合成试验用量无法验证', code='trial_authorization_required')
+        usage = {'prompt_tokens': usage['promptTokenCount'],
+                 'completion_tokens': usage['candidatesTokenCount'] + usage['thoughtsTokenCount'],
+                 'completion_tokens_details': {'reasoning_tokens': usage['thoughtsTokenCount']}}
+        trace = envelope.get('responseId')
+    else:
+        model, usage, trace = envelope.get('model'), envelope.get('usage'), envelope.get('id')
+    metadata = {'response_sha256': hashlib.sha256(raw).hexdigest(), 'response_bytes': len(raw), 'protocol': protocol}
+    secrets = [value.removeprefix('Bearer ') for key, value in request.header_items()
+               if key.lower() in {'authorization', 'x-goog-api-key'}]
+    if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}', model) or any(secret and secret in model for secret in secrets):
+        model = None
+    if isinstance(trace, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', trace):
+        if not any(secret and secret in trace for secret in secrets):
+            metadata['trace_id'] = trace
+    try:
+        trial_gate.report_usage(attempt, model, usage, transport_metadata=metadata,
+                                state_path=state_path)
+    except TrialGateError as error:
+        raise ModelClientError(str(error), code=error.code) from None
+
+
 def _open_request(request, timeout):
+    reset_trial_context()
+    for field in ('_noreset_trial_attempt_id', '_noreset_trial_state_path'):
+        if hasattr(request, field):
+            delattr(request, field)
     try:
         authorize_request(request)
     except TrialGateError as error:
         raise ModelClientError(str(error), code=error.code) from None
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler()).open(request, timeout=timeout)
+    attempt = getattr(request, '_noreset_trial_attempt_id', None)
+    if type(attempt) is int:
+        _TRIAL_ATTEMPT.set(attempt)
+        _TRIAL_STATE.set(getattr(request, '_noreset_trial_state_path', None))
+    try:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler()).open(request, timeout=timeout)
+    except Exception:
+        _trial_stop(request, 'transport_failed')
+        raise
 
 
 def _modelscope_account_binding_required(error, request_url):
@@ -187,6 +270,14 @@ class ChatCompletionsClient:
         self.trial_provider = trial_provider
 
     def complete_json(self, system_prompt: str, payload: dict) -> dict:
+        reset_trial_context()
+        try:
+            return self._complete_json(system_prompt, payload)
+        except Exception:
+            stop_current_trial('business_validation_failed')
+            raise
+
+    def _complete_json(self, system_prompt: str, payload: dict) -> dict:
         try:
             serialized_payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -248,6 +339,7 @@ class ChatCompletionsClient:
             raise ModelClientError('模型响应不是 UTF-8 JSON') from None
         if not isinstance(response_data, dict):
             raise ModelClientError('模型响应必须是 JSON 对象')
+        _trial_report(request, response_data, raw)
         if response_data.get('error'):
             raise ModelClientError('模型响应报告错误')
         choices = response_data.get('choices')

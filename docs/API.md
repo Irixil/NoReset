@@ -14,6 +14,16 @@
 
 `APP_MODE=local_first` 是内测版的正式运行模式。记录、修订历史、媒体原件和备份由浏览器的 Web Crypto + IndexedDB 处理，后端不创建 SQLite 健康数据库，并对旧 `/api/events`、`/api/media`、`/api/handoffs` 服务端路由返回 `404 legacy_api_disabled`。前端保留同形本地请求层，用于降低旧界面迁移风险；这些本地请求不会离开浏览器。
 
+### 2026-10-09 隔离语音试验保护
+
+受预算 gate 管理的 ASR 成功响应增加顶层 `trial_control:{review_required:true}`。该字段由服务端依据本次实际预占与同次用量生成；HTTP 入参、供应商同名字段、媒体 `attempt_id` 和前端按钮不能批准预算。客户端先加密保存原件、转写和来源版本，再持久停在 `review_required`，不自动请求后续 LLM。缺少标记的普通产品流程沿用原行为；存在但非法的标记保守停止。
+
+本机 `POST /api/conversations/:id/trial-continue` 接受 `{expected_version,turn_id,turn_version}`，只核当前原话/事件版本并继续一次既有 LLM 路由。它不是新的后端授权接口：必须另有受信的有效授权，且完整派生请求 SHA、范围和累计预算符合 gate。继续前持久 `continuing`，刷新不补发，重复点击不增加请求。任何本次发送、计量或服务端业务失败都会停止后续受控请求；包括 HTTP 200 的 `model_output_blocked` 安全阻断。成功 ASR 不因后续 LLM 失败变成可重试识别，原件继续保留。
+
+本地可信 `append_trial` 支持在同一累计账本追加 v3 授权快照，保留旧 attempt、原报价、用量及预占；不从空库创建 v3，不退款、不重算旧价，也不解除冻结。缺新有效许可、完整计费合同界或准确来源/请求 SHA 时拒绝外发。每次实际请求先提交预占，再从同次有界响应记录模型与完整用量；不额外请求计量或重试。LLM wire 上限 24000 bytes/输出至多2048，ASR wire 上限3145728 bytes/输出1024/思考0，仅是请求控制，不能代替供应商所有尝试和失败收费的总金额保证。
+
+这些保护目前只有合成离线证据，未激活实际授权和账本。真实语音试验仍等待供应商完整收费边界及含旧预占的新增明确批准；[本轮验收记录](evidence/goal-audit-2026-10-09/voice-controls/README.md)说明证据和未测边界。
+
 函数服务只提供以下无状态能力：
 
 - `GET /health`：返回 `mode:"local_first"` 和 `storage:"encrypted_on_device"`，不返回旧 `session_token`。

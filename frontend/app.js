@@ -2,6 +2,7 @@ let API = globalThis.BingliConfig?.apiBaseUrl || '';
 let token = localStorage.getItem('session_token') || '', modelProvider = '', saveBusy = false;
 let events = [], conversations = [], current = null, detailRequestSerial = 0, mediaRecorder = null, chunks = [], timerId = null, startedAt = 0, elapsedMs = 0, demoMode = false, localMode = Boolean(globalThis.HealthLocal), voicePermissionPending = false, voiceUploadPending = false;
 let activeConversation = null, conversationLoading = false, conversationEditingTurnId = null, pendingConversationTurn = null, pendingMediaRetry = null, lastSpokenTurnId = null;
+let voicePermissionGeneration = 0;
 let silenceAudioContext = null, silenceAnalyser = null, silenceFrameId = null, silenceStartedAt = 0, speechDetected = false;
 let reportReturnFocus = null, reportInertTargets = [], contextReturnFocus = null, contextInertTargets = [];
 let healthContextEntries = [], contextDraftSelection = new Set(), contextPickerLoading = false, contextPickerLoadError = false, contextPickerRequestId = 0, contextSelectionSaving = false, voiceStatusCheckId = 0;
@@ -235,8 +236,24 @@ function setVoiceStatus(text,tone=''){
   status.textContent=text;status.className='conversation-status'+(tone?' '+tone:'');
 }
 function setVoiceComposerEnabled(enabled){
+  if(activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')enabled=false;
   const input=$('voiceTextInput'),send=$('voiceTextSend');
   if(input)input.disabled=!enabled;if(send)send.disabled=!enabled||!input?.value.trim();
+}
+function trialVoiceMessage(control){
+  return control?.state==='review_required'?'语音已转成文字，原话和录音已保留。请对照录音核对文字，等待本次试验批准后再继续一次。':control?.state==='completed'?'语音和本次回复已保存；下一段语音仍会先暂停核对。':control?.state==='continuing'?'这次回复已提交，原话和录音已保留。请等结果；重新进入不会再次发送。':'本次语音试验已停止，原话和录音已保留；请等待新的明确处理安排。';
+}
+async function continueTrialVoice(){
+  const control=activeConversation?.trial_control;
+  if(saveBusy||conversationEditingTurnId||control?.state!=='review_required')return false;
+  saveBusy=true;renderVoiceConversation();setVoiceStatus('正在检查并提交本次回复…');
+  try{
+    const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/trial-continue`,{method:'POST',body:JSON.stringify({expected_version:activeConversation.version,turn_id:control.turn_id,turn_version:control.turn_version})});
+    if(x.j.conversation)syncConversation(x.j.conversation,{speak:x.r.ok&&!x.j.ai_failed});
+    setVoiceStatus(trialVoiceMessage(activeConversation?.trial_control),x.j.ai_failed||!x.r.ok?'error':'ok');
+    return x.r.ok&&!x.j.ai_failed;
+  }catch{setVoiceStatus('本次回复未完成，原话和录音已保留；重新进入不会再次发送。','error');return false}
+  finally{saveBusy=false;renderVoiceConversation();setVoiceComposerEnabled(true)}
 }
 function voiceTurnHtml(turn){
   const assistant=turn.role==='assistant'||turn.side==='assistant';
@@ -244,7 +261,7 @@ function voiceTurnHtml(turn){
   const avatar=assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':'';
   const editing=!assistant&&conversationEditingTurnId===turn.turn_id;
   const latestTurn=(activeConversation?.turns||[]).filter(item=>!item.superseded).at(-1);
-  const canRetry=assistant&&turn.ai_failed&&latestTurn?.turn_id===turn.turn_id;
+  const canRetry=!activeConversation?.trial_control&&assistant&&turn.ai_failed&&latestTurn?.turn_id===turn.turn_id;
   let content='';
   if(editing){
     content=`<label class="chat-edit-label" for="voice-turn-${escapeHtml(turn.turn_id)}">修改刚才说的话</label><textarea id="voice-turn-${escapeHtml(turn.turn_id)}" class="chat-edit-textarea" data-voice-turn-input rows="4">${escapeHtml(turn.editText??turn.text??'')}</textarea><div class="chat-edit-actions"><button class="chat-action" type="button" data-voice-turn-save>保存修改</button><button class="chat-secondary-action" type="button" data-voice-turn-cancel>取消</button></div>${turn.editStatus?`<small class="chat-edit-error">${escapeHtml(turn.editStatus)}</small>`:''}`;
@@ -266,6 +283,7 @@ function renderVoiceConversation(){
   const box=$('voiceConversationTurns');if(!box)return;
   const turns=(activeConversation?.turns||[]).filter(turn=>!turn.superseded);
   box.innerHTML=[...turns,pendingConversationTurn].filter(Boolean).map(voiceTurnHtml).join('');
+  if(activeConversation?.trial_control){const control=activeConversation.trial_control;box.innerHTML+=`<div class="chat-turn"><div class="chat-bubble"><p>${escapeHtml(trialVoiceMessage(control))}</p>${control.state==='review_required'?`<button class="chat-action" type="button" data-trial-continue ${saveBusy?'disabled':''}>核对并获准后继续一次</button>`:''}</div></div>`;box.querySelector('[data-trial-continue]')?.addEventListener('click',continueTrialVoice)}
   box.querySelectorAll('[data-voice-turn-edit]').forEach(button=>button.onclick=()=>beginVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn));
   box.querySelectorAll('[data-voice-turn-cancel]').forEach(button=>button.onclick=cancelVoiceTurnEdit);
   box.querySelectorAll('[data-voice-turn-save]').forEach(button=>button.onclick=()=>saveVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn,button.closest('.chat-bubble')?.querySelector('[data-voice-turn-input]')?.value||''));
@@ -313,6 +331,7 @@ function reportFactHtml(line,index){
   return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}${evidence}</article>`;
 }
 function syncConversation(conversation,{speak=true}={}){
+  if(conversation?.trial_control&&conversation.trial_control.state!=='completed')voicePermissionGeneration++;
   if(pendingMediaRetry&&pendingMediaRetry.conversation_id!==conversation?.conversation_id)pendingMediaRetry=null;
   activeConversation=conversation;conversationEditingTurnId=null;pendingConversationTurn=null;
   document.querySelector?.('.conversation-shell')?.classList.remove('awaiting-choice');
@@ -324,8 +343,11 @@ function conversationHasPendingReply(conversation){
   const turns=(conversation?.turns||[]).filter(turn=>!turn.superseded),latest=turns[turns.length-1];
   return latest?.role==='elder';
 }
-function speakAssistant(turn,force=false){
+async function speakAssistant(turn,force=false){
   if(!turn?.text||isMockContent(turn)||!globalThis.speechSynthesis||!globalThis.SpeechSynthesisUtterance)return;
+  const conversationId=activeConversation?.conversation_id;
+  let trial;try{trial=await globalThis.HealthLocal?.trialVoiceState?.()}catch{return}
+  if(activeConversation?.conversation_id!==conversationId||trial&&trial.state!=='completed'||activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')return;
   if(!force&&turn.turn_id===lastSpokenTurnId)return;
   speechSynthesis.cancel();speechSynthesis.resume?.();const utterance=new SpeechSynthesisUtterance(turn.text);utterance.lang='zh-CN';utterance.rate=.92;speechSynthesis.speak(utterance);lastSpokenTurnId=turn.turn_id;
 }
@@ -455,6 +477,8 @@ async function saveHealthContextSelection(){
   }
 }
 async function retryConversationReply(button){
+  if(activeConversation?.trial_control)return false;
+  const trial=await globalThis.HealthLocal?.trialVoiceState?.();if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),'error');return false}
   const turns=(activeConversation?.turns||[]).filter(turn=>!turn.superseded),latest=turns.at(-1);
   if(saveBusy||!latest||latest.role!=='assistant'||!latest.ai_failed||!activeConversation?.conversation_id)return false;
   saveBusy=true;if(button){button.disabled=true;button.textContent='正在重试…'}setVoiceComposerEnabled(false);setVoiceStatus('刚才的原话已保存在本机，正在请求一次回复…');
@@ -491,6 +515,11 @@ function showVoiceMediaSaved(media){
 }
 async function showVoiceMediaResult(media){
   if(!media)return;
+  if(media.trial_control){
+    let control=media.trial_control;
+    if(media.conversation_id){const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){syncConversation(saved.j.conversation,{speak:false});control=saved.j.conversation.trial_control||control}}
+    setVoiceStatus(trialVoiceMessage(control),control.state==='stopped'?'error':'ok');return;
+  }
   const recognitionError=media.recognition?.error?.code||media.recognition?.error?.error||media.recognition?.error||media.error;
   if(recognitionError==='original_unavailable'){
     setVoiceStatus('原录音无法读取，请重新录音后再试。','error');return;
@@ -558,6 +587,8 @@ async function loadConversation(){
     if(x.j.conversation){
       const pending=conversationHasPendingReply(x.j.conversation);
       syncConversation(x.j.conversation,{speak:false});
+      const globalTrial=await globalThis.HealthLocal?.trialVoiceState?.();
+      if(x.j.conversation.trial_control||globalTrial&&globalTrial.state!=='completed'){const control=globalTrial?.state==='stopped'?globalTrial:x.j.conversation.trial_control||globalTrial;setVoiceStatus(trialVoiceMessage(control),control.state==='stopped'?'error':'ok');return}
       if(!pending){setVoiceStatus('上次说到这里，您可以接着说。','ok');return}
       setVoiceStatus('刚才的话已保存在本机，正在尝试接上回复…','ok');
       const resumed=await api(`/api/conversations/${encodeURIComponent(x.j.conversation.conversation_id)}/resume-assistant`,{method:'POST',body:'{}'});
@@ -571,6 +602,7 @@ async function loadConversation(){
 }
 async function pauseConversation(){
   if(!activeConversation?.conversation_id)return;
+  if(activeConversation.trial_control)return;
   try{const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/pause`,{method:'POST',body:'{}'});if(x.r.ok&&x.j.conversation)activeConversation=x.j.conversation}catch{}
 }
 async function submitConversationText(text,extra={}){
@@ -776,6 +808,9 @@ function startSilenceWatch(stream){
   }catch{stopSilenceWatch();return false}
 }
 async function startVoice(){
+  if(typeof recognitionBusy!=='undefined'&&recognitionBusy.size){setVoiceStatus('这段语音还在识别或保存，请等完成。');return}
+  const trial=await globalThis.HealthLocal?.trialVoiceState?.();
+  if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),trial.state==='stopped'?'error':'ok');return}
   if(voicePermissionPending||voiceUploadPending)return;
   if(mediaRecorder?.state==='recording'||$('recordBtn').classList.contains('recording')){$('finishVoiceBtn').onclick?.();return}
   const Recorder=globalThis.MediaRecorder,getUserMedia=globalThis.navigator?.mediaDevices?.getUserMedia;
@@ -785,9 +820,14 @@ async function startVoice(){
     $('voiceHint').textContent=insecure?'当前页面不是安全连接，浏览器不开放麦克风；请使用安全连接，或到“看病资料”上传已有录音、直接输入文字':'此浏览器暂不支持直接录音；您可以到“看病资料”上传已有录音，或直接输入文字';setVoiceStatus($('voiceHint').textContent,'error');return;
   }
   globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
+  const permissionGeneration=++voicePermissionGeneration,conversationId=activeConversation?.conversation_id;
   let stream;
   try{
     stream=await getUserMedia.call(globalThis.navigator.mediaDevices,{audio:true});
+    const lateTrial=await globalThis.HealthLocal?.trialVoiceState?.();
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||lateTrial&&lateTrial.state!=='completed'||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      stream.getTracks().forEach(track=>track.stop());$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus(lateTrial&&lateTrial.state!=='completed'?trialVoiceMessage(lateTrial):$('voiceHint').textContent,lateTrial?.state==='stopped'?'error':'ok');return;
+    }
     const preferred=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(type=>typeof Recorder.isTypeSupported==='function'&&Recorder.isTypeSupported(type));
     try{mediaRecorder=preferred?new Recorder(stream,{mimeType:preferred}):new Recorder(stream)}catch{mediaRecorder=new Recorder(stream)}
     const recordingChunks=chunks;
@@ -803,6 +843,7 @@ async function startVoice(){
   }finally{voicePermissionPending=false;setRecording(mediaRecorder?.state==='recording');updateTimer()}
 }
 function stopVoice(reason){
+  voicePermissionGeneration++;
   if(mediaRecorder?.state==='recording')elapsedMs+=Date.now()-startedAt;
   clearInterval(timerId);timerId=null;stopSilenceWatch();
   let failed=false;

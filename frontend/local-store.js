@@ -21,6 +21,21 @@
   const conversationWrites = new Map();
   const eventWrites = new Map();
   const mediaWrites = new Map();
+  const TRIAL_VOICE_KEY = 'trial-control:voice';
+  function trialMarker(body) {
+    if (!Object.prototype.hasOwnProperty.call(body || {}, 'trial_control')) return null;
+    const marker = body.trial_control;
+    const valid = marker && typeof marker === 'object' && !Array.isArray(marker)
+      && marker.review_required === true && Object.keys(marker).every(key => ['review_required', 'stopped'].includes(key))
+      && (!Object.prototype.hasOwnProperty.call(marker, 'stopped') || marker.stopped === true);
+    return { review_required: true, state: valid && marker.stopped !== true ? 'review_required' : 'stopped' };
+  }
+  async function trialVoiceState() { return await vault.get(TRIAL_VOICE_KEY) || null; }
+  async function saveTrialConversation(conversation, control) {
+    const saved = { ...conversation, trial_control: control, version: conversation.version + 1, updated_at: now() };
+    await vault.mutate({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }, { key: TRIAL_VOICE_KEY, value: control }] });
+    return saved;
+  }
 
   function apiUrl(path) { return globalThis.BingliConfig?.apiUrl(path) || path; }
 
@@ -420,7 +435,7 @@
     if (!mediaId) return false;
     return withMediaLock(mediaId, async () => {
       const media = await vault.get(mediaKey(mediaId));
-      if (!media || media.kind !== 'audio' || media.temporary !== true || media.recognition_status !== 'succeeded' || media.recognition?.is_mock || mockSource(media.recognition)) return false;
+      if (!media || media.trial_control || media.kind !== 'audio' || media.temporary !== true || media.recognition_status !== 'succeeded' || media.recognition?.is_mock || mockSource(media.recognition)) return false;
       await vault.mutate({ deletes: [mediaBinaryKey(mediaId), mediaKey(mediaId)] });
       return true;
     });
@@ -540,11 +555,27 @@
   }
 
   async function cloudRequest(path, options = {}) {
+    const voice = path === '/api/ai/conversation-turn' || (path === '/api/ai/media/recognize' && options.body?.get?.('kind') === 'audio');
+    const blockedVoice = async () => {
+      if (!voice) return null;
+      const trial = await trialVoiceState(), owner = options.trialVoiceContinue;
+      if (owner) {
+        const conversation = await vault.get(conversationKey(owner.conversation_id));
+        const control = conversation?.trial_control;
+        const sameOwner = value => value?.state === 'continuing' && value.conversation_id === owner.conversation_id
+          && value.turn_id === owner.turn_id && value.turn_version === owner.turn_version && value.media_id === owner.media_id;
+        if (!sameOwner(trial) || !sameOwner(control) || conversation.version !== owner.conversation_version) return fail(409, trial?.state === 'stopped' ? 'trial_stopped' : 'trial_review_required');
+      } else if (trial && trial.state !== 'completed') return fail(409, trial.state === 'stopped' ? 'trial_stopped' : 'trial_review_required');
+      return null;
+    };
+    const blocked = await blockedVoice(); if (blocked) return blocked;
+    const { trialVoiceContinue, ...transportOptions } = options;
     // Read the current HttpOnly session before each operation; never retain a token
     // in a backup, browser storage or a second UI password flow.
     const csrf = await onlineSession();
     if (!csrf) return fail(401, 'session_unavailable', { retryable: true });
-    return cloudFetch(path, { ...options, headers: { ...options.headers, 'X-CSRF-Token': csrf } });
+    const lateBlocked = await blockedVoice(); if (lateBlocked) return lateBlocked;
+    return cloudFetch(path, { ...transportOptions, headers: { ...options.headers, 'X-CSRF-Token': csrf } });
   }
 
   async function readEvent(recordId) {
@@ -870,14 +901,15 @@
     return saveConversation(current);
   }
 
-  async function conversationReply(conversation) {
+  async function conversationReply(conversation, trialContinue = false) {
+    if (conversation.trial_control && !trialContinue) return fail(409, 'trial_review_required');
     const latest = elderTurns(conversation).at(-1);
     if (latest?.local_safety?.danger_detected) {
       return ok(200, { action: 'urgent', assistant_text: safety.DANGER_REMINDER,
         provider: 'LocalDangerRule', stop_reason: 'urgent_rule',
         controller: { ...conversation.controller, last_question_category: null } });
     }
-    return cloudRequest('/api/ai/conversation-turn', { method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)) });
+    return cloudRequest('/api/ai/conversation-turn', { method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)), ...(trialContinue ? { trialVoiceContinue: { ...conversation.trial_control, conversation_version: conversation.version } } : {}) });
   }
 
   async function conversationRequest(path, options, locked = false, sourceLocked = false) {
@@ -988,9 +1020,29 @@
         return ok(200, { ok: true, conversation: await saveConversation(updated) });
       })();
     }
+    if (parts[3] === 'trial-continue' && method === 'POST') {
+      let latest = await vault.get(conversationKey(conversationId));
+      const control = latest?.trial_control, global = await trialVoiceState();
+      if (!control || control.state !== 'review_required' || global?.state !== 'review_required' || global.turn_id !== control.turn_id) return fail(409, 'trial_stopped_or_not_pending', { conversation: latest });
+      const turn = elderTurns(latest).at(-1), event = turn?.record_id ? await readEvent(turn.record_id) : null;
+      if (Number(body.expected_version) !== latest.version || body.turn_id !== control.turn_id || Number(body.turn_version) !== control.turn_version
+        || turn?.turn_id !== control.turn_id || turn?.version !== control.turn_version || !event || event.raw_text !== turn.text) return fail(409, 'trial_source_changed', { conversation: latest });
+      latest = await saveTrialConversation(latest, { ...control, state: 'continuing' });
+      let result;
+      try { result = await conversationReply(latest, true); } catch { result = fail(0, 'network_unavailable'); }
+      const marker = trialMarker(result.j);
+      if (marker?.state === 'stopped') result = fail(422, 'trial_stopped');
+      latest = await appendAssistantResult(latest, result);
+      latest = await saveTrialConversation(latest, { ...control, state: latest.last_ai_metadata?.ai_failed ? 'stopped' : 'completed' });
+      const media = await vault.get(mediaKey(control.media_id));
+      if (media) await vault.put(mediaKey(control.media_id), { ...media, trial_control: latest.trial_control });
+      return ok(latest.trial_control.state === 'completed' ? 200 : 202, { ok: true, conversation: latest, ai_failed: latest.trial_control.state === 'stopped', trial_control: latest.trial_control });
+    }
     if (parts[3] === 'resume-assistant' && method === 'POST') {
       return (async () => {
         let latest = excludeMockFacts(await vault.get(conversationKey(conversationId)));
+        const trial = await trialVoiceState();
+        if (latest?.trial_control || trial && trial.state !== 'completed') return ok(200, { ok: true, conversation: latest, trial_control: latest?.trial_control || trial, recovered: false });
         const pending = pendingElderTurn(latest);
         if (!pending) return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest });
         const result = await conversationReply(latest);
@@ -1014,6 +1066,12 @@
         const saved = await vault.get(conversationKey(replay.conversation_id));
         return ok(200, { ok: true, created: false, conversation: saved, turn_id: replay.turn_id });
       }
+      const sourceMedia = body.media_id ? await vault.get(mediaKey(body.media_id)) : null;
+      const controlled = sourceMedia?.trial_control;
+      const trial = await trialVoiceState();
+      if (trial && trial.state !== 'completed' && !controlled) return fail(409, trial.state === 'stopped' ? 'trial_stopped' : 'trial_review_required');
+      if (conversation.trial_control && !controlled) return fail(409, 'trial_review_required');
+      if (controlled && (sourceMedia.conversation_id !== conversationId || sourceMedia.record_id !== body.record_id || sourceMedia.recognition?.text !== text)) return fail(409, 'trial_source_changed');
       if (Number(body.expected_version) !== conversation.version) return fail(409, 'stale_conversation');
       let event;
       if (body.record_id) event = await readEvent(body.record_id);
@@ -1041,8 +1099,9 @@
         active_episode_start_turn_id: null,
       };
       withUser.report = buildConversationReport(withUser, conversation.report);
-      conversation = await saveConversation(withUser);
+      conversation = controlled ? await saveTrialConversation({ ...withUser, status: 'paused' }, { ...controlled, conversation_id: conversationId, turn_id: userTurn.turn_id, turn_version: userTurn.version, media_id: body.media_id }) : await saveConversation(withUser);
       await vault.put(`operation:conversation-turn:${operationKey}`, { conversation_id: conversationId, turn_id: userTurn.turn_id });
+      if (controlled) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id, trial_control: conversation.trial_control });
       const result = await conversationReply(conversation);
       conversation = await appendAssistantResult(conversation, result);
       if (body.keep_media_until_pause !== true) await cleanupTemporaryAudio(body.media_id);
@@ -1090,17 +1149,22 @@
       const persisted = current.record_id ? await withEventLock(current.record_id, persistCorrection) : await persistCorrection();
       if (!persisted.r.ok) return persisted;
       conversation = persisted.j.conversation;
+      if (conversation.trial_control) {
+        const changed = conversation.turns.find(turn => turn.turn_id === turnId);
+        conversation = await saveTrialConversation(conversation, { ...conversation.trial_control, turn_version: changed.version });
+        return ok(200, { ok: true, conversation, trial_control: conversation.trial_control });
+      }
       const result = await conversationReply(conversation);
       conversation = await appendAssistantResult(conversation, result);
       return ok(200, { ok: true, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation });
     }
     if (parts[3] === 'pause' && method === 'POST') {
-      for (const turn of elderTurns(conversation)) await cleanupTemporaryAudio(turn.media_id);
+      if (!conversation.trial_control) for (const turn of elderTurns(conversation)) await cleanupTemporaryAudio(turn.media_id);
       conversation = await saveConversation({ ...conversation, status: 'paused' });
       return ok(200, { ok: true, conversation });
     }
     if (parts[3] === 'finish' && method === 'POST') {
-      for (const turn of elderTurns(conversation)) await cleanupTemporaryAudio(turn.media_id);
+      if (!conversation.trial_control) for (const turn of elderTurns(conversation)) await cleanupTemporaryAudio(turn.media_id);
       conversation = await saveConversation({ ...conversation, status: 'finished' });
       return ok(200, { ok: true, conversation });
     }
@@ -1108,6 +1172,11 @@
   }
 
   function mediaPublic(media) {
+    if (media.trial_control) {
+      if (['failed', 'interrupted'].includes(media.recognition_status)) return { ...media, recognition: { ...media.recognition,
+        retryable: false, manual_retry_after_authorization: false, error: { ...media.recognition?.error, retryable: false } } };
+      return { ...media };
+    }
     if (media.link_pending_reason === 'conversation_link_pending' && Date.now() - (Date.parse(media.updated_at || media.created_at) || 0) >= 120000) {
       return { ...media, link_pending_reason: null, conversation_link_error: 'conversation_link_interrupted' };
     }
@@ -1197,16 +1266,22 @@
     if (!media) return fail(404, 'media_not_found');
     if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, media: mediaPublic(media) });
     if (parts[3] === 'recognize' && method === 'POST') {
-      return withRecognitionLocks(media, async () => {
+      return withRecognitionLocks(media, () => withMediaLock('voice-recognition-start', async () => {
         const current = await vault.get(mediaKey(mediaId));
         if (!current) return fail(404, 'media_not_found');
         if (current.conversation_id && !(await vault.get(conversationKey(current.conversation_id)))) return fail(404, 'conversation_not_found');
         if (mediaPublic(current).recognition_status === 'processing') return ok(202, { ok: true, action: 'existing', media: mediaPublic(current) });
+        if (current.kind === 'audio') {
+          const trial = await trialVoiceState();
+          if (trial && trial.state !== 'completed') return fail(409, trial.state === 'stopped' ? 'trial_stopped' : 'trial_review_required', { media: mediaPublic(current) });
+          if (current.recognition_status === 'succeeded' && current.trial_control) return ok(200, { ok: true, media: mediaPublic(current) });
+          if ((await mediaList()).some(item => item.media_id !== mediaId && item.kind === 'audio' && item.recognition_status === 'processing')) return fail(409, 'audio_recognition_in_progress', { media: mediaPublic(current) });
+        }
         const processing = { ...current, recognition_status: 'processing', version: current.version + 1, updated_at: now(), recognition: null };
         await vault.put(mediaKey(mediaId), processing);
         processRecognition(processing);
         return ok(202, { ok: true, action: 'started', media: mediaPublic(processing) });
-      });
+      }));
     }
     if (parts[3] === 'link' && method === 'POST') {
       if (media.recognition?.is_mock || mockSource(media.recognition)) return fail(409, 'media_mock_unavailable');
@@ -1229,12 +1304,16 @@
 
   async function processRecognition(media) {
     pendingLocalOperations += 1;
+    let recognitionTrial = null;
     try {
       const original = await vault.get(mediaBinaryKey(media.media_id));
       if (!original?.bytes) throw Object.assign(new Error('original_unavailable'), { code: 'original_unavailable' });
       const form = new FormData(); form.append('kind', media.kind); form.append('content_type', media.content_type); form.append('attempt_id', id('attempt')); form.append('file', new Blob([original.bytes], { type: media.content_type }), media.original_filename);
       const result = await cloudRequest('/api/ai/media/recognize', { method: 'POST', body: form });
-      if (!result.r.ok) throw Object.assign(new Error(result.j.error || 'recognition_failed'), { code: result.j.error, retryable: result.j.retryable === true });
+      const trial = media.kind === 'audio' ? trialMarker(result.j) : null;
+      recognitionTrial = trial;
+      if (trial) await vault.put(TRIAL_VOICE_KEY, { ...trial, media_id: media.media_id, conversation_id: media.conversation_id });
+      if (!result.r.ok) throw Object.assign(new Error(result.j.error || 'recognition_failed'), { code: result.j.error, retryable: result.j.retryable === true, trial_control: trial });
       if (result.j.recognition?.is_mock || mockSource(result.j.recognition)) throw Object.assign(new Error('media_mock_unavailable'), { code: 'media_mock_unavailable', retryable: true });
       if (!result.j.recognition?.text?.trim()) throw Object.assign(new Error('recognition_empty'), { code: 'recognition_empty', retryable: true });
       await withRecognitionLocks(media, async () => {
@@ -1248,7 +1327,7 @@
         const created = await createEvent({ raw_text: result.j.recognition.text, source_kind: media.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户',
           ...(media.temporary === true && media.conversation_id ? { source_conversation_id: media.conversation_id } : {}) }, `media-real-link:${media.media_id}`);
         if (!created.r.ok) throw Object.assign(new Error(created.j.error), { code: created.j.error });
-        let updated = { ...current, recognition_status: 'succeeded', recognition: result.j.recognition, local_safety: created.j.event.local_safety, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', link_pending_reason: media.temporary === true && media.conversation_id ? 'conversation_link_pending' : null, conversation_link_error: null, version: current.version + 1, updated_at: now() };
+        let updated = { ...current, ...(trial ? { trial_control: trial } : {}), recognition_status: 'succeeded', recognition: result.j.recognition, local_safety: created.j.event.local_safety, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', link_pending_reason: media.temporary === true && media.conversation_id ? 'conversation_link_pending' : null, conversation_link_error: null, version: current.version + 1, updated_at: now() };
         await vault.put(mediaKey(media.media_id), updated);
         if (updated.temporary === true && updated.conversation_id) {
           // This internal source is already owned by the conversation lock.
@@ -1267,6 +1346,7 @@
         }
       });
     } catch (error) {
+      if (recognitionTrial) error.trial_control = { ...recognitionTrial, state: 'stopped' };
       if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
         active = false; initialisePromise = null;
         return;
@@ -1275,12 +1355,13 @@
         const current = await vault.get(mediaKey(media.media_id));
         if (!current || current.version !== media.version || current.recognition_status !== 'processing') return;
         if (media.conversation_id && !(await vault.get(conversationKey(media.conversation_id)))) return;
-        const retryable = error.retryable === true || RECOVERABLE_MEDIA_ERRORS.has(error.code);
+        const retryable = !error.trial_control && (error.retryable === true || RECOVERABLE_MEDIA_ERRORS.has(error.code));
         const message = error.code === 'original_unavailable' ? '原录音已无法读取，不能重新识别。请重新录音；此前的模拟结果不是真实转写。'
           : error.code === 'media_mock_unavailable' ? '语音或照片识别尚未接通，原件已保存在本机；接通真实服务后可重试。'
           : retryable ? '识别没有完成，原件已保存在本机，可以重试。' : '识别没有完成，原件已保存在本机。';
-        const updated = { ...current, recognition_status: 'failed', recognition: { error_message: message, error: { code: error.code || 'recognition_failed', retryable }, retryable }, version: current.version + 1, updated_at: now() };
+        const updated = { ...current, ...(error.trial_control ? { trial_control: { ...error.trial_control, state: 'stopped' } } : {}), recognition_status: 'failed', recognition: { error_message: message, error: { code: error.code || 'recognition_failed', retryable }, retryable }, version: current.version + 1, updated_at: now() };
         await vault.put(mediaKey(media.media_id), updated);
+        if (error.trial_control) await vault.put(TRIAL_VOICE_KEY, { ...error.trial_control, state: 'stopped', media_id: media.media_id, conversation_id: media.conversation_id });
       });
     } finally { pendingLocalOperations -= 1; }
   }
@@ -1411,6 +1492,7 @@
     restoreBackup,
     saveFeedback,
     storageStatus,
+    trialVoiceState,
     vault,
   };
 })();
