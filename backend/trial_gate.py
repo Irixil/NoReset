@@ -1027,12 +1027,19 @@ def confirm_trial_review(attempt_id, approval_ref, *, state_path=STATE_PATH):
 
 
 def _save_transport_metadata(connection, ident, metadata):
-    if (not isinstance(metadata, dict) or set(metadata) - {'trace_id', 'response_sha256', 'response_bytes', 'protocol'}
+    provenance = {'usage_normalization', 'original_usage_sha256', 'request_sha256'}
+    if (not isinstance(metadata, dict) or set(metadata) - {'trace_id', 'response_sha256', 'response_bytes', 'protocol', *provenance}
             or len(_snapshot(metadata).encode()) > 2048
             or 'trace_id' in metadata and (not isinstance(metadata['trace_id'], str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,256}', metadata['trace_id']))
             or 'response_sha256' in metadata and (not isinstance(metadata['response_sha256'], str) or not HASH.fullmatch(metadata['response_sha256']))
             or 'response_bytes' in metadata and (type(metadata['response_bytes']) is not int or not 0 <= metadata['response_bytes'] <= 2 * 1024 * 1024)
             or 'protocol' in metadata and metadata['protocol'] not in {'openai', 'gemini', 'chat_completions'}):
+        _deny()
+    if provenance & set(metadata) and (not provenance <= set(metadata)
+            or metadata['usage_normalization'] != 'deepseek_nonthinking_omitted_reasoning_v1'
+            or metadata.get('protocol') != 'openai'
+            or any(not isinstance(metadata[k], str) or not HASH.fullmatch(metadata[k]) for k in provenance - {'usage_normalization'})
+            or connection.execute('SELECT request_sha256 FROM attempts WHERE id=?', (ident,)).fetchone() != (metadata['request_sha256'],)):
         _deny()
     connection.execute('CREATE TABLE IF NOT EXISTS transport_metadata (attempt_id INTEGER PRIMARY KEY, metadata_json TEXT NOT NULL)')
     old = connection.execute('SELECT metadata_json FROM transport_metadata WHERE attempt_id=?', (ident,)).fetchone()

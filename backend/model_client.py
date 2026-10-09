@@ -74,6 +74,44 @@ def strict_json_loads(text: str) -> Any:
         raise ModelClientError('模型返回不是有效 JSON') from None
 
 
+def parse_completion_envelope(response_data: dict) -> dict:
+    """Pure existing response-content parser; no transport, usage or authority.
+
+    Saved-response processing does not verify a historical usage or grant a new
+    request. Callers must preserve its provenance and match the original inputs.
+    """
+    if not isinstance(response_data, dict):
+        raise ModelClientError('模型响应必须是 JSON 对象')
+    if response_data.get('error'):
+        raise ModelClientError('模型响应报告错误')
+    choices = response_data.get('choices')
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise ModelClientError('模型响应必须包含一条完整 choice')
+    choice = choices[0]
+    if choice.get('finish_reason') == 'length':
+        raise ModelClientError('模型输出因 token 上限被截断', code='model_output_truncated')
+    if choice.get('finish_reason') != 'stop':
+        raise ModelClientError('模型未正常完成文本输出')
+    message = choice.get('message')
+    if not isinstance(message, dict) or message.get('refusal') or message.get('tool_calls') or message.get('function_call'):
+        raise ModelClientError('模型响应未提供可用文本消息')
+    # Preserve existing relay compatibility: an omitted role is accepted; a
+    # supplied role must be assistant. Meter normalization is stricter.
+    if 'role' in message and message['role'] != 'assistant':
+        raise ModelClientError('模型响应 role 必须为 assistant')
+    content = message.get('content')
+    if not isinstance(content, str) or not content.strip():
+        raise ModelClientError('模型返回 content 为空或不是文本')
+    content = content.strip()
+    fence = re.fullmatch(r'```(?:json)?\s*\n(.*?)\n```', content, re.DOTALL)
+    if fence:
+        content = fence.group(1)
+    result = strict_json_loads(content)
+    if not isinstance(result, dict):
+        raise ModelClientError('模型输出必须为 JSON 对象')
+    return result
+
+
 def validate_extra_body(value: Any) -> dict:
     if value is None:
         return {}
@@ -171,6 +209,71 @@ def _trial_stop(request, reason_code):
         trial_gate.stop_trial(attempt, reason_code, state_path=state_path)
 
 
+def _deepseek_nonthinking_usage(request, envelope, usage):
+    """Future official non-thinking omission compatibility, not fee telemetry.
+
+    DeepSeek's official non-stream example omits completion reasoning details.
+    Derive zero only from its explicit mode contract plus a complete consistent
+    response; never mutate the raw envelope or repair explicit invalid details.
+    """
+    models = {'deepseek-flash', 'deepseek-v4-flash'}
+    profile = getattr(request, '_noreset_trial_profile', None)
+    if (request.full_url != 'https://api.deepseek.com/chat/completions' or request.get_method() != 'POST'
+            or not isinstance(profile, dict) or profile.get('kind') != 'llm' or profile.get('provider') != 'deepseek'
+            or profile.get('model') not in models or envelope.get('model') not in models or envelope.get('error')
+            or any(k in envelope for k in ('reasoning_content', 'thinking', 'thoughts', 'tool_calls'))
+            or not isinstance(usage, dict)):
+        return usage, {}
+    details = usage.get('completion_tokens_details')
+    if 'completion_tokens_details' in usage and details != {}:
+        return usage, {}  # Includes explicit 0, null, bool and nonzero: preserve.
+    try:
+        body = strict_json_loads(request.data.decode('utf-8'))
+    except (ModelClientError, AttributeError, UnicodeError):
+        return usage, {}
+    if (not isinstance(body, dict) or body.get('model') != profile['model']
+            or body.get('thinking') != {'type': 'disabled'} or body.get('stream') is not False
+            or set(body) - {'model', 'temperature', 'stream', 'max_tokens', 'messages', 'response_format', 'thinking'}):
+        return usage, {}  # Unknown flags, tools and contradictory effort disallow inference.
+    choices = envelope.get('choices')
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        return usage, {}
+    choice = choices[0]; message = choice.get('message'); logprobs = choice.get('logprobs')
+    if (choice.get('finish_reason') != 'stop' or not isinstance(message, dict)
+            or set(choice) - {'index', 'finish_reason', 'message', 'logprobs'}
+            or message.get('role') != 'assistant' or not isinstance(message.get('content'), str) or not message['content'].strip()
+            or set(message) - {'role', 'content', 'reasoning_content', 'tool_calls', 'function_call'}
+            or message.get('reasoning_content') not in (None, '')
+            or message.get('tool_calls') not in (None, []) or message.get('function_call') is not None
+            or logprobs is not None and not isinstance(logprobs, dict)
+            or isinstance(logprobs, dict) and logprobs.get('reasoning_content') not in (None, [])):
+        return usage, {}
+    fields = ('prompt_tokens', 'completion_tokens', 'total_tokens')
+    if (any(type(usage.get(k)) is not int or usage[k] < 0 for k in fields)
+            or usage['total_tokens'] != usage['prompt_tokens'] + usage['completion_tokens']
+            or set(usage) - {*fields, 'prompt_tokens_details', 'prompt_cache_hit_tokens',
+                            'prompt_cache_miss_tokens', 'completion_tokens_details'}):
+        return usage, {}
+    cache = ('prompt_cache_hit_tokens', 'prompt_cache_miss_tokens')
+    if any(k in usage for k in cache):
+        if (any(type(usage.get(k)) is not int or usage[k] < 0 for k in cache)
+                or sum(usage[k] for k in cache) != usage['prompt_tokens']):
+            return usage, {}
+    if 'prompt_tokens_details' in usage:
+        prompt_details = usage['prompt_tokens_details']
+        if (not isinstance(prompt_details, dict) or set(prompt_details) != {'cached_tokens'}
+                or type(prompt_details['cached_tokens']) is not int or prompt_details['cached_tokens'] < 0
+                or type(usage.get('prompt_cache_hit_tokens')) is not int
+                or prompt_details['cached_tokens'] != usage['prompt_cache_hit_tokens']):
+            return usage, {}
+    original = json.dumps(usage, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    normalized = copy.deepcopy(usage)
+    normalized['completion_tokens_details'] = {'reasoning_tokens': 0}
+    return normalized, {'usage_normalization': 'deepseek_nonthinking_omitted_reasoning_v1',
+                        'original_usage_sha256': hashlib.sha256(original).hexdigest(),
+                        'request_sha256': hashlib.sha256(request.data).hexdigest()}
+
+
 def _trial_report(request, envelope, raw, *, protocol='openai'):
     """Only the actual reserved request can report its own bounded response."""
     attempt = getattr(request, '_noreset_trial_attempt_id', None)
@@ -181,6 +284,7 @@ def _trial_report(request, envelope, raw, *, protocol='openai'):
         raise ModelClientError('试验计量状态无效', code='trial_authorization_required')
     if not isinstance(envelope, dict):
         raise ModelClientError('合成试验用量无法验证', code='trial_authorization_required')
+    normalization = {}
     if protocol == 'gemini':
         model, usage = envelope.get('modelVersion'), envelope.get('usageMetadata')
         fields = ('promptTokenCount', 'candidatesTokenCount', 'totalTokenCount')
@@ -196,7 +300,10 @@ def _trial_report(request, envelope, raw, *, protocol='openai'):
         trace = envelope.get('responseId')
     else:
         model, usage, trace = envelope.get('model'), envelope.get('usage'), envelope.get('id')
+        if protocol == 'openai':
+            usage, normalization = _deepseek_nonthinking_usage(request, envelope, usage)
     metadata = {'response_sha256': hashlib.sha256(raw).hexdigest(), 'response_bytes': len(raw), 'protocol': protocol}
+    metadata.update(normalization)
     secrets = [value.removeprefix('Bearer ') for key, value in request.header_items()
                if key.lower() in {'authorization', 'x-goog-api-key'}]
     if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}', model) or any(secret and secret in model for secret in secrets):
@@ -342,33 +449,4 @@ class ChatCompletionsClient:
         if not isinstance(response_data, dict):
             raise ModelClientError('模型响应必须是 JSON 对象')
         _trial_report(request, response_data, raw)
-        if response_data.get('error'):
-            raise ModelClientError('模型响应报告错误')
-        choices = response_data.get('choices')
-        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-            raise ModelClientError('模型响应必须包含一条完整 choice')
-        choice = choices[0]
-        if choice.get('finish_reason') == 'length':
-            raise ModelClientError('模型输出因 token 上限被截断', code='model_output_truncated')
-        if choice.get('finish_reason') != 'stop':
-            raise ModelClientError('模型未正常完成文本输出')
-        message = choice.get('message')
-        if not isinstance(message, dict) or message.get('refusal') or message.get('tool_calls') or message.get('function_call'):
-            raise ModelClientError('模型响应未提供可用文本消息')
-        # Some compatible relays omit role. If supplied, it must identify an
-        # assistant response rather than echoing user/system input as output.
-        if 'role' in message and message['role'] != 'assistant':
-            raise ModelClientError('模型响应 role 必须为 assistant')
-        content = message.get('content')
-        if not isinstance(content, str) or not content.strip():
-            raise ModelClientError('模型返回 content 为空或不是文本')
-        content = content.strip()
-        # Retain the existing whole-message fenced-JSON compatibility. No prose,
-        # partial fences or trailing content is stripped or repaired.
-        fence = re.fullmatch(r'```(?:json)?\s*\n(.*?)\n```', content, re.DOTALL)
-        if fence:
-            content = fence.group(1)
-        result = strict_json_loads(content)
-        if not isinstance(result, dict):
-            raise ModelClientError('模型输出必须为 JSON 对象')
-        return result
+        return parse_completion_envelope(response_data)
