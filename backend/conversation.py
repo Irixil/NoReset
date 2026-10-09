@@ -363,6 +363,19 @@ def _source_excerpt(text: str, category: str | None = None) -> str:
     return "；".join(excerpts)
 
 
+def _unperformed_action_excerpt(text: str) -> str:
+    """A stated unperformed action is a fact; it is not a normal result."""
+    values = []
+    for match in re.finditer(r"[^，。！？；,.!?;\n]+[，。！？；,.!?;]?", text):
+        clause = match.group().strip()
+        if re.fullmatch(
+            r"(?:我)?(?:还没有|尚未|并未|没有|还没|没|未)"
+            r"(?:量|测|做|查|检查)(?:过)?[^，。！？；,.!?;\n]+[，。；,.;]?", clause,
+        ) and not _EXPLICIT_UNKNOWN.search(clause):
+            values.append(clause)
+    return "；".join(dict.fromkeys(values))
+
+
 def _literal_corrections(ref: str, turns: list[dict[str, Any]]):
     positions = {row["turn_id"]: index for index, row in enumerate(turns)}
     position = positions[ref]
@@ -386,6 +399,9 @@ def _literal_corrections(ref: str, turns: list[dict[str, Any]]):
 def _current_source_excerpt(ref: str, category: str, turns: list[dict[str, Any]]) -> str:
     source = next(row["text"] for row in turns if row["turn_id"] == ref)
     excerpt = _source_excerpt(source, category)
+    if category == "prior_actions_results":
+        return "；".join(dict.fromkeys(value for value in
+                          (excerpt, _unperformed_action_excerpt(source)) if value))
     if category in {"relevant_history", "prior_actions_results", "unknown", None}:
         return excerpt
     for old, pattern, occurrences, is_correction in _literal_corrections(ref, turns):
@@ -400,8 +416,12 @@ def _current_source_excerpt(ref: str, category: str, turns: list[dict[str, Any]]
         # Keep only still-supported category fragments, never paste new words
         # into an old quote. Ambiguous attributes remain unassigned; raw history
         # retains every occurrence and other source clauses stay available.
-        excerpt = "；".join(part.strip("，。；,; ") for part in pattern.split(excerpt)
-                           if _PATTERNS[category].search(part))
+        # Split the existing extract into clauses before removing an old
+        # attribute. Otherwise a dangling suffix such as "了" can borrow a
+        # match from a separate unchanged evening clause and become a fact.
+        excerpt = "；".join(part.strip() for clause in re.split(r"[，。！？；,.!?;\n]", excerpt)
+                           for part in pattern.split(clause)
+                           if part.strip() and _PATTERNS[category].search(part))
     return excerpt
 
 
@@ -447,6 +467,54 @@ def _source_summary(
     return "；".join(result)
 
 
+def _bound_answer_corrections(answers: list[dict[str, Any]], turns: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Resolve only an explicit, uniquely targeted literal answer correction.
+
+    The complete declared subject comes from patient syntax, not a symptom
+    inventory. Ambiguous or explicitly unknown targets retire the old answer
+    without authorizing a new known fact. Full sentences preserve time and
+    negation; the actual new responding_to stays separate from the old question.
+    """
+    positions = {row["turn_id"]: index for index, row in enumerate(turns)}
+    resolved = {}
+    for index, row in enumerate(turns):
+        for match in re.finditer(r"[^。！？；.!?;\n]+[。！？；.!?;]?", row["text"]):
+            sentence = match.group().strip()
+            marker = re.search(r"说错了|改一下|更正|纠正", sentence)
+            if not marker or re.search(
+                r"如果|假如|假设|(?<!主)要是|会不会|[？?]|(?:没|没有|未)(?:说|更正|改|表示)|"
+                r"(?:医生|药师|家属|别人|他|她).{0,6}(?:说|建议|嘱咐|提到)", sentence,
+            ):
+                continue
+            targets = []
+            for clause in re.split(r"[，,]", sentence[marker.end():].strip("，, ")):
+                copula = re.fullmatch(r"(?P<subject>[^，。！？；,.!?;]{1,24})是[^，。！？；,.!?;]+[。.;]?", clause.strip())
+                if not copula:
+                    continue
+                subject = copula.group("subject").strip()
+                # These are grammatical qualifiers/pronouns, not a declared
+                # attribute. Never discover a target from arbitrary n-grams.
+                if subject in {"我", "它", "这", "那", "有", "无", "不", "没", "未", "没有",
+                               "主要", "大多", "通常", "一般", "偶尔", "本来", "现在", "今天", "昨天", "前天", "以前"}:
+                    continue
+                owners = [answer for answer in answers
+                          if positions.get(answer["turn_id"], len(turns)) < index
+                          and subject in answer["quote"]]
+                if owners:
+                    targets.append(owners)
+            if not targets:
+                continue
+            unique = len(targets) == 1 and len(targets[0]) == 1
+            fact = sentence if unique and len(row["text"]) <= 120 and not (
+                _EXPLICIT_UNKNOWN.search(sentence) or _META_FEEDBACK.search(sentence)
+                or _DIAGNOSIS_REQUEST.search(sentence) or _unsafe_reply(sentence)
+            ) else ""
+            for owners in targets:
+                for answer in owners:
+                    resolved[answer["category"]] = {"source": row, "excerpt": fact}
+    return resolved
+
+
 def _ground_clinical_state(
         state: dict[str, dict[str, Any]], turns: list[dict[str, Any]],
         health_context: list[dict[str, str]], controller: dict[str, Any],
@@ -456,11 +524,51 @@ def _ground_clinical_state(
     latest = turns[-1]
     last_category = controller.get("last_question_category")
     negative_categories = {"aggravating_relieving", "associated_symptoms", "relevant_history", "prior_actions_results"}
+    # A keyword-free answer remains evidence for the question it answered.
+    # Bind the complete patient source, never the model's summary or question
+    # text as a patient fact. Edits and corrections invalidate the old binding.
+    sources = {row["turn_id"]: row for row in turns}
+    origins = [item for item in controller.get("grounded_answers", [])
+               if item["turn_id"] in sources
+               and sources[item["turn_id"]].get("version", 1) == item["version"]
+               and sources[item["turn_id"]]["text"] == item["quote"]
+               and sources[item["turn_id"]].get("responding_to") == item["responding_to"]
+               and item["question"] in controller["asked_questions"]
+               and item["category"] in controller["asked_categories"]
+               and controller["question_counts"].get(item["category"], 0) > 0
+               and not list(_literal_corrections(item["turn_id"], turns))]
+    corrections = _bound_answer_corrections(origins, turns)
+    answers = []
+    for answer in origins:
+        correction = answer.get("correction")
+        if correction:
+            source = sources.get(correction["turn_id"])
+            if not (source and source.get("version", 1) == correction["version"]
+                    and source["text"] == correction["quote"]
+                    and source.get("responding_to") == correction["responding_to"]):
+                continue
+        answers.append(answer)
+    if answers:
+        controller["grounded_answers"] = answers
+    else:
+        controller.pop("grounded_answers", None)
 
     for category in CATEGORIES:
         item = state[category]
         refs = [ref for ref in item["evidence_turn_ids"] if ref in turn_text]
         contexts = item["context_ids"] if category == "relevant_history" else []
+        targeted = corrections.get(category)
+        retired_refs = {answer["turn_id"] for answer in origins
+                        if answer["category"] == category and (targeted or answer.get("correction"))}
+        if item["status"] == "known" and targeted and targeted["excerpt"] and targeted["source"]["turn_id"] in refs:
+            for answer in answers:
+                if answer["category"] == category:
+                    source = targeted["source"]
+                    answer["correction"] = {
+                        "turn_id": source["turn_id"], "version": source.get("version", 1),
+                        "quote": source["text"], "responding_to": source.get("responding_to"),
+                    }
+                    controller["grounded_answers"] = answers
 
         short_answer = (
             category == last_category
@@ -470,10 +578,23 @@ def _ground_clinical_state(
             and not _DIAGNOSIS_REQUEST.search(latest["text"])
             and not _DECLINED.search(latest["text"])
             and not re.search(r"[？?]", latest["text"])
+            and model_intent not in {"correction", "explicit_finish"}
+            and not _CORRECTION.search(latest["text"])
             and not _EXPLICIT_FINISH.fullmatch(latest["text"].strip())
             and not _source_excerpt(latest["text"], category)
         )
         if short_answer and item["status"] == "known" and latest["turn_id"] in refs:
+            question = controller["asked_questions"][-1] if controller["asked_questions"] else ""
+            if (question and latest["responding_to"]["text"].endswith(question)
+                    and category in controller["asked_categories"]
+                    and controller["question_counts"].get(category, 0) > 0):
+                binding = {
+                    "category": category, "turn_id": latest["turn_id"],
+                    "version": latest.get("version", 1), "quote": latest["text"],
+                    "responding_to": dict(latest["responding_to"]), "question": question,
+                }
+                answers = [answer for answer in answers if answer["category"] != category] + [binding]
+                controller["grounded_answers"] = answers
             existing_refs = [
                 ref for ref in refs
                 if ref != latest["turn_id"]
@@ -497,7 +618,8 @@ def _ground_clinical_state(
             if category == "main_complaint" and model_intent in {"health_fact", "answer", "correction"}:
                 literal_complaint_refs = [
                     ref for ref in refs
-                    if item["summary"] == turn_text[ref].strip()
+                    if ref not in retired_refs
+                    and item["summary"] == turn_text[ref].strip()
                     and not _source_excerpt(turn_text[ref], category)
                     and not list(_literal_corrections(ref, turns))
                     and not _META_FEEDBACK.search(turn_text[ref])
@@ -506,11 +628,24 @@ def _ground_clinical_state(
                     and not _EXPLICIT_FINISH.fullmatch(turn_text[ref].strip())
                     and not re.search(r"[？?]", turn_text[ref])
                 ]
+            literal_answers = []
+            for answer in answers:
+                if answer["category"] != category:
+                    continue
+                correction = answer.get("correction")
+                if correction:
+                    if (targeted and targeted["excerpt"]
+                            and targeted["source"]["turn_id"] == correction["turn_id"]
+                            and correction["turn_id"] in refs):
+                        literal_answers.append((correction["turn_id"], targeted["excerpt"]))
+                elif not targeted and answer["turn_id"] in refs:
+                    literal_answers.append((answer["turn_id"], answer["quote"]))
+            literal_answer_refs = [ref for ref, _text in literal_answers]
             grounded_refs = [
                 ref for ref in refs
-                if not _META_FEEDBACK.search(turn_text[ref])
+                if ref not in retired_refs and not _META_FEEDBACK.search(turn_text[ref])
                 and _current_source_excerpt(ref, category, turns)
-            ] + literal_complaint_refs
+            ] + literal_complaint_refs + literal_answer_refs
             if category == "main_complaint":
                 grounded_refs = _current_main_complaint_refs(grounded_refs, turns)
             if (
@@ -525,9 +660,12 @@ def _ground_clinical_state(
             if not grounded_refs and not contexts:
                 state[category] = {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
                 continue
-            summary = _source_summary(grounded_refs, contexts, turns, health_context, category=category)
+            summary = _source_summary([ref for ref in grounded_refs if ref not in literal_answer_refs],
+                                      contexts, turns, health_context, category=category)
             if not summary and literal_complaint_refs:
                 summary = turn_text[literal_complaint_refs[0]].strip()
+            summary = "；".join(dict.fromkeys(part for part in
+                                [summary] + [text for _ref, text in literal_answers] if part))
             state[category] = {
                 "status": "known",
                 "summary": summary,
@@ -690,7 +828,7 @@ def _controller_state(value: Any) -> dict[str, Any]:
     closed = [legacy.get(item, item) for item in source.get("closed_categories", []) if legacy.get(item, item) in CATEGORIES]
     asked_questions = [str(item).strip()[:160] for item in source.get("asked_questions", []) if isinstance(item, str) and item.strip()][-12:]
     last = legacy.get(source.get("last_question_category"), source.get("last_question_category"))
-    return {
+    result = {
         "asked_categories": list(dict.fromkeys(asked)), "closed_categories": list(dict.fromkeys(closed)),
         "question_counts": counts, "asked_questions": asked_questions,
         "question_count": min(max(int(source.get("question_count", 0) or 0), 0), MAX_QUESTIONS),
@@ -698,6 +836,55 @@ def _controller_state(value: Any) -> dict[str, Any]:
         "last_question_category": last if last in CATEGORIES else None,
         "linked_context_ids": [item for item in source.get("linked_context_ids", []) if isinstance(item, str) and _CONTEXT_ID.fullmatch(item)][:30],
     }
+    if "grounded_answers" in source:
+        answers = source["grounded_answers"]
+        fields = {"category", "turn_id", "version", "quote", "responding_to", "question"}
+        if not isinstance(answers, list) or len(answers) > len(CATEGORIES):
+            raise ConversationError("controller_answer_invalid")
+        cleaned = []
+        for answer in answers:
+            if (not isinstance(answer, dict) or not fields <= set(answer) or set(answer) - fields - {"correction"}
+                    or answer.get("category") not in CATEGORIES
+                    or not isinstance(answer.get("turn_id"), str) or not _TURN_ID.fullmatch(answer["turn_id"])
+                    or type(answer.get("version")) is not int or answer["version"] < 1
+                    or not isinstance(answer.get("quote"), str) or not answer["quote"].strip() or len(answer["quote"]) > 120
+                    or not isinstance(answer.get("question"), str) or not answer["question"].strip() or len(answer["question"]) > 160
+                    or not isinstance(answer.get("responding_to"), dict) or set(answer["responding_to"]) != {"turn_id", "text"}):
+                raise ConversationError("controller_answer_invalid")
+            question_source = answer["responding_to"]
+            if (not isinstance(question_source["turn_id"], str) or not _TURN_ID.fullmatch(question_source["turn_id"])
+                    or question_source["turn_id"] == answer["turn_id"]
+                    or not isinstance(question_source["text"], str) or len(question_source["text"]) > 1000
+                    or not question_source["text"].endswith(answer["question"])
+                    or _META_FEEDBACK.search(answer["quote"]) or _DIAGNOSIS_REQUEST.search(answer["quote"])
+                    or _DECLINED.search(answer["quote"]) or re.search(r"[？?]", answer["quote"])
+                    or _EXPLICIT_FINISH.fullmatch(answer["quote"].strip())):
+                raise ConversationError("controller_answer_invalid")
+            cleaned_answer = {**answer, "responding_to": dict(question_source)}
+            if "correction" in answer:
+                correction = answer["correction"]
+                if (not isinstance(correction, dict) or set(correction) != {"turn_id", "version", "quote", "responding_to"}
+                        or not isinstance(correction.get("turn_id"), str) or not _TURN_ID.fullmatch(correction["turn_id"])
+                        or correction["turn_id"] == answer["turn_id"]
+                        or type(correction.get("version")) is not int or correction["version"] < 1
+                        or not isinstance(correction.get("quote"), str) or not correction["quote"].strip() or len(correction["quote"]) > 120):
+                    raise ConversationError("controller_answer_invalid")
+                actual_question = correction["responding_to"]
+                if actual_question is not None and (
+                    not isinstance(actual_question, dict) or set(actual_question) != {"turn_id", "text"}
+                    or not isinstance(actual_question.get("turn_id"), str) or not _TURN_ID.fullmatch(actual_question["turn_id"])
+                    or actual_question["turn_id"] == correction["turn_id"]
+                    or not isinstance(actual_question.get("text"), str) or not actual_question["text"].strip()
+                    or len(actual_question["text"]) > 1000
+                ):
+                    raise ConversationError("controller_answer_invalid")
+                cleaned_answer["correction"] = {**correction, "responding_to": dict(actual_question) if actual_question else None}
+            cleaned.append(cleaned_answer)
+        if len({answer["category"] for answer in cleaned}) != len(cleaned):
+            raise ConversationError("controller_answer_invalid")
+        if cleaned:
+            result["grounded_answers"] = cleaned
+    return result
 
 
 def _response_text(reply: str, question: str) -> str:
