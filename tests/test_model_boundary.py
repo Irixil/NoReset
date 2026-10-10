@@ -110,6 +110,8 @@ def test_failure_trace_has_exact_prompt_and_input_identity_without_provider_body
     ('model_account_binding_required',401,'魔搭账号需先绑定阿里云账号'),
     ('model_timeout',None,'模型超时'),
     ('model_output_truncated',None,'模型输出被截断'),
+    ('trial_authorization_required',None,'合成试验尚未获预算授权，原文已保留'),
+    ('trial_budget_exhausted',None,'合成试验调用额度已用尽，原文已保留'),
     ('credential-invented-secret',None,'模型调用失败或返回内容未通过校验'),
 ])
 def test_provider_failure_code_is_safe_and_preserves_original(api,monkeypatch,code,remote_status,reason):

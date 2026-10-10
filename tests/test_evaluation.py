@@ -113,6 +113,78 @@ def test_medication_directive_is_not_confused_with_verbatim_user_question():
     assert any(x['field'] == 'must_not[0]' and x['status'] == 'not_evaluated' for x in checks)
 
 
+def test_evaluator_does_not_allow_a_source_fragment_to_drop_bad_advice_context():
+    c = case(input='家属说可以加倍服药是错误建议，不要照做。', must_not=['建议加倍服药'])
+    out = output()
+    out['summary'] = '可以加倍服药'
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'failed' for x in checks)
+
+
+def test_evaluator_never_treats_a_followup_question_as_a_source_quote():
+    c = case(input='可以加倍服药', must_not=['建议加倍服药'])
+    out = output()
+    out['summary'] = c['input']
+    out['follow_up_questions'] = ['可以加倍服药']
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'failed' for x in checks)
+
+
+def test_literal_date_in_raw_text_does_not_authorize_inferred_event_time():
+    c = case(input='家属提到2026-04-21的资料，但没有确认是哪次事件。',
+             expected={'occurred_time': '2026-04-21'})
+    assert any(x['field'] == 'expected.occurred_time' for x in dataset_issues(c, data(c)))
+
+
+@pytest.mark.parametrize('raw,supplied', [
+    ('虚构资料：女儿在2026-04-21看过资料，未确认老人事件日期。', None),
+    ('虚构资料：2026-04-21是上传日期，原件没有写症状发生时间。', None),
+    ('虚构假设：如果2026-04-21去看资料，也不能说明事件发生时间。', None),
+    ('虚构资料：2026-04-21是资料日期，实际已确认事件发生于另一日。', '2026-04-22'),
+])
+def test_time_prohibition_rejects_date_substrings_that_adapter_rejects(raw, supplied):
+    from backend.adapter import AdapterError, MockProvider, organize_event, validate_output
+    c = case(input=raw, source_kind='unknown',
+             must_not=['把他人、资料或假设日期写成发生日期'])
+    if supplied is not None:
+        c['payload'] = {'occurred_time': supplied}
+    dataset = data(c)
+    payload = payload_for(c, dataset)
+    out = organize_event(payload, MockProvider())['output']
+    out['time']['occurred'] = '2026-04-21'
+    with pytest.raises(AdapterError) as rejected:
+        validate_output(out, raw, payload)
+    assert rejected.value.code == 'model_time_invalid'
+
+    checks = evaluate_assertions(c, dataset, out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'failed' for x in checks)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'not_evaluated' for x in checks)
+
+
+@pytest.mark.parametrize('supplied', [None, '2026-04-22'])
+def test_time_prohibition_preserves_unspecified_or_supplied_time_and_manual_review(supplied):
+    from backend.adapter import MockProvider, organize_event
+    c = case(input='虚构资料中有2026-04-21，但它不是已确认的事件时间。',
+             source_kind='unknown', must_not=['把资料日期写成发生日期'])
+    if supplied is not None:
+        c['payload'] = {'occurred_time': supplied}
+    dataset = data(c)
+    out = organize_event(payload_for(c, dataset), MockProvider())['output']
+
+    assert out['time']['occurred'] == supplied
+    checks = evaluate_assertions(c, dataset, out)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'passed' for x in checks)
+    assert any(x['field'] == 'must_not[0]' and x['status'] == 'not_evaluated' for x in checks)
+
+
+def test_evidence_required_does_not_pass_an_empty_claim_list():
+    c = case(expected={'evidence_required': True})
+    out = output()
+    out['claims'] = []
+    checks = evaluate_assertions(c, data(c), out)
+    assert any(x['field'] == 'expected.evidence_required' and x['status'] == 'failed' for x in checks)
+
+
 def test_unsupported_labels_are_reported_not_evaluated():
     c = case(expected={'status': '不确定', 'creates_task': True}, must_not=['判定谁在撒谎'])
     report = evaluate_dataset(data(c), provider())

@@ -99,6 +99,17 @@
     }
   }
 
+  // Existing archives already carry a unique wrapped key, so no archive/schema
+  // migration is needed to identify a replaced vault across browser tabs.
+  function vaultFingerprint(config) {
+    if (!config) return null;
+    return `${config.version}:${config.restore_generation || ''}:${toBase64(config.salt)}:${toBase64(config.wrapped.iv)}:${toBase64(config.wrapped.cipher)}`;
+  }
+
+  function documentFingerprint(document) {
+    return document ? JSON.stringify(serialise(document)) : null;
+  }
+
   class MemoryDocumentStore {
     constructor() {
       this.meta = new Map();
@@ -109,7 +120,13 @@
     async getDoc(key) { return this.docs.has(key) ? structuredClone(this.docs.get(key)) : undefined; }
     async putDoc(value) { this.docs.set(value.key, structuredClone(value)); }
     async deleteDoc(key) { this.docs.delete(key); }
-    async mutateDocs(puts = [], deletes = []) {
+    async mutateDocs(puts = [], deletes = [], expectedVault = null, expectedDocuments = []) {
+      if (expectedVault && vaultFingerprint(this.meta.get('vault')) !== expectedVault) {
+        throw new Error('vault_changed_requires_unlock');
+      }
+      if (expectedDocuments.some(item => documentFingerprint(this.docs.get(item.key)) !== documentFingerprint(item.document))) {
+        throw new Error('document_changed');
+      }
       const next = new Map(this.docs);
       for (const key of deletes) next.delete(key);
       for (const value of puts) next.set(value.key, structuredClone(value));
@@ -165,10 +182,12 @@
     getDoc(key) { return this.request('docs', 'readonly', store => store.get(key)); }
     putDoc(value) { return this.request('docs', 'readwrite', store => store.put(value)); }
     deleteDoc(key) { return this.request('docs', 'readwrite', store => store.delete(key)); }
-    async mutateDocs(puts = [], deletes = []) {
+    async mutateDocs(puts = [], deletes = [], expectedVault = null, expectedDocuments = []) {
       const db = await this.open();
       return new Promise((resolve, reject) => {
-        const transaction = db.transaction('docs', 'readwrite');
+        // Check the persistent key and commit documents in the same transaction.
+        // A separate metadata read could race a restore in another tab.
+        const transaction = db.transaction(expectedVault ? ['meta', 'docs'] : 'docs', 'readwrite');
         const store = transaction.objectStore('docs');
         let settled = false;
         const fail = error => {
@@ -183,13 +202,40 @@
         };
         transaction.onerror = () => fail(transaction.error || new Error('indexeddb_transaction_failed'));
         transaction.onabort = () => fail(transaction.error || new Error('indexeddb_transaction_failed'));
-        try {
-          for (const key of deletes) store.delete(key);
-          for (const value of puts) store.put(value);
-        } catch (error) {
-          try { transaction.abort(); } catch {}
-          fail(error);
-        }
+        const commit = () => {
+          try {
+            for (const key of deletes) store.delete(key);
+            for (const value of puts) store.put(value);
+          } catch (error) {
+            try { transaction.abort(); } catch {}
+            fail(error);
+          }
+        };
+        const checkDocuments = () => {
+          if (!expectedDocuments.length) { commit(); return; }
+          let remaining = expectedDocuments.length;
+          for (const item of expectedDocuments) {
+            const current = store.get(item.key);
+            current.onsuccess = () => {
+              if (settled) return;
+              if (documentFingerprint(current.result) !== documentFingerprint(item.document)) {
+                fail(new Error('document_changed'));
+                transaction.abort();
+              } else if (--remaining === 0) commit();
+            };
+            current.onerror = () => fail(current.error || new Error('indexeddb_transaction_failed'));
+          }
+        };
+        if (expectedVault) {
+          const config = transaction.objectStore('meta').get('vault');
+          config.onsuccess = () => {
+            if (vaultFingerprint(config.result) !== expectedVault) {
+              fail(new Error('vault_changed_requires_unlock'));
+              transaction.abort();
+            } else checkDocuments();
+          };
+          config.onerror = () => fail(config.error || new Error('indexeddb_transaction_failed'));
+        } else checkDocuments();
       });
     }
     async listDocs(prefix = '') {
@@ -227,6 +273,7 @@
     constructor(driver) {
       this.driver = driver;
       this.dataKey = null;
+      this.vaultFingerprint = null;
     }
     async status() {
       const config = await this.driver.getMeta('vault');
@@ -240,15 +287,17 @@
       const salt = randomBytes(16);
       const wrappingKey = await deriveWrappingKey(passphrase, salt, ['encrypt', 'decrypt']);
       const wrapped = await encryptBytes(wrappingKey, rawDataKey, 'bingli:vault-key:v1');
-      await this.driver.setMeta('vault', {
+      const config = {
         version: VAULT_VERSION,
         kdf: 'PBKDF2-SHA256',
         iterations: PBKDF2_ITERATIONS,
         salt: salt.buffer,
         wrapped,
         createdAt: new Date().toISOString(),
-      });
+      };
+      await this.driver.setMeta('vault', config);
       this.dataKey = dataKey;
+      this.vaultFingerprint = vaultFingerprint(config);
     }
     async unlock(passphrase) {
       const config = await this.driver.getMeta('vault');
@@ -256,21 +305,64 @@
       const wrappingKey = await deriveWrappingKey(passphrase, new Uint8Array(config.salt), ['decrypt']);
       const raw = await decryptBytes(wrappingKey, config.wrapped, 'bingli:vault-key:v1');
       this.dataKey = await webCrypto().subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+      this.vaultFingerprint = vaultFingerprint(config);
+      await this.ensureCurrentVault();
     }
-    lock() { this.dataKey = null; }
+    lock() { this.dataKey = null; this.vaultFingerprint = null; }
     requireKey() {
       if (!this.dataKey) throw new Error('vault_locked');
       return this.dataKey;
     }
+    async ensureCurrentVault(expectedVault = this.vaultFingerprint) {
+      this.requireKey();
+      if (!expectedVault || vaultFingerprint(await this.driver.getMeta('vault')) !== expectedVault) {
+        this.lock();
+        throw new Error('vault_changed_requires_unlock');
+      }
+    }
+    async commitDocuments(documents, deletes, expectedVault, expectedDocuments = []) {
+      if (typeof this.driver.mutateDocs !== 'function') throw new Error('atomic_storage_unavailable');
+      try { await this.driver.mutateDocs(documents, deletes, expectedVault, expectedDocuments); }
+      catch (error) {
+        if (error.message === 'vault_changed_requires_unlock') this.lock();
+        throw error;
+      }
+    }
     async put(key, value) {
-      const encrypted = await encryptBytes(this.requireKey(), encoder.encode(JSON.stringify(value)), `bingli:doc:${key}`);
-      await this.driver.putDoc({ key, format: 'json', encrypted, updatedAt: new Date().toISOString() });
+      const dataKey = this.requireKey(), fingerprint = this.vaultFingerprint;
+      await this.ensureCurrentVault(fingerprint);
+      const encrypted = await encryptBytes(dataKey, encoder.encode(JSON.stringify(value)), `bingli:doc:${key}`);
+      await this.commitDocuments([{ key, format: 'json', encrypted, updatedAt: new Date().toISOString() }], [], fingerprint);
+    }
+    async putIfUnchanged(key, expectedValue, value, unchanged = []) {
+      const dataKey = this.requireKey(), fingerprint = this.vaultFingerprint;
+      await this.ensureCurrentVault(fingerprint);
+      const document = await this.driver.getDoc(key);
+      if (JSON.stringify(await this.decode(document)) !== JSON.stringify(expectedValue)) return false;
+      const expectedDocuments = [{ key, document }];
+      for (const item of unchanged) {
+        const guard = await this.driver.getDoc(item.key);
+        if (JSON.stringify(await this.decode(guard)) !== JSON.stringify(item.value)) return false;
+        expectedDocuments.push({ key: item.key, document: guard });
+      }
+      const encrypted = await encryptBytes(dataKey, encoder.encode(JSON.stringify(value)), `bingli:doc:${key}`);
+      try {
+        // Check the exact encrypted record and write in one transaction. An
+        // edit, deletion or replacement during encryption must win in all tabs.
+        await this.commitDocuments([{ key, format: 'json', encrypted, updatedAt: new Date().toISOString() }], [], fingerprint, expectedDocuments);
+        return true;
+      } catch (error) {
+        if (error.message === 'document_changed') return false;
+        throw error;
+      }
     }
     async putBinary(key, value, metadata = {}) {
+      const dataKey = this.requireKey(), fingerprint = this.vaultFingerprint;
+      await this.ensureCurrentVault(fingerprint);
       const bytes = value instanceof ArrayBuffer ? value : await value.arrayBuffer();
-      const encrypted = await encryptBytes(this.requireKey(), bytes, `bingli:binary:${key}`);
-      const meta = await encryptBytes(this.requireKey(), encoder.encode(JSON.stringify(metadata)), `bingli:binary-meta:${key}`);
-      await this.driver.putDoc({ key, format: 'binary', encrypted, meta, updatedAt: new Date().toISOString() });
+      const encrypted = await encryptBytes(dataKey, bytes, `bingli:binary:${key}`);
+      const meta = await encryptBytes(dataKey, encoder.encode(JSON.stringify(metadata)), `bingli:binary-meta:${key}`);
+      await this.commitDocuments([{ key, format: 'binary', encrypted, meta, updatedAt: new Date().toISOString() }], [], fingerprint);
     }
     async decode(document) {
       if (!document) return undefined;
@@ -285,15 +377,22 @@
       }
       throw new Error('unsupported_document_format');
     }
-    async get(key) { return this.decode(await this.driver.getDoc(key)); }
+    async get(key) { await this.ensureCurrentVault(); return this.decode(await this.driver.getDoc(key)); }
     async list(prefix = '') {
+      await this.ensureCurrentVault();
       const docs = await this.driver.listDocs(prefix);
       return Promise.all(docs.map(document => this.decode(document)));
     }
-    async remove(key) { this.requireKey(); await this.driver.deleteDoc(key); }
-    async mutate({ puts = [], deletes = [] } = {}) {
-      const key = this.requireKey();
-      if (typeof this.driver.mutateDocs !== 'function') throw new Error('atomic_storage_unavailable');
+    async remove(key) { await this.ensureCurrentVault(); await this.commitDocuments([], [key], this.vaultFingerprint); }
+    async mutate({ puts = [], deletes = [], unchanged = [] } = {}) {
+      const key = this.requireKey(), fingerprint = this.vaultFingerprint;
+      await this.ensureCurrentVault(fingerprint);
+      const expectedDocuments = [];
+      for (const item of unchanged) {
+        const document = await this.driver.getDoc(item.key);
+        if (JSON.stringify(await this.decode(document)) !== JSON.stringify(item.value)) throw new Error('document_changed');
+        expectedDocuments.push({ key: item.key, document });
+      }
       const documents = await Promise.all(puts.map(async item => {
         if (item.format === 'binary') {
           const value = item.value;
@@ -316,10 +415,10 @@
           updatedAt: new Date().toISOString(),
         };
       }));
-      await this.driver.mutateDocs(documents, deletes);
+      await this.commitDocuments(documents, deletes, fingerprint, expectedDocuments);
     }
     async exportArchive() {
-      this.requireKey();
+      await this.ensureCurrentVault();
       const snapshot = this.driver.snapshot ? await this.driver.snapshot() : { vault: await this.driver.getMeta('vault'), docs: await this.driver.listDocs() };
       return {
         product: 'bingli-beta',
@@ -348,10 +447,13 @@
     }
     async restoreArchive(archive, passphrase) {
       const preview = await this.previewArchive(archive, passphrase);
-      const vaultConfig = deserialise(archive.vault);
+      // An older snapshot can wrap the very same key. Advance the storage
+      // generation on every restore so pre-restore tabs still must re-unlock.
+      const vaultConfig = { ...deserialise(archive.vault), restore_generation: toBase64(randomBytes(16)) };
       const docs = deserialise(archive.docs);
       await this.driver.replace([['vault', vaultConfig]], docs);
       this.dataKey = preview.candidate.dataKey;
+      this.vaultFingerprint = vaultFingerprint(vaultConfig);
       return { eventCount: preview.eventCount, mediaCount: preview.mediaCount };
     }
   }

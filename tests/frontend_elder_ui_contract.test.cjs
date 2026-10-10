@@ -153,8 +153,8 @@ test('conversation recovery keeps later additions in the same grounded history',
   assert.doesNotMatch(localStore, /startsNewEpisode|episodeIndex|modelTurns/);
 });
 
-test('only the exact reviewed urgent conversation text bypasses the frontend safety scan', () => {
-  assert.match(localStore, /action === 'urgent' && result\.j\?\.assistant_text === safety\.DANGER_REMINDER/);
+test('the legacy urgent exception keeps its exact text check with local danger provenance', () => {
+  assert.match(localStore, /action === 'urgent'[\s\S]{0,200}result\.j\?\.assistant_text === safety\.DANGER_REMINDER/);
   assert.doesNotMatch(localStore, /reviewedFixedText = result\.j\?\.action === 'urgent' \|\|/);
 });
 
@@ -182,9 +182,10 @@ test('reports use doctor handoff sections with sources and retain raw transcript
     assert.match(localStore, new RegExp(title));
   }
   const reportBuilder = localStore.match(/function buildConversationReport[\s\S]*?function conversationWithCurrentReport/)?.[0] || '';
-  assert.doesNotMatch(reportBuilder, /\.summary/);
+  assert.match(reportBuilder, /analysisSourcesCurrent/);
+  assert.match(reportBuilder, /groundedReportSummary/);
   assert.match(reportBuilder, /kind: 'quote', text: turn\.text/);
-  assert.match(reportBuilder, /format_version: 4/);
+  assert.match(reportBuilder, /format_version: 5/);
   assert.match(localStore, /source_context_ids/);
   assert.match(localStore, /transcript:/);
   assert.match(app, /reportSectionsHtml/);

@@ -187,6 +187,7 @@ def test_default_backend_defers_provider_to_per_kind_environment(tmp_path, monke
 
 
 def test_websocket_connection_rejects_redirect_without_forwarding_credentials(monkeypatch):
+    from dataclasses import replace
     from websockets.exceptions import InvalidStatus
     from websockets.http11 import Response
     from websockets.datastructures import Headers
@@ -197,9 +198,20 @@ def test_websocket_connection_rejects_redirect_without_forwarding_credentials(mo
         calls.append((url, options)); raise InvalidStatus(Response(302, "Moved", Headers({"Location": "wss://evil.invalid"})))
     monkeypatch.setattr(websockets.sync.client, "connect", connect)
     with pytest.raises(recognition.RecognitionError) as exc:
-        recognition._connect_dashscope(recognition._config_for("audio", None))
+        recognition._connect_dashscope(replace(recognition._config_for("audio", None), url="ws://127.0.0.1:19444/fixture"))
     assert exc.value.code == "invalid_provider_response" and len(calls) == 1
     assert calls[0][1]["proxy"] is None and calls[0][1]["max_size"] > 0
+
+
+def test_external_websocket_trial_is_closed_before_connection(monkeypatch):
+    import websockets.sync.client
+    configure(monkeypatch)
+    calls = []
+    monkeypatch.setattr(websockets.sync.client, "connect", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(recognition.RecognitionError) as exc:
+        recognition._connect_dashscope(recognition._config_for("audio", None))
+    assert exc.value.code == "trial_authorization_required" and not exc.value.retryable
+    assert calls == [] and "test-secret" not in str(exc.value)
 
 
 def test_http_asr_assigns_mime_extension_to_storage_original(monkeypatch):

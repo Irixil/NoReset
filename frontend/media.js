@@ -3,6 +3,7 @@ let mediaItems=[], uploadBusy=false, selectedPhoto=null, pendingRecordingBlob=nu
 const localMediaJobs=new Map();
 const recognitionBusy=new Set();
 const originalUrls=new Map();
+const originalTargets=new Map();
 const mediaStatus=$('mediaStatus');
 async function readBlobBytes(source){
   if(typeof FileReader!=='undefined'){
@@ -38,12 +39,19 @@ function unusableAudioMessage(m){
   return m?.kind==='audio'&&['invalid_media','no_text_detected'].includes(code)?'这段录音没有可识别的声音，请重新录音；原件仍保存在本机。':'';
 }
 function mediaRetryable(m){
+  if(m?.trial_control)return false;
   // The API puts retryability on the current attempt's error.  Accept the
   // compatibility locations too, but never infer that a terminal failure is
   // retryable merely because it has a failed status.
   if(m?.recognition_status==='interrupted')return m.recognition?.retryable!==false;
   if(m?.recognition_status!=='failed')return false;
+  if(m.recognition?.manual_retry_after_authorization===true&&['trial_authorization_required','trial_budget_exhausted'].includes(m.recognition?.error?.code))return true;
   return m.recognition?.retryable===true||m.recognition?.error?.retryable===true||m.retryable===true;
+}
+function trialRetryMessage(m){
+  if(m?.trial_control)return m.trial_control.state==='stopped'?'本次语音试验已停止；原件和已识别文字保留，等待明确处理安排。':'本次语音试验已暂停核对；原件和已识别文字保留。';
+  const code=m?.recognition?.error?.code;
+  return code==='trial_budget_exhausted'?'本次试验额度已用尽；原件已保留，需要新的预算授权后才能手动重试。':code==='trial_authorization_required'?'试验尚未获预算授权；原件已保留，获得授权后可手动重试。':'';
 }
 function capabilityMessage(c){
   if(c?.enabled===true)return '';
@@ -115,21 +123,23 @@ async function mediaRequest(path,opt){
   const x=await api(path,opt);
   if(!x.r.ok){
     const error=new Error(x.r.status===0?'连接中断，请重试，原文件和重试信息保留':x.j.error==='media_mock_unavailable'?'识别服务尚未接通；原件已保存，可直接打字记录。':readableMediaError(x.j.message||x.j.error));
-    error.code=x.j.error||'';error.retryable=x.j.retryable===true;throw error;
+    error.code=x.j.error||'';error.status=x.r.status;error.retryable=x.j.retryable===true;throw error;
   }
   return x.j;
 }
 async function loadMedia(){
   const {r,j}=await api('/api/media');
-  if(!r.ok){mediaMessage('媒体列表暂时无法读取，请恢复连接后刷新');const box=$('archivePhotos');if(box)box.innerHTML='<div class="load-error" role="status"><b>原件列表暂时无法读取</b><span>已保存原件不会删除，请恢复连接后刷新。</span></div>';return false;}
+  if(!r.ok){mediaMessage('媒体列表暂时无法读取，请恢复连接后刷新');const box=$('archivePhotos');if(box){releaseOriginalsIn(box);box.innerHTML='<div class="load-error" role="status"><b>原件列表暂时无法读取</b><span>已保存原件不会删除，请恢复连接后刷新。</span></div>';}return false;}
   mediaItems=j.media||[];renderMedia();return true;
 }
 function renderMedia(){
+  releaseOriginalsIn($('archivePhotos'));
   $('archivePhotoCount').textContent=mediaItems.filter(m=>m.kind==='image'&&m.save_status==='saved').length;
   $('archivePhotos').innerHTML=mediaItems.length?latestMediaFirst(mediaItems).map(m=>{
     const mock=isMockMedia(m);
     const terminalUnavailable=['failed','interrupted'].includes(m.recognition_status)&&!mediaRetryable(m);
-    const action=mock?(mediaRetryable(m)?'重新识别原录音':'查看模拟结果'):m.recognition_status==='succeeded'?'查看识别文字':m.recognition_status==='processing'?'识别处理中':terminalUnavailable?'':'识别 / 重试';
+    const trialRetry=m.recognition?.manual_retry_after_authorization===true&&trialRetryMessage(m);
+    const action=trialRetry?(m.recognition.error.code==='trial_budget_exhausted'?'新授权后重试':'获授权后重试'):mock?(mediaRetryable(m)?'重新识别原录音':'查看模拟结果'):m.recognition_status==='succeeded'?'查看识别文字':m.recognition_status==='processing'?'识别处理中':terminalUnavailable?'':'识别 / 重试';
     const actionButton=action?`<button class="outline" data-recognize="${m.media_id}" ${m.save_status!=='saved'||m.recognition_status==='processing'?'disabled':''}>${action}</button>`:'';
     const unusableAudio=unusableAudioMessage(m);
     const recognitionError=(m.recognition?.error_message||unusableAudio)?`<p class="status error">${escapeHtml(unusableAudio||readableMediaError(m.recognition.error_message,'识别没有完成，请保留原件并重试'))}</p>`:'';
@@ -140,20 +150,42 @@ function renderMedia(){
   document.querySelectorAll('[data-recognize]').forEach(b=>b.onclick=()=>recognizeMedia(b.dataset.recognize));
 }
 function latestMediaFirst(items){return items.slice().sort((a,b)=>{const at=Date.parse(a.created_at||a.updated_at||'')||0;const bt=Date.parse(b.created_at||b.updated_at||'')||0;return bt-at||String(b.media_id||'').localeCompare(String(a.media_id||''))})}
+function releaseOriginal(id){
+  const node=originalTargets.get(id)?.node;
+  try{node?.pause?.();node?.removeAttribute?.('src');node?.load?.()}catch{}
+  if(originalUrls.has(id))URL.revokeObjectURL(originalUrls.get(id));
+  originalUrls.delete(id);originalTargets.delete(id);
+}
+function releaseOriginalsIn(container){
+  if(!container)return;
+  for(const [id,target] of originalTargets){
+    if(target.box===container||container.contains?.(target.box)||target.box?.isConnected===false)releaseOriginal(id);
+  }
+}
 async function openOriginal(id,{box=null,media=null}={}){
+  let url,target;
   try{
-    if(originalUrls.has(id))URL.revokeObjectURL(originalUrls.get(id));
-    let url;
+    const m=media||mediaItems.find(m=>m.media_id===id);box=box||$('media-'+id)?.querySelector('.media-result');
+    if(!m||!box||box.isConnected===false)throw new Error('原件暂时无法读取');
+    releaseOriginalsIn(box);releaseOriginal(id);
+    target={box,node:null};originalTargets.set(id,target);
     if(globalThis.HealthLocal?.active)url=await globalThis.HealthLocal.originalObjectUrl(id);
     else{await health();const r=await fetch(API+`/api/media/${id}/original`,{credentials:'include',headers:{'X-Session-Token':token}});if(!r.ok)throw new Error('原件暂时无法读取');url=URL.createObjectURL(await r.blob());}
+    if(box.isConnected===false||originalTargets.get(id)!==target){URL.revokeObjectURL(url);if(originalTargets.get(id)===target)originalTargets.delete(id);return false}
     originalUrls.set(id,url);
-    const m=media||mediaItems.find(m=>m.media_id===id);box=box||$('media-'+id)?.querySelector('.media-result');
-    if(!m||!box)throw new Error('原件暂时无法读取');
-    const node=document.createElement(m.kind==='audio'?'audio':'img');node.src=url;
-    if(m.kind==='audio')node.controls=true;else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
+    const node=document.createElement(m.kind==='audio'?'audio':'img');target.node=node;node.src=url;
+    if(m.kind==='audio'){node.controls=true;node.style.maxWidth='100%';}else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
     box.replaceChildren(node);
     if(m.kind==='image'){const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';link.textContent='放大查看原件';box.append(link);}
-  }catch(e){if(box)box.textContent='原件暂时无法读取，请重新打开核对。';else mediaMessage(e.message);}
+    return true;
+  }catch(e){
+    if(url&&originalUrls.get(id)!==url)URL.revokeObjectURL(url);
+    if(target&&originalTargets.get(id)===target){
+      releaseOriginal(id);
+      if(box&&box.isConnected!==false)box.textContent='原件暂时无法读取，请重新打开核对。';
+    }else if(!box)mediaMessage(e.message);
+  }
+  return false;
 }
 async function showDocumentOriginals(recordId){
   const box=$('documentOriginals'),button=$('documentOriginalBtn');if(!box)return;
@@ -189,17 +221,25 @@ async function uploadMedia(file,kind,{temporary=false,conversationId=null}={}){
     if(!(kind==='audio'?c.audio_content_types:c.image_content_types).includes(type))throw new Error('当前服务不支持该文件格式，请保留原件并换用支持的格式');
     if(!file.size||file.size>c.max_total_bytes)throw new Error('文件为空或超过当前实例的资源保护边界');
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await readBlobBytes(file))),v=>v.toString(16).padStart(2,'0')).join('');
-    const jobKey=`elder_media_upload_v1:${kind}:${hash}:${type}:${temporary?'temporary':'retained'}`;
+    const jobKey=`elder_media_upload_v2:${kind}:${hash}:${type}:${temporary?'temporary':'retained'}:${conversationId||'standalone'}`;
     let job;if(globalThis.HealthLocal?.active)job=localMediaJobs.get(jobKey);else try{job=JSON.parse(localStorage.getItem(jobKey)||'null')}catch{}
+    if(job?.mediaId){
+      try{
+        const {media}=await mediaRequest('/api/media/'+job.mediaId);
+        if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体');await loadMedia();return media;}
+      }catch(error){
+        if(error.status!==404)throw error;
+        // Deletion, successful temporary-audio cleanup or backup restore can
+        // remove an earlier upload. A new user upload gets a fresh identity.
+        if(globalThis.HealthLocal?.active)localMediaJobs.delete(jobKey);else localStorage.removeItem(jobKey);
+        job=null;
+      }
+    }
     if(!job){
       const chunkSize=c.max_part_bytes,total=Math.ceil(file.size/chunkSize);
       if(total>c.max_parts)throw new Error('文件分片数量超过当前实例边界');
       job={key:crypto.randomUUID(),chunkSize,metadata:{kind,content_type:type,total_parts:String(total),expected_size:String(file.size),expected_sha256:hash,original_filename:file.name||`recording.${type.split('/')[1]}`,actor_name:'老人',temporary:String(temporary===true),conversation_id:conversationId||''}};
       if(globalThis.HealthLocal?.active)localMediaJobs.set(jobKey,job);else localStorage.setItem(jobKey,JSON.stringify(job));
-    }
-    if(job.mediaId){
-      const {media}=await mediaRequest('/api/media/'+job.mediaId);
-      if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体');await loadMedia();return media;}
     }
     mediaMessage('正在创建上传，原件尚未保存完整');
     const form=new FormData();Object.entries(job.metadata).forEach(([k,v])=>form.append(k,v));
@@ -256,7 +296,7 @@ async function recognizeMedia(id){
       const {media}=await mediaRequest('/api/media/'+id);
       if(!recognitionStillFinishing(media)){
         await loadMedia();showRecognition(media);await loadEvents();
-        mediaMessage(media.recognition_status==='succeeded'?'识别文字已保留，请核对来源和内容':unusableAudioMessage(media)||(mediaRetryable(media)?'识别没有完成，原件仍可查看和重试':'识别没有完成，原件仍可查看；请查看下方说明。'));return media;
+        mediaMessage(media.recognition_status==='succeeded'?'识别文字已保留，请核对来源和内容':trialRetryMessage(media)||unusableAudioMessage(media)||(mediaRetryable(media)?'识别没有完成，原件仍可查看和重试':'识别没有完成，原件仍可查看；请查看下方说明。'));return media;
       }
       await new Promise(resolve=>setTimeout(resolve,1000));
     }

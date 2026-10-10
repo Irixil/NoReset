@@ -625,6 +625,10 @@ main { width: 100%; padding: 0 20px; }
 .report-fact + .report-fact { padding-top: 18px; border-top: 1px dashed var(--line); }
 .report-fact-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
 .report-fact-head small { flex: none; color: var(--muted); font-size: 14px; }
+.report-source-version { display: block; }
+.report-source-evidence { margin-top: 8px; }
+.report-source-evidence summary { min-height: 44px; display: flex; align-items: center; color: var(--primary-dark); cursor: pointer; }
+.report-source-evidence blockquote { white-space: pre-wrap; }
 .report-fact-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .report-fact-tags span { padding: 3px 8px; border-radius: 999px; color: var(--primary-dark); background: var(--primary-soft); font-size: 14px; font-weight: 750; line-height: 1.45; }
 .report-fact blockquote,
@@ -935,8 +939,39 @@ main { width: 100%; padding: 0 20px; }
 .health-context-grid label { display: grid; gap: 6px; color: var(--ink); font-size: 14px; font-weight: 750; }
 .health-context-grid textarea { min-height: 86px; padding: 11px 12px; border: 1px solid #cfd2eb; border-radius: 12px; color: var(--ink); background: #fff; font: inherit; line-height: 1.5; }
 .health-context-grid textarea::placeholder { color: #73788d; font-weight: 400; }
+.conversation-top .conversation-subject-label { margin-top: 3px; color: var(--primary-dark); font-weight: 750; }
+.health-subject-conflict { margin: 12px 0; padding: 13px; border: 1px solid #e7b8a9; border-radius: 12px; color: #74351f; background: var(--danger-soft); font-size: 16px; line-height: 1.6; }
+.health-memory-card { min-width: 0; }
+.health-subject-controls,
+.health-memory-form { display: grid; gap: 7px; margin-top: 18px; }
+.health-subject-controls > label,
+.health-memory-form > label { margin-top: 7px; color: var(--ink); font-size: 15px; font-weight: 750; }
+.health-subject-controls input,
+.health-subject-controls select,
+.health-memory-form input:not([type="checkbox"]),
+.health-memory-form select { width: 100%; min-height: 48px; padding: 10px 11px; border: 1px solid #cfd2eb; border-radius: 11px; color: var(--ink); background: #fff; font: inherit; }
+.health-subject-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.health-subject-add .outline { min-height: 48px; }
+.memory-sharing-note { padding: 12px; border-radius: 11px; background: var(--primary-soft); line-height: 1.65; }
+.health-memory-list { display: grid; gap: 12px; margin-top: 16px; }
+.health-memory-item { min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 13px; background: #fff; }
+.health-memory-text { color: var(--ink) !important; font-size: 17px !important; white-space: pre-wrap; overflow-wrap: anywhere; }
+.health-memory-provenance { display: grid; gap: 7px; margin: 12px 0; color: var(--muted); font-size: 13px; }
+.health-memory-provenance > div { display: grid; grid-template-columns: 7em minmax(0, 1fr); gap: 8px; }
+.health-memory-provenance dt,
+.health-memory-provenance dd { margin: 0; overflow-wrap: anywhere; }
+.health-memory-actions,
+.health-memory-form-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.health-memory-actions button,
+.health-memory-form-actions button { min-height: 48px; margin-top: 0 !important; padding-inline: 9px; }
+.health-memory-form { padding-top: 18px; border-top: 1px solid var(--line); }
+.health-memory-form h3 { margin: 0; font-size: 19px; }
+.health-memory-form textarea { font: inherit; line-height: 1.6; }
+.health-memory-form .memory-checkbox { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; font-weight: 500; line-height: 1.6; }
+.memory-checkbox input { width: 24px; height: 24px; flex: 0 0 24px; margin-top: 2px; accent-color: var(--primary); }
 @media (min-width: 720px) {
-  .health-context-card { grid-column: 1 / -1; }
+  .health-context-card,
+  .health-memory-card { grid-column: 1 / -1; }
   .health-context-grid { grid-template-columns: 1fr 1fr; }
 }
 .file-label { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; margin-top: 12px; padding: 10px 13px; border: 1px solid #cfd2eb; border-radius: 12px; color: var(--primary-dark); background: #fff; font-weight: 700; cursor: pointer; }

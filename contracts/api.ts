@@ -235,10 +235,11 @@ export type AppConfigResponse = {
   mode: "local_first";
   access_configured: boolean;
   cloud_backup_configured: boolean;
-  product_name: "病历不归零·内测版";
+  product_name: "NoReset·内测版";
   data_location: "this_device";
   backup_mode: "encrypted_archive";
   provider: string;
+  reviewed_risk_rules: ReviewedRiskManifest;
   capabilities: {
     text_ai: ConfiguredCapability;
     audio_recognition: ConfiguredCapability;
@@ -249,7 +250,26 @@ export type AppConfigResponse = {
 // Mock is unavailable. True is configuration readiness only, not connectivity or quality.
 export type ConfiguredCapability = { available: boolean; reason: string };
 
-export type ConversationAction = "ask" | "reply" | "finish" | "urgent";
+export type ConversationAction = "ask" | "reply" | "finish" | "urgent" | "soon_evaluation";
+
+export type ReviewedRiskLevel = "soon_evaluation" | "urgent";
+export type ReviewedRiskManifest = {
+  contract_version: "reviewed-risk-candidates-v1";
+  rule_set_version: string;
+  status: "no_approved_rules" | "reviewed_rules_loaded";
+  clinical_validation: "not_completed" | "synthetic_fixture_only" | "clinical_review_metadata_present";
+  config_sha256: string | null;
+  rules: { rule_id: string; version: string; level: ReviewedRiskLevel }[];
+};
+
+export type ReviewedRiskSource = { turn_id: string; version: number; quote: string };
+export type ReviewedRiskAssessment = Omit<ReviewedRiskManifest, "rules"> & {
+  level: "none" | ReviewedRiskLevel;
+  notice: string | null;
+  matched_rules: { rule_id: string; version: string; level: ReviewedRiskLevel; evidence: ReviewedRiskSource[] }[];
+  sources: ReviewedRiskSource[];
+  rejected_candidates: number;
+};
 
 export type ConversationModelTurn = {
   turn_id: string;
@@ -257,6 +277,87 @@ export type ConversationModelTurn = {
   version?: number;
   // Previous assistant question or response; context only, never patient evidence.
   responding_to?: { turn_id: string; text: string };
+};
+
+/** Local encrypted subject separation; this is not an account permission. */
+export type HealthSubject = {
+  subject_id: string;
+  label: string;
+  relationship: "self" | "family";
+  created_at: string;
+};
+
+export type HealthMemoryCategory =
+  | "conditions" | "medications" | "allergies"
+  | "procedures" | "tests" | "similar_episodes";
+
+/** User-confirmed statements remain statements, not verified diagnoses. */
+export type HealthMemoryInput = {
+  category: HealthMemoryCategory;
+  text: string;
+  temporal_status: "current" | "historical" | "uncertain";
+  confirmation_status: "confirmed" | "unconfirmed";
+  confirmed_by: "self" | "family";
+  source_kind: "self_statement" | "family_report" | "document";
+  occurred_on: string | null;
+  remember: boolean;
+};
+
+export type HealthMemoryEntry = Omit<HealthMemoryInput, "temporal_status"> & {
+  context_id: string;
+  subject_id: string;
+  source: "user_confirmed" | "user_unconfirmed";
+  recorded_at: string;
+  confirmed_at: string | null;
+  updated_at: string;
+  temporal_status: HealthMemoryInput["temporal_status"] | null;
+  /** Legacy records have no invented occurrence date or time status. */
+  legacy_entry?: boolean;
+};
+
+export type HealthMemoryProfile = {
+  subject_id: string;
+  version: number;
+  updated_at: string | null;
+  entries: HealthMemoryEntry[];
+};
+
+export type HealthMemoryWriteRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+  entry: HealthMemoryInput;
+};
+
+export type HealthSubjectsResponse = {
+  ok: true;
+  subjects: HealthSubject[];
+  active_subject_id: string;
+  /** The current tab keeps its owner until an explicit re-selection. */
+  observed_subject_id?: string;
+  version: number;
+};
+
+export type DeleteHealthMemoryRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+};
+
+export type HealthMemoryResponse = {
+  ok: true;
+  health_context: HealthMemoryProfile;
+  subject_id?: string;
+};
+
+/** Only today's explicit selection or confirmed remembered entries, <=5. */
+export type ConversationHealthMemoryRequest = {
+  subject_id: string;
+  turns: ConversationModelTurn[];
+  controller: Record<string, unknown>;
+  health_context: Array<Omit<HealthMemoryEntry, "temporal_status"> & {
+    temporal_status?: "current" | "historical";
+  }>;
 };
 
 export type AppSessionResponse =
@@ -313,6 +414,10 @@ export type StatelessOrganizeSuccess = LocalSafety & OrganizeResultMeta & {
 
 export type StatelessMediaRecognitionSuccess = {
   ok: true;
+  /** Trusted response-only marker for the controlled synthetic voice trial.
+   * It requires local review before a separately authorized model reply;
+   * it never grants budget, retries, or a provider call. */
+  trial_control?: { review_required: true; stopped?: true };
   recognition: {
     text: string;
     provider: string;

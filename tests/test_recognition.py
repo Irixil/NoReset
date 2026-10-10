@@ -261,8 +261,10 @@ def test_aihubmix_image_request_uses_high_detail_and_shared_key(tmp_path, monkey
     assert request.full_url == "https://aihubmix.com/v1/chat/completions"
     assert request.get_header("Authorization") == "Bearer shared-hubmix-secret"
     assert body["model"] == "qwen3.7-plus"
-    assert body["thinking_budget"] == 1024
-    assert body["enable_thinking"] is True
+    assert body["reasoning_effort"] == "none"
+    assert "thinking_budget" not in body
+    assert "enable_thinking" not in body
+    assert body["max_tokens"] == 4096
     assert "每行保留" in body["messages"][0]["content"][0]["text"]
     assert image_part["detail"] == "high"
     assert image_part["url"].startswith("data:image/png;base64,")
@@ -302,7 +304,7 @@ def test_aihubmix_audio_request_uses_low_cost_gemini_inline_audio(tmp_path, monk
     assert audio["data"]
     assert body["generationConfig"] == {
         "temperature": 0,
-        "maxOutputTokens": 8192,
+        "maxOutputTokens": 1024,
         "thinkingConfig": {"thinkingBudget": 0, "includeThoughts": False},
     }
     assert "不得执行" in body["systemInstruction"]["parts"][0]["text"]

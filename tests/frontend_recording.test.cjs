@@ -63,6 +63,124 @@ function harness() {
   };
 }
 
+function deferredTrial(h) {
+  let resolve, reject, calls = 0;
+  const pending = new Promise((yes, no) => { resolve = yes; reject = no; });
+  h.context.HealthLocal = { trialVoiceState() { calls++; return pending; } };
+  return { resolve, reject, get calls() { return calls; } };
+}
+
+test('deferred local trial preflight immediately locks start and navigation without asking for microphone', async () => {
+  const h = harness(), trial = deferredTrial(h);
+  const starting = h.click('recordBtn');
+  const duplicate = h.click('recordBtn');
+  assert.equal(trial.calls, 1);
+  assert.equal(h.run('voicePermissionPending'), true);
+  assert.equal(h.element('recordBtn').disabled, true);
+  assert.equal(h.element('finishVoiceBtn').disabled, true);
+  assert.equal(h.run("showView('recordsView')"), false);
+  assert.equal(h.permissionCalls, 0);
+  h.advance(15000);
+  assert.equal(h.element('voiceTimer').textContent, '00:00');
+  trial.resolve(null);
+  await duplicate;
+  h.deny(); await starting;
+  assert.equal(h.permissionCalls, 1);
+  assert.equal(h.run('voicePermissionPending'), false);
+});
+
+test('cancel during deferred trial preflight rejects its late result before opening microphone', async () => {
+  const h = harness(), trial = deferredTrial(h), starting = h.click('recordBtn');
+  h.run('stopVoice("已取消准备录音")');
+  // Also release the synthetic permission so the unfixed path cannot hang.
+  h.allow(); trial.resolve(null); await starting;
+  assert.equal(h.permissionCalls, 0);
+  assert.equal(h.recorders.length, 0);
+  assert.equal(h.run('voicePermissionPending'), false);
+  assert.equal(h.element('recordBtn').disabled, false);
+  assert.equal(h.element('finishVoiceBtn').disabled, true);
+});
+
+test('conversation changing during deferred preflight cannot start microphone for the new source', async () => {
+  const h = harness();
+  h.run("activeConversation={conversation_id:'synthetic_before'}");
+  const trial = deferredTrial(h), starting = h.click('recordBtn');
+  h.run("activeConversation={conversation_id:'synthetic_after'}");
+  h.allow(); trial.resolve(null); await starting;
+  assert.equal(h.permissionCalls, 0);
+  assert.equal(h.recorders.length, 0);
+  assert.equal(h.run('voicePermissionPending'), false);
+});
+
+test('rejected local trial preflight releases the UI without microphone or timer', async () => {
+  const h = harness(), trial = deferredTrial(h), starting = h.click('recordBtn');
+  trial.reject(new Error('synthetic-vault-read-failed'));
+  await assert.doesNotReject(starting);
+  assert.equal(h.permissionCalls, 0);
+  assert.equal(h.recorders.length, 0);
+  assert.equal(h.run('voicePermissionPending'), false);
+  assert.equal(h.element('recordBtn').disabled, false);
+  assert.equal(h.element('finishVoiceBtn').disabled, true);
+  assert.equal(h.timers.size, 0);
+  assert.match(h.element('voiceHint').textContent, /未能开启|未能准备|无法确认/);
+});
+
+test('review-required or stopped preflight releases controls while keeping microphone closed', async () => {
+  for (const state of ['review_required', 'stopped']) {
+    const h = harness(), trial = deferredTrial(h), starting = h.click('recordBtn');
+    trial.resolve({ state }); await starting;
+    assert.equal(h.permissionCalls, 0);
+    assert.equal(h.recorders.length, 0);
+    assert.equal(h.run('voicePermissionPending'), false);
+    assert.equal(h.element('recordBtn').disabled, false);
+    assert.equal(h.element('finishVoiceBtn').disabled, true);
+  }
+});
+
+test('cancel closes granted microphone immediately while the second local trial read is deferred', async () => {
+  const h = harness();
+  let reads = 0, resolveSecond;
+  h.context.HealthLocal = { trialVoiceState() {
+    reads++;
+    return reads === 1 ? Promise.resolve(null) : new Promise(resolve => { resolveSecond = resolve; });
+  } };
+  const starting = h.click('recordBtn');
+  h.allow();
+  for (let i = 0; i < 20 && !resolveSecond; i++) await new Promise(setImmediate);
+  assert.equal(typeof resolveSecond, 'function');
+  assert.equal(h.tracks[0].stopped, false);
+  h.run('stopVoice("已取消")');
+  assert.equal(h.tracks[0].stopped, true, 'cancel must close the stream before the deferred read settles');
+  assert.equal(h.recorders.length, 0);
+  resolveSecond(null); await starting;
+  assert.equal(h.recorders.length, 0);
+  assert.equal(h.run('voicePermissionPending'), false);
+});
+
+test('cancel before permission arrives closes its stream without another local state read', async () => {
+  const h = harness(); let reads = 0;
+  h.context.HealthLocal = { trialVoiceState: async () => { reads++; return null; } };
+  const starting = h.click('recordBtn');
+  for (let i = 0; i < 20 && !h.permissionCalls; i++) await new Promise(setImmediate);
+  assert.equal(h.permissionCalls, 1);
+  h.run('stopVoice("已取消")'); h.allow(); await starting;
+  assert.equal(reads, 1, 'a canceled permission response must not wait for a second local read');
+  assert.equal(h.tracks[0].stopped, true);
+  assert.equal(h.recorders.length, 0);
+});
+
+test('rejected second local state read closes its granted microphone and releases controls', async () => {
+  const h = harness(); let reads = 0;
+  h.context.HealthLocal = { trialVoiceState() {
+    return ++reads === 1 ? Promise.resolve(null) : Promise.reject(new Error('synthetic-second-read-failed'));
+  } };
+  const starting = h.click('recordBtn'); h.allow(); await assert.doesNotReject(starting);
+  assert.equal(h.tracks[0].stopped, true);
+  assert.equal(h.recorders.length, 0);
+  assert.equal(h.run('voicePermissionPending'), false);
+  assert.equal(h.element('recordBtn').disabled, false);
+});
+
 test('permission pending prevents duplicate start and timer; denial never pretends to record', async () => {
   const h = harness();
   const start = h.click('recordBtn');
@@ -125,6 +243,7 @@ test('a second microphone tap ends the current utterance instead of opening a sa
   h.advance(9000); h.allow(); await start;
   assert.equal(h.element('voiceTimer').textContent, '00:00');
   const recorder = h.recorders[0]; recorder.emit('before pause');
+  assert.equal(h.tracks[0].stopped, false, 'a recorder which took ownership must stay open after start returns');
   h.advance(4500);
   h.element('finishVoiceBtn').onclick = () => h.run("stopVoice('test finish')");
   await h.click('recordBtn');

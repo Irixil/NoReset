@@ -2,9 +2,14 @@ let API = globalThis.BingliConfig?.apiBaseUrl || '';
 let token = localStorage.getItem('session_token') || '', modelProvider = '', saveBusy = false;
 let events = [], conversations = [], current = null, detailRequestSerial = 0, mediaRecorder = null, chunks = [], timerId = null, startedAt = 0, elapsedMs = 0, demoMode = false, localMode = Boolean(globalThis.HealthLocal), voicePermissionPending = false, voiceUploadPending = false;
 let activeConversation = null, conversationLoading = false, conversationEditingTurnId = null, pendingConversationTurn = null, pendingMediaRetry = null, lastSpokenTurnId = null;
+let voicePermissionGeneration = 0;
+let cancelPendingMicrophone = null;
 let silenceAudioContext = null, silenceAnalyser = null, silenceFrameId = null, silenceStartedAt = 0, speechDetected = false;
 let reportReturnFocus = null, reportInertTargets = [], contextReturnFocus = null, contextInertTargets = [];
 let healthContextEntries = [], contextDraftSelection = new Set(), contextPickerLoading = false, contextPickerLoadError = false, contextPickerRequestId = 0, contextSelectionSaving = false, voiceStatusCheckId = 0;
+let healthMemoryEntries = [], healthMemoryVersion = 0, healthMemoryEditingId = null, healthMemoryBusy = false;
+let healthSubjects = [], healthSubjectsVersion = 0, activeHealthSubjectId = 'subject_self', healthSubjectUiEpoch = 0, healthSubjectSwitchBusy = false;
+let healthSubjectLoaded = false, healthSubjectChanged = false;
 const handoffSelection=new Set(),knownHandoffEvents=new Set();
 const DEMO_KEY = 'elder_demo_events_v1';
 const PHOTO_KEY = 'elder_demo_photos_v1';
@@ -15,7 +20,7 @@ function reducedMotion(){return window.matchMedia?.('(prefers-reduced-motion: re
 function reveal(element,titleSelector){if(!element)return;element.scrollIntoView?.({behavior:reducedMotion()?'auto':'smooth',block:'start'});element.querySelector?.(titleSelector)?.focus?.({preventScroll:true})}
 function clearRecordPanels(){
   detailRequestSerial++;
-  const detail=$('detail');if(detail){detail.classList.add('hidden');detail.innerHTML=''}
+  const detail=$('detail');if(detail){if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(detail);detail.classList.add('hidden');detail.innerHTML=''}
   const detailTitle=$('detailPageTitle');if(detailTitle)detailTitle.textContent='记录详情';
   const handoff=$('handoff');if(handoff){handoff.classList.add('hidden');handoff.innerHTML=''}
   const banner=$('dangerBanner');if(banner){banner.classList.add('hidden');banner.innerHTML=''}
@@ -25,6 +30,7 @@ function showView(id){
   const recordingActive=mediaRecorder?.state==='recording';
   const leavingConversation=document.querySelector?.('.view.active')?.id==='voiceView'&&id!=='voiceView';
   if(id!=='voiceView'&&(recordingActive||voicePermissionPending||voiceUploadPending)){toast(voicePermissionPending?'正在等待麦克风权限，请稍候':'正在录音或保留原件，请稍候');reveal($('voiceView'),'h1');return false}
+  const previousView=document.querySelector?.('.view.active');if(previousView?.id!==id&&typeof releaseOriginalsIn==='function')releaseOriginalsIn(previousView);
   if(leavingConversation)void pauseConversation();
   // Clear record-specific panels whenever navigation starts so an older event
   // cannot leak into the next screen or appear as the newly selected record.
@@ -37,7 +43,7 @@ function showView(id){
   });
   window.scrollTo({top:0,behavior:reducedMotion()?'auto':'smooth'});
   const activeView=views.find(v=>v.id===id);activeView?.querySelector?.('h1')?.focus?.({preventScroll:true});
-  if(id==='recordsView')loadEvents();if(id==='homeView')renderHome();if(id==='settingsView'){refreshStorageStatus();void loadHealthContext()}if(id==='voiceView'){void loadConversation();void refreshVoiceOnlineStatus()}if(['photoCaptureView','archiveView'].includes(id)&&typeof refreshMediaOnlineStatus==='function')void refreshMediaOnlineStatus();return true
+  if(id==='recordsView')loadEvents();if(id==='homeView')renderHome();if(id==='settingsView'){refreshStorageStatus();void loadHealthMemory()}if(id==='voiceView'){void loadConversation();void refreshVoiceOnlineStatus()}if(['photoCaptureView','archiveView'].includes(id)&&typeof refreshMediaOnlineStatus==='function')void refreshMediaOnlineStatus();return true
 }
 document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{
   // Media entry buttons are disabled after capability discovery when the
@@ -97,7 +103,13 @@ async function refreshVoiceOnlineStatus(){
   }
 }
 async function api(path,opt={},retried=false){
-  if(localMode)return globalThis.HealthLocal.request(path,opt);
+  if(opt.method==='POST'&&/^\/api\/conversations\/[^/]+\/(?:pause|finish)$/.test(path)&&typeof releaseOriginalsIn==='function')releaseOriginalsIn($('voiceConversationTurns'));
+  if(localMode){
+    const headers={...(opt.headers||{}),'X-Health-Subject-Id':activeHealthSubjectId,'X-Health-Subject-Version':String(healthSubjectsVersion)};
+    const result=await globalThis.HealthLocal.request(path,{...opt,headers});
+    if(['subject_changed','subject_mismatch'].includes(result?.j?.error)&&typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();
+    return result;
+  }
   const h={...(opt.body instanceof FormData ? {} : {'Content-Type':'application/json'}),...(opt.headers||{})};
   if(token)h['X-Session-Token']=token;
   try {
@@ -132,7 +144,7 @@ function safetyHtml(s){
   if(s?.clinical_review_required)html+=`<p class="status error">${escapeHtml(s.clinical_review_notice||'这条记录需要专业人员复核，记录核对不能消除待办。')}</p>`;
   return html;
 }
-function safetyBanner(s){const b=$('dangerBanner');if(!b)return;if(s?.danger_detected){b.innerHTML=`<b>需要及时关注</b><br>${escapeHtml(s.danger_reminder||'记录中出现需要尽快请专业人员判断的描述，请联系当地急救服务或专业人员。')}`;b.classList.remove('hidden')}else b.classList.add('hidden')}
+function safetyBanner(s){const b=$('dangerBanner');if(!b)return;if(s?.danger_detected||s?.reviewed_risk_notice){b.innerHTML=`<b>${s?.reviewed_risk_level==='soon_evaluation'?'需要尽快评估':'需要及时关注'}</b><br>${escapeHtml(s.reviewed_risk_notice||s.danger_reminder||'记录中出现需要尽快请专业人员判断的描述，请联系当地急救服务或专业人员。')}`;b.classList.remove('hidden')}else b.classList.add('hidden')}
 function stateLabel(s){return ({inbox:'已保存，待整理',draft:'整理草稿，待核对',needs_review:'退回待整理',recorded:'已核对记录准确',superseded:'旧版本'})[s]||'状态待确认'}
 const EVENT_KIND_LABELS={symptom:'症状记录',measurement:'指标记录',medication:'用药记录',instruction:'医嘱或建议',document:'资料记录',question:'待核对问题',handoff:'交接记录',other:'其他记录'};
 const REVIEW_ROLE_LABELS={none:'暂未指定',family:'家属或照护者',clinician_or_pharmacist:'医生、护士或药师',emergency_services:'急救服务或专业人员'};
@@ -223,7 +235,9 @@ function renderList(){
 function applyRecordFilters(event){event?.preventDefault();renderList();const box=$('eventsList');box?.focus?.({preventScroll:true});box?.scrollIntoView?.({behavior:'smooth',block:'start'})}
 function clearRecordFilters(){const form=$('recordFilters');if(form?.reset)form.reset();else for(const id of ['filterKeyword','filterKind','filterState','filterStart','filterEnd'])$(id).value='';renderList();$('filterKeyword')?.focus?.()}
 async function loadEvents(){
+  const subjectEpoch=typeof healthSubjectUiEpoch==='number'?healthSubjectUiEpoch:0;
   const [{r,j},conversationResult]=await Promise.all([api('/api/events'),api('/api/conversations')]);
+  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch)return false;
   if(r.ok){demoMode=false;events=j.events||[];conversations=conversationResult.r.ok?conversationResult.j.conversations||[]:[];setModeLabel();renderList();renderHome();renderArchive();return true;}
   demoMode=true;setModeLabel();
   const message='<div class="load-error" role="status"><b>记录暂时无法读取</b><span>请恢复连接后重试；已保存内容不会删除。</span><button class="outline" type="button" data-retry-events>重新读取</button></div>';
@@ -235,8 +249,51 @@ function setVoiceStatus(text,tone=''){
   status.textContent=text;status.className='conversation-status'+(tone?' '+tone:'');
 }
 function setVoiceComposerEnabled(enabled){
+  if(typeof healthSubjectChanged!=='undefined'&&healthSubjectChanged)enabled=false;
+  if(activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')enabled=false;
   const input=$('voiceTextInput'),send=$('voiceTextSend');
+  if(send)send.textContent=activeConversation?.trial_control?'保存原话':'发送';
   if(input)input.disabled=!enabled;if(send)send.disabled=!enabled||!input?.value.trim();
+}
+function trialVoiceMessage(control){
+  if(control?.state==='review_required')return control.source_kind==='elder'&&!control.media_id?'本轮原话已保存在本机，尚未请求回复。请核对文字，等待本次试验批准后再继续一次。':'语音已转成文字，原话和录音已保留。请对照录音核对文字，等待本次试验批准后再继续一次。';
+  return control?.state==='completed'?'原话和本次回复已保存；可补充或纠正，下一轮仍会先保存在本机并暂停核对。':control?.state==='continuing'?'这次回复已提交，原话与已有原件已保留。请等结果；重新进入不会再次发送。':'本次试验已停止，原话与已有原件已保留；请等待新的明确处理安排。';
+}
+async function continueTrialVoice(){
+  const control=activeConversation?.trial_control;
+  if(saveBusy||conversationEditingTurnId||control?.state!=='review_required')return false;
+  saveBusy=true;renderVoiceConversation();setVoiceStatus('正在检查并提交本次回复…');
+  try{
+    const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/trial-continue`,{method:'POST',body:JSON.stringify({expected_version:activeConversation.version,turn_id:control.turn_id,turn_version:control.turn_version})});
+    if(x.j.conversation)syncConversation(x.j.conversation,{speak:x.r.ok&&!x.j.ai_failed});
+    setVoiceStatus(trialVoiceMessage(activeConversation?.trial_control),x.j.ai_failed||!x.r.ok?'error':'ok');
+    return x.r.ok&&!x.j.ai_failed;
+  }catch{setVoiceStatus('本次回复未完成，原话和录音已保留；重新进入不会再次发送。','error');return false}
+  finally{saveBusy=false;renderVoiceConversation();setVoiceComposerEnabled(true)}
+}
+async function showConversationOriginal(turn,box,conversation){
+  if(!box||turn?.source_kind!=='audio_transcript'||!turn.media_id||isMockContent(turn))return false;
+  box.textContent='正在读取本机原录音…';
+  try{
+    const x=await api('/api/media/'+encodeURIComponent(turn.media_id));
+    if(!box.isConnected&&box.isConnected!==undefined)return false;
+    const view=box.closest?.('.view');if(view&&!view.classList.contains('active'))return false;
+    if(!x.r.ok||!x.j.media){box.textContent='这份临时录音已清理或暂时无法读取；识别文字与修改历史仍保留。';return false}
+    const media=x.j.media;
+    if(media.media_id!==turn.media_id||media.kind!=='audio'||(media.conversation_id&&media.conversation_id!==conversation?.conversation_id)){
+      box.textContent='原录音与这段原话的来源不一致，请重新打开当前记录。';return false;
+    }
+    return await openOriginal(turn.media_id,{box,media});
+  }catch{box.textContent='原录音暂时无法读取；文字仍保留，可以稍后重新打开。';return false}
+}
+function bindConversationSourceActions(box,conversation){
+  box.querySelectorAll('[data-turn-original]').forEach(button=>button.onclick=async()=>{
+    const turn=(conversation?.turns||[]).find(item=>item.turn_id===button.dataset.turnOriginal&&item.role==='elder'&&!item.superseded);
+    const target=button.closest('.chat-bubble')?.querySelector('.voice-audio-original');
+    if(button.disabled||!turn||!target)return;button.disabled=true;
+    try{await showConversationOriginal(turn,target,conversation)}finally{button.disabled=false}
+  });
+  box.querySelectorAll('[data-turn-source]').forEach(button=>button.onclick=()=>showDetail(button.dataset.turnSource));
 }
 function voiceTurnHtml(turn){
   const assistant=turn.role==='assistant'||turn.side==='assistant';
@@ -244,7 +301,7 @@ function voiceTurnHtml(turn){
   const avatar=assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':'';
   const editing=!assistant&&conversationEditingTurnId===turn.turn_id;
   const latestTurn=(activeConversation?.turns||[]).filter(item=>!item.superseded).at(-1);
-  const canRetry=assistant&&turn.ai_failed&&latestTurn?.turn_id===turn.turn_id;
+  const canRetry=!activeConversation?.trial_control&&assistant&&turn.ai_failed&&latestTurn?.turn_id===turn.turn_id;
   let content='';
   if(editing){
     content=`<label class="chat-edit-label" for="voice-turn-${escapeHtml(turn.turn_id)}">修改刚才说的话</label><textarea id="voice-turn-${escapeHtml(turn.turn_id)}" class="chat-edit-textarea" data-voice-turn-input rows="4">${escapeHtml(turn.editText??turn.text??'')}</textarea><div class="chat-edit-actions"><button class="chat-action" type="button" data-voice-turn-save>保存修改</button><button class="chat-secondary-action" type="button" data-voice-turn-cancel>取消</button></div>${turn.editStatus?`<small class="chat-edit-error">${escapeHtml(turn.editStatus)}</small>`:''}`;
@@ -254,21 +311,25 @@ function voiceTurnHtml(turn){
     if(assistant){
       if(!mock&&canRetry)content+='<div class="chat-inline-actions"><button type="button" data-voice-retry>重试小零回复</button></div>';
       else if(!mock&&!turn.ai_failed)content+=`<div class="chat-inline-actions"><button type="button" data-voice-replay>再听一遍</button></div>`;
-      if(turn.action==='urgent'&&!turn.ai_failed)content+='<small>固定安全提醒 · 不包含诊断或用药建议</small>';
+      if(['urgent','soon_evaluation'].includes(turn.action)&&!turn.ai_failed)content+='<small>固定安全提醒 · 不包含诊断或用药建议</small>';
     }else{
-      const source=mock?'模拟识别结果（非患者原话）':turn.source_kind==='audio_transcript'?'语音已转成文字':'已加密保存在本机';
-      content+=`<small>${escapeHtml(source)}${turn.version>1?` · 已修改，第 ${turn.version} 版`:''}</small>${mock?'':'<button class="chat-edit-link" type="button" data-voice-turn-edit>修改</button>'}`;
+      const audio=turn.source_kind==='audio_transcript',source=mock?'模拟识别结果（非患者原话）':audio?'语音识别文字 · 请核对':'已加密保存在本机';
+      content+=`<small>${escapeHtml(source)}${turn.version>1?` · 已修改，第 ${turn.version} 版`:''}</small>${mock?'':`<button class="chat-edit-link" type="button" data-voice-turn-edit>${audio?'修改识别文字':'修改'}</button>`}`;
+      if(!mock&&audio&&turn.media_id)content+=`<button class="chat-edit-link" type="button" data-turn-original="${escapeHtml(turn.turn_id)}" data-voice-original="${escapeHtml(turn.media_id)}">对照原录音</button><div class="voice-audio-original" style="max-width:100%" aria-live="polite"></div>`;
     }
   }
   return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'}${turn.pending?' pending-turn':''}" data-voice-turn="${escapeHtml(turn.turn_id||'')}">${avatar}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}${turn.error?' error-bubble':''}${editing?' editing-bubble':''}">${content}</div></article>`;
 }
 function renderVoiceConversation(){
   const box=$('voiceConversationTurns');if(!box)return;
+  if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(box);
   const turns=(activeConversation?.turns||[]).filter(turn=>!turn.superseded);
   box.innerHTML=[...turns,pendingConversationTurn].filter(Boolean).map(voiceTurnHtml).join('');
+  if(activeConversation?.trial_control){const control=activeConversation.trial_control;box.innerHTML+=`<div class="chat-turn"><div class="chat-bubble"><p>${escapeHtml(trialVoiceMessage(control))}</p>${control.state==='review_required'?`<button class="chat-action" type="button" data-trial-continue ${saveBusy?'disabled':''}>核对并获准后继续一次</button>`:''}</div></div>`;box.querySelector('[data-trial-continue]')?.addEventListener('click',continueTrialVoice)}
   box.querySelectorAll('[data-voice-turn-edit]').forEach(button=>button.onclick=()=>beginVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn));
   box.querySelectorAll('[data-voice-turn-cancel]').forEach(button=>button.onclick=cancelVoiceTurnEdit);
   box.querySelectorAll('[data-voice-turn-save]').forEach(button=>button.onclick=()=>saveVoiceTurnEdit(button.closest('[data-voice-turn]')?.dataset.voiceTurn,button.closest('.chat-bubble')?.querySelector('[data-voice-turn-input]')?.value||''));
+  bindConversationSourceActions(box,activeConversation);
   box.querySelectorAll('[data-voice-replay]').forEach(button=>button.onclick=()=>{const turn=turnById(button.closest('[data-voice-turn]')?.dataset.voiceTurn);if(turn)speakAssistant(turn,true)});
   box.querySelectorAll('[data-voice-retry]').forEach(button=>button.onclick=()=>retryConversationReply(button));
   const editingTurn=conversationEditingTurnId;
@@ -292,27 +353,41 @@ function renderConversationReport(){
   if(!report){body.innerHTML='<p class="muted">说完第一句话后，这里会自动生成报告。</p>';return}
   $('conversationReportStatus').textContent=report.status_label||'自动整理 · 本人未核对';
   const transcript=(report.transcript||[]).filter(turn=>!isMockContent(turn));
-  body.innerHTML=`<p class="report-reading-guide">按就诊时最常用的顺序整理，共保留 ${report.source_turn_ids?.length||0} 段患者原话。</p>`+(transcript.length!==(report.transcript||[]).length?'<p class="status error">历史模拟识别文字已从报告事实中排除，仅在完整对话历史中保留。</p>':'')+reportSectionsHtml(report)+`<details class="report-transcript"><summary>查看完整对话（${report.transcript?.length||0} 轮）</summary><ol>${(report.transcript||[]).map(turn=>`<li><span>${turn.role==='assistant'?'小零':'老人'}${isMockContent(turn)?' · 模拟内容，不是患者事实':''}</span><p>${escapeHtml(turn.text||'')}</p></li>`).join('')||`<li><p>${escapeHtml(isMockContent(report.body)?'历史报告内容无法确认来源，原始记录仍保留。':report.body||'')}</p></li>`}</ol></details><p class="report-source-note">第 ${report.version||1} 版 · 修改聊天原话后，这份记录会自动更新。关键事实始终以患者原话为准。</p>`;
+  body.innerHTML=`<p class="report-reading-guide">按就诊时最常用的顺序整理，共保留 ${report.source_turn_ids?.length||0} 段患者原话。</p>`+(transcript.length!==(report.transcript||[]).length?'<p class="status error">历史模拟识别文字已从报告事实中排除，仅在完整对话历史中保留。</p>':'')+reportSectionsHtml(report)+reportOriginalSourcesHtml(report)+`<details class="report-transcript"><summary>查看完整对话（${report.transcript?.length||0} 轮）</summary><ol>${(report.transcript||[]).map(turn=>`<li><span>${turn.role==='assistant'?'小零':'老人'}${isMockContent(turn)?' · 模拟内容，不是患者事实':''}</span><p>${escapeHtml(turn.text||'')}</p></li>`).join('')||`<li><p>${escapeHtml(isMockContent(report.body)?'历史报告内容无法确认来源，原始记录仍保留。':report.body||'')}</p></li>`}</ol></details><p class="report-source-note">第 ${report.version||1} 版 · 修改聊天原话后，这份记录会自动更新。关键事实始终以患者原话为准。</p>`;
 }
 function reportSectionsHtml(report){
   const sections=report?.sections||[];
   if(!sections.length)return isMockContent(report?.body)?'<p class="status error">历史报告含模拟识别内容，已从患者事实中排除。</p>':`<pre>${escapeHtml(report?.body||'')}</pre>`;
   return `<div class="clinical-report-sections">${sections.map(section=>`<section class="clinical-report-section" data-report-section="${escapeHtml(section.key||'record')}"><h3>${escapeHtml(section.title||'记录')}</h3><div class="report-fact-list">${(section.lines||[]).filter(line=>!isMockContent(line)&&!mockText(typeof line==='string'?line:line?.text)).map((line,index)=>reportFactHtml(line,index)).join('')}</div></section>`).join('')}</div>`;
 }
+function reportOriginalSourcesHtml(report){
+  const ids=Array.isArray(report?.source_turn_ids)?report.source_turn_ids:[];
+  const sources=(Array.isArray(report?.source_versions)?report.source_versions:[]).filter(source=>typeof source?.turn_id==='string'&&source.turn_id.trim()&&ids.includes(source.turn_id)&&Number.isSafeInteger(source.version)&&source.version>0&&typeof source.quote==='string'&&source.quote.trim()&&!isMockContent(source)&&!mockText(source.quote));
+  const unique=sources.filter(source=>sources.filter(other=>other.turn_id===source.turn_id).length===1);
+  if(!unique.length)return '';
+  return `<section class="clinical-report-section report-original-sources"><h3>原话来源</h3><div class="report-fact-list"><p class="muted">以下保留每段当前原话，包括尚未整理进摘要的内容；原话仍需本人核对。</p>${unique.map((source,index)=>reportFactHtml({kind:'quote',text:source.quote,source_label:'原话 · 本人未核对',source_turn_ids:[source.turn_id],source_versions:[source]},index)).join('')}</div></section>`;
+}
 function reportFactHtml(line,index){
   if(typeof line==='string')return `<div class="report-fact report-fact-check"><p>${escapeHtml(line)}</p></div>`;
   const tags=(line?.tags||[]).map(tag=>`<span>${escapeHtml(tag)}</span>`).join('');
-  const source=line?.source_label?`<small>${escapeHtml(line.source_label)}</small>`:'';
+  const sourceVersions=(Array.isArray(line?.source_versions)?line.source_versions:[]).filter(source=>Array.isArray(line?.source_turn_ids)&&typeof source?.turn_id==='string'&&source.turn_id.trim()&&line.source_turn_ids.includes(source.turn_id)&&Number.isSafeInteger(source.version)&&source.version>0&&typeof source.quote==='string'&&source.quote.trim());
+  const sourceVersionLabel=source=>`原话第 ${source.version} 版${source.version>1?' · 已修订':''}`;
+  const versionLabels=sourceVersions.map(source=>`<span class="report-source-version">${escapeHtml(sourceVersionLabel(source))}</span>`).join('');
+  const source=line?.source_label||versionLabels?`<small>${line?.source_label?`<span>${escapeHtml(line.source_label)}</span>`:''}${versionLabels}</small>`:'';
+  const evidence=sourceVersions.map(source=>`<details class="report-source-evidence" data-source-turn-id="${escapeHtml(source.turn_id)}"><summary>查看对应原话（${escapeHtml(sourceVersionLabel(source))}）</summary><blockquote>${escapeHtml(source.quote)}</blockquote></details>`).join('');
   const kind=['quote','context','alert','check'].includes(line?.kind)?line.kind:'check';
   const text=escapeHtml(line?.text||'');
   const content=kind==='quote'?`<blockquote>${text}</blockquote>`:`<p>${text}</p>`;
-  return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}</article>`;
+  return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}${evidence}</article>`;
 }
 function syncConversation(conversation,{speak=true}={}){
+  if(typeof activeHealthSubjectId!=='undefined'&&conversation?.subject_id&&conversation.subject_id!==activeHealthSubjectId){if(typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();return false}
+  if(conversation?.trial_control&&conversation.trial_control.state!=='completed')voicePermissionGeneration++;
   if(pendingMediaRetry&&pendingMediaRetry.conversation_id!==conversation?.conversation_id)pendingMediaRetry=null;
   activeConversation=conversation;conversationEditingTurnId=null;pendingConversationTurn=null;
   document.querySelector?.('.conversation-shell')?.classList.remove('awaiting-choice');
   renderVoiceConversation();renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(true);
+  if(typeof updateHealthSubjectLabels==='function')updateHealthSubjectLabels();
   const last=[...(conversation?.turns||[])].reverse().find(turn=>turn.role==='assistant'&&!turn.superseded);
   if(speak&&last&&!isMockContent(last)&&last.turn_id!==lastSpokenTurnId)speakAssistant(last);
 }
@@ -320,8 +395,11 @@ function conversationHasPendingReply(conversation){
   const turns=(conversation?.turns||[]).filter(turn=>!turn.superseded),latest=turns[turns.length-1];
   return latest?.role==='elder';
 }
-function speakAssistant(turn,force=false){
+async function speakAssistant(turn,force=false){
   if(!turn?.text||isMockContent(turn)||!globalThis.speechSynthesis||!globalThis.SpeechSynthesisUtterance)return;
+  const conversationId=activeConversation?.conversation_id;
+  let trial;try{trial=await globalThis.HealthLocal?.trialVoiceState?.()}catch{return}
+  if(activeConversation?.conversation_id!==conversationId||trial&&trial.state!=='completed'||activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')return;
   if(!force&&turn.turn_id===lastSpokenTurnId)return;
   speechSynthesis.cancel();speechSynthesis.resume?.();const utterance=new SpeechSynthesisUtterance(turn.text);utterance.lang='zh-CN';utterance.rate=.92;speechSynthesis.speak(utterance);lastSpokenTurnId=turn.turn_id;
 }
@@ -359,7 +437,7 @@ function updateHealthContextButton(){
   button.disabled=!activeConversation?.conversation_id;
   button.textContent=count?`已选 ${count} 项相关资料（可选）`:'带上相关资料（可选）';
 }
-const HEALTH_CONTEXT_CATEGORY_LABELS={conditions:'疾病或长期问题',medications:'正在使用的药物',allergies:'过敏情况',procedures:'手术、住院或受伤经历',tests:'已有检查或测量',similar_episodes:'以前类似情况'};
+const HEALTH_CONTEXT_CATEGORY_LABELS={conditions:'疾病或长期问题',medications:'药物使用记录',allergies:'过敏情况',procedures:'手术、住院或受伤经历',tests:'已有检查或测量',similar_episodes:'以前类似情况'};
 function setContextDialogBackgroundInert(inert){
   const panel=$('healthContextPickerPanel');if(!panel)return;
   if(inert){
@@ -390,7 +468,8 @@ function renderHealthContextPicker(){
   }
   list.innerHTML=healthContextEntries.map(item=>{
     const id=escapeHtml(item.context_id||''),checked=contextDraftSelection.has(item.context_id)?' checked':'';
-    return `<label class="health-context-choice"><input type="checkbox" data-context-id="${id}"${checked}><span><b>${escapeHtml(HEALTH_CONTEXT_CATEGORY_LABELS[item.category]||'已确认情况')}</b><span>${escapeHtml(item.text||'')}</span></span></label>`;
+    const timeLabel=item.temporal_status==='current'?'目前仍适用':item.temporal_status==='historical'?'过去的情况':item.temporal_status==='uncertain'?'不确定 · 待核实':item.legacy_entry?'时间状态未核对':'';
+    return `<label class="health-context-choice"><input type="checkbox" data-context-id="${id}"${checked}><span><b>${escapeHtml(HEALTH_CONTEXT_CATEGORY_LABELS[item.category]||'已确认情况')}${timeLabel?` · ${escapeHtml(timeLabel)}`:''}</b><span>${escapeHtml(item.text||'')}</span></span></label>`;
   }).join('');
   list.querySelectorAll('[data-context-id]').forEach(input=>input.addEventListener('change',()=>{
     const accepted=changeContextPickerSelection(input.dataset.contextId,input.checked);
@@ -451,6 +530,8 @@ async function saveHealthContextSelection(){
   }
 }
 async function retryConversationReply(button){
+  if(activeConversation?.trial_control)return false;
+  const trial=await globalThis.HealthLocal?.trialVoiceState?.();if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),'error');return false}
   const turns=(activeConversation?.turns||[]).filter(turn=>!turn.superseded),latest=turns.at(-1);
   if(saveBusy||!latest||latest.role!=='assistant'||!latest.ai_failed||!activeConversation?.conversation_id)return false;
   saveBusy=true;if(button){button.disabled=true;button.textContent='正在重试…'}setVoiceComposerEnabled(false);setVoiceStatus('刚才的原话已保存在本机，正在请求一次回复…');
@@ -487,6 +568,11 @@ function showVoiceMediaSaved(media){
 }
 async function showVoiceMediaResult(media){
   if(!media)return;
+  if(media.trial_control){
+    let control=media.trial_control;
+    if(media.conversation_id){const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){syncConversation(saved.j.conversation,{speak:false});control=saved.j.conversation.trial_control||control}}
+    setVoiceStatus(trialVoiceMessage(control),control.state==='stopped'?'error':'ok');return;
+  }
   const recognitionError=media.recognition?.error?.code||media.recognition?.error?.error||media.recognition?.error||media.error;
   if(recognitionError==='original_unavailable'){
     setVoiceStatus('原录音无法读取，请重新录音后再试。','error');return;
@@ -506,9 +592,9 @@ async function showVoiceMediaResult(media){
       const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));
       if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){
         const voiceVisible=document.querySelector?.('.view.active')?.id==='voiceView';
-        syncConversation(saved.j.conversation,{speak:voiceVisible});const paused=await api(`/api/conversations/${encodeURIComponent(media.conversation_id)}/pause`,{method:'POST',body:'{}'});if(paused.r.ok&&paused.j.conversation)activeConversation=paused.j.conversation;
+        syncConversation(saved.j.conversation,{speak:voiceVisible});
       }
-      setVoiceStatus('语音已转成文字，原话和报告都已保存。','ok');return;
+      setVoiceStatus('识别文字和报告已保存，请对照原录音核对。离开或结束后临时录音会清理，文字与修改历史保留。','ok');return;
     }
     if(activeConversation?.conversation_id!==media.conversation_id){setVoiceStatus('语音文字已保存，但这段录音还没有接入原来的对话。请回到原对话核对；录音原件仍保留。','error');return}
     if(media.conversation_link_error||media.conversation_link_interrupted){prepareMediaRetry(media,text);setVoiceStatus('识别文字和录音原件已保留；加入对话没有完成。请核对下方文字后点发送重试。','error');return}
@@ -520,7 +606,7 @@ async function showVoiceMediaResult(media){
     if(media.conversation_turn_id&&media.conversation_id){
       const saved=await api('/api/conversations/'+encodeURIComponent(media.conversation_id));
       if(saved.r.ok&&saved.j.conversation&&activeConversation?.conversation_id===media.conversation_id){
-        syncConversation(saved.j.conversation);const paused=await api(`/api/conversations/${encodeURIComponent(media.conversation_id)}/pause`,{method:'POST',body:'{}'});if(paused.r.ok&&paused.j.conversation)activeConversation=paused.j.conversation;
+        syncConversation(saved.j.conversation);
       }
       setVoiceStatus('语音已转成文字，原话和报告都已保存。','ok');
     }else await submitConversationText(text,{source_kind:'audio_transcript',record_id:rid,media_id:media.media_id});
@@ -546,6 +632,7 @@ async function startSeparateConversation(){
   finally{conversationLoading=false;if(button)button.disabled=false}
 }
 async function loadConversation(){
+  if(typeof healthSubjectSwitchBusy!=='undefined'&&healthSubjectSwitchBusy)return;
   if(conversationLoading)return;conversationLoading=true;setVoiceComposerEnabled(false);
   try{
     const x=await api(`/api/conversations/current?local_date=${encodeURIComponent(localDateValue())}`);
@@ -554,6 +641,8 @@ async function loadConversation(){
     if(x.j.conversation){
       const pending=conversationHasPendingReply(x.j.conversation);
       syncConversation(x.j.conversation,{speak:false});
+      const globalTrial=await globalThis.HealthLocal?.trialVoiceState?.();
+      if(x.j.conversation.trial_control||globalTrial&&globalTrial.state!=='completed'){const control=globalTrial?.state==='stopped'?globalTrial:x.j.conversation.trial_control||globalTrial;setVoiceStatus(trialVoiceMessage(control),control.state==='stopped'?'error':'ok');return}
       if(!pending){setVoiceStatus('上次说到这里，您可以接着说。','ok');return}
       setVoiceStatus('刚才的话已保存在本机，正在尝试接上回复…','ok');
       const resumed=await api(`/api/conversations/${encodeURIComponent(x.j.conversation.conversation_id)}/resume-assistant`,{method:'POST',body:'{}'});
@@ -566,10 +655,13 @@ async function loadConversation(){
   }finally{conversationLoading=false;if(activeConversation)setVoiceComposerEnabled(true)}
 }
 async function pauseConversation(){
+  if(typeof releaseOriginalsIn==='function')releaseOriginalsIn($('voiceConversationTurns'));
   if(!activeConversation?.conversation_id)return;
+  if(activeConversation.trial_control)return;
   try{const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/pause`,{method:'POST',body:'{}'});if(x.r.ok&&x.j.conversation)activeConversation=x.j.conversation}catch{}
 }
 async function submitConversationText(text,extra={}){
+  if(typeof healthSubjectSwitchBusy!=='undefined'&&healthSubjectSwitchBusy)return false;
   if(saveBusy||!activeConversation?.conversation_id)return false;
   const clean=String(text||'').trim();if(!clean){setVoiceStatus('请先说或写下想记录的内容。','error');return false}
   if((extra.source_kind==='audio_transcript'||extra.media_id)&&mockText(clean)){setVoiceStatus(mockWarning,'error');return false}
@@ -579,8 +671,8 @@ async function submitConversationText(text,extra={}){
   if(extra.keep_media_until_pause===true)body.keep_media_until_pause=true;
   const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/turns`,{method:'POST',headers:{'Idempotency-Key':operationKey},body:JSON.stringify(body)});
   saveBusy=false;pendingConversationTurn=null;
-  if(!x.r.ok||!x.j.conversation){renderVoiceConversation();setVoiceComposerEnabled(true);if(x.r.status===409)void loadConversation();setVoiceStatus(x.r.status===409?'这份对话已在另一个页面更新；已重新读取，刚才输入仍保留，请再发送一次。':'这句话没有确认保存，请保留当前页面后重试。','error');return false}
-  syncConversation(x.j.conversation);setVoiceStatus(x.j.ai_failed?'原话和报告已保存在本机；联网回复没完成，可点对话中的“重试小零回复”，也可以继续打字。':'原话和报告已保存。',x.j.ai_failed?'error':'ok');await loadEvents();return true;
+  if(!x.r.ok||!x.j.conversation){renderVoiceConversation();setVoiceComposerEnabled(true);if(x.j.error==='trial_source_changed'&&x.j.raw_text_preserved_on_device){void loadConversation();setVoiceStatus('这次原话已保存在“我的记录”，尚未接入当前对话；请先核对当前停点，输入仍保留。','error');return false}if(['trial_stopped','trial_review_required'].includes(x.j.error)){setVoiceStatus(x.j.error==='trial_stopped'?'本次试验已停止，这次输入尚未保存；请保留输入。':'请先处理已保存原话的核对停点，这次输入仍保留。','error');return false}if(x.r.status===409)void loadConversation();setVoiceStatus(x.r.status===409?'这份对话已在另一个页面更新；已重新读取，刚才输入仍保留，请再发送一次。':'这句话没有确认保存，请保留当前页面后重试。','error');return false}
+  syncConversation(x.j.conversation);setVoiceStatus(x.j.trial_control?trialVoiceMessage(x.j.trial_control):x.j.ai_failed?'原话和报告已保存在本机；联网回复没完成，可点对话中的“重试小零回复”，也可以继续打字。':'原话和报告已保存。',x.j.ai_failed?'error':'ok');await loadEvents();return true;
 }
 async function saveVoiceSupplement(){
   const input=$('voiceTextInput'),text=input.value.trim();
@@ -629,7 +721,7 @@ function detailHtml(e,{organizeFailed=false,relatedRecords=null}={}){
 function renderDetail(e,options={}){
   const mock=isMockContent(e);current=e;safetyBanner(mock||documentNeedsReview(e)?null:e.local_safety);
   const pageTitle=$('detailPageTitle');if(pageTitle)pageTitle.textContent='单条记录详情';
-  const d=$('detail');d.classList.remove('hidden');d.innerHTML=(mock?`<p class="status error">${escapeHtml(mockWarning)}</p>`:'')+detailHtml(e,options);
+  const d=$('detail');if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(d);d.classList.remove('hidden');d.innerHTML=(mock?`<p class="status error">${escapeHtml(mockWarning)}</p>`:'')+detailHtml(e,options);
   if($('documentOriginalBtn'))$('documentOriginalBtn').onclick=()=>showDocumentOriginals(e.record_id);
   if($('sourceReviewCheck'))$('sourceReviewCheck').onchange=()=>{$('sourceReviewBtn').disabled=!$('sourceReviewCheck').checked};
   if($('sourceReviewBtn'))$('sourceReviewBtn').onclick=async()=>{
@@ -643,15 +735,20 @@ function renderDetail(e,options={}){
   if($('rejectBtn'))$('rejectBtn').onclick=()=>review(e,'reject');
   if($('reviseBtn'))$('reviseBtn').onclick=()=>revise(e);$('historyBtn').onclick=()=>historyView(e);
 }
-async function loadRelatedHistory(e){const ids=Array.isArray(e.related_record_ids)?e.related_record_ids.slice(0,10):[];if(!ids.length)return;const records=[];for(const id of ids){const x=await api('/api/events/'+encodeURIComponent(id));if(x.r.ok&&x.j.event)records.push(x.j.event)}if(current?.record_id===e.record_id)renderDetail(e,{relatedRecords:records,focus:false})}
+function detailStillCurrent(e,request){return request===detailRequestSerial&&current?.record_id===e.record_id&&current?.version===e.version}
+async function loadRelatedHistory(e){const request=detailRequestSerial,ids=Array.isArray(e.related_record_ids)?e.related_record_ids.slice(0,10):[];if(!ids.length)return;const records=[];for(const id of ids){const x=await api('/api/events/'+encodeURIComponent(id));if(x.r.ok&&x.j.event)records.push(x.j.event)}if(detailStillCurrent(e,request))renderDetail(e,{relatedRecords:records,focus:false})}
 function conversationTurnTime(turn){return turn?.created_at?new Date(turn.created_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function conversationTranscriptTurnHtml(turn){
   const assistant=turn.role==='assistant',mock=isMockContent(turn),speaker=assistant?'小零':'我',time=conversationTurnTime(turn),history=!assistant&&!mock&&turn.versions?.length?`<details class="turn-history"><summary>查看修改前文字</summary>${turn.versions.map(version=>`<p>第 ${escapeHtml(version.version)} 版：${escapeHtml(version.text||'')}</p>`).join('')}</details>`:'';
-  return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'} archive-chat-turn">${assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':''}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}">${mock?`<small class="mock-content-warning">${escapeHtml(mockWarning)}</small>`:''}<p>${escapeHtml(turn.text||'')}</p><small>${mock?'模拟内容':speaker}${time?` · ${escapeHtml(time)}`:''}${!assistant&&!mock&&turn.version>1?' · 已修改':''}</small>${history}</div></article>`;
+  const audio=!assistant&&!mock&&turn.source_kind==='audio_transcript';
+  const sourceActions=audio?`${turn.record_id?`<button class="chat-edit-link" type="button" data-turn-source="${escapeHtml(turn.record_id)}">核对/修改识别文字</button>`:''}${turn.media_id?`<button class="chat-edit-link" type="button" data-turn-original="${escapeHtml(turn.turn_id)}" data-voice-original="${escapeHtml(turn.media_id)}">对照原录音</button><div class="voice-audio-original" style="max-width:100%" aria-live="polite"></div>`:''}`:'';
+  return `<article class="chat-turn ${assistant?'assistant-turn':'user-turn'} archive-chat-turn">${assistant?'<img class="chat-avatar" src="assets/brand-mascot.png?v=20260930-real-acceptance-9" alt="" aria-hidden="true">':''}<div class="chat-bubble ${assistant?'assistant-bubble':'user-bubble'}">${mock?`<small class="mock-content-warning">${escapeHtml(mockWarning)}</small>`:''}<p>${escapeHtml(turn.text||'')}</p><small>${mock?'模拟内容':audio?'语音识别文字 · 请核对':speaker}${time?` · ${escapeHtml(time)}`:''}${!assistant&&!mock&&turn.version>1?` · 已修改，第 ${escapeHtml(turn.version)} 版`:''}</small>${sourceActions}${history}</div></article>`;
 }
 function conversationSafety(conversation){
   const elderTurns=elderArchiveTurns(conversation).filter(turn=>!isMockContent(turn)),danger=elderTurns.find(turn=>turn.local_safety?.danger_detected),review=elderTurns.find(turn=>turn.local_safety?.clinical_review_required);
-  return {danger_detected:Boolean(danger),danger_reminder:danger?.local_safety?.danger_reminder,clinical_review_required:Boolean(review),clinical_review_notice:review?.local_safety?.clinical_review_notice};
+  const reviewedRisks=(conversation.report?.reviewed_risk_assessments||[]).filter(assessment=>globalThis.HealthSafety?.reviewedRiskSourcesCurrent(assessment,elderTurns));
+  const reviewedRisk=reviewedRisks.find(assessment=>assessment.level==='urgent')||reviewedRisks.find(assessment=>assessment.level==='soon_evaluation');
+  return {danger_detected:Boolean(danger),danger_reminder:danger?.local_safety?.danger_reminder,clinical_review_required:Boolean(review),clinical_review_notice:review?.local_safety?.clinical_review_notice,reviewed_risk_level:reviewedRisk?.level,reviewed_risk_notice:reviewedRisk?.notice};
 }
 function conversationDetailHtml(conversation){
   const turns=liveArchiveTurns(conversation),elderTurns=elderArchiveTurns(conversation),elderCount=elderTurns.filter(turn=>!isMockContent(turn)).length,hasMock=elderTurns.some(isMockContent),date=conversationDateLabel(conversation);
@@ -660,7 +757,8 @@ function conversationDetailHtml(conversation){
 function renderConversationDetail(conversation){
   current=conversation;safetyBanner(conversationSafety(conversation));
   const pageTitle=$('detailPageTitle');if(pageTitle)pageTitle.textContent=`${conversationDateLabel(conversation)}完整对话`;
-  const d=$('detail');d.classList.remove('hidden');d.innerHTML=conversationDetailHtml(conversation);
+  const d=$('detail');if(typeof releaseOriginalsIn==='function')releaseOriginalsIn(d);d.classList.remove('hidden');d.innerHTML=conversationDetailHtml(conversation);
+  bindConversationSourceActions(d,conversation);
 }
 async function showConversationDetail(id){
   if(!showView('recordDetailView'))return;
@@ -673,7 +771,9 @@ async function showDetail(id){if(!showView('recordDetailView'))return;const requ
 function closeDetail(){showView('recordsView')}
 async function organize(e){
   const b=$('organizeBtn');if(!b||b.disabled)return;b.disabled=true;b.textContent='整理中…';
+  const request=detailRequestSerial;
   const x=await api('/api/events/'+e.record_id+'/organize',{method:'POST',body:JSON.stringify({expected_version:e.version})});
+  if(!detailStillCurrent(e,request)){await loadEvents();return}
   // A successful POST or 422 already carries the saved evidence. Render it
   // without a second GET, so losing the connection cannot hide the original.
   if(x.j.event||x.r.status===422){
@@ -688,9 +788,10 @@ async function organize(e){
 }
 async function review(e,action='confirm'){
   const b=$(action==='reject'?'rejectBtn':'reviewBtn');b.disabled=true;
+  const request=detailRequestSerial;
   const x=await api('/api/events/'+e.record_id+'/review',{method:'POST',body:JSON.stringify({expected_version:e.version,action,note:action==='confirm'?'仅确认记录准确，不代表医生确认或风险消失':'退回重新整理'})});
-  if(x.r.ok){toast(action==='confirm'?'已记录“记录准确”':'已退回重新整理');await loadEvents();await showDetail(e.record_id);}
-  else {b.disabled=false;toast('核对未确认，请刷新后重试');}
+  if(x.r.ok){toast(action==='confirm'?'已记录“记录准确”':'已退回重新整理');await loadEvents();if(detailStillCurrent(e,request))await showDetail(e.record_id);}
+  else if(detailStillCurrent(e,request)){b.disabled=false;toast('核对未确认，请刷新后重试');}
 }
 async function deleteRecord(e,button=null){
   if(!confirm('确定删除这条记录吗？删除后，这条记录、修订历史和关联原件会从当前设备移除；其他记录和旧备份不受影响。'))return false;
@@ -698,7 +799,7 @@ async function deleteRecord(e,button=null){
   const x=await api('/api/events/'+encodeURIComponent(e.record_id),{method:'DELETE',body:JSON.stringify({delete_scope_confirmed:true})});
   if(x.r.ok){handoffSelection.delete(e.record_id);await loadEvents();toast(`已删除这条记录${x.j.deleted.local_media_count?`和 ${x.j.deleted.local_media_count} 份关联原件`:''}；其他记录未改变`);return true}
   if(button){button.disabled=false;button.setAttribute('aria-label','删除这条记录')}
-  toast('删除未完成，这条记录仍然保留');return false;
+  toast(x.j.error==='conversation_source_changed'?'这条原话属于完整对话，请从就诊记录删除该对话；资料仍保留':'删除未完成，这条记录仍然保留');return false;
 }
 async function deleteConversation(conversation,button=null){
   if(!confirm('确定删除这条完整对话吗？删除后，这次对话、关联原话和本机临时录音会从当前设备移除；其他记录、健康背景和旧备份不受影响。'))return false;
@@ -706,7 +807,7 @@ async function deleteConversation(conversation,button=null){
   const x=await api('/api/conversations/'+encodeURIComponent(conversation.conversation_id),{method:'DELETE',body:JSON.stringify({delete_scope_confirmed:true,expected_version:conversation.version})});
   if(x.r.ok){if(activeConversation?.conversation_id===conversation.conversation_id)activeConversation=null;conversationRecordIds(conversation).forEach(recordId=>handoffSelection.delete(recordId));await loadEvents();toast(`已删除这条完整对话${x.j.deleted.local_media_count?`和 ${x.j.deleted.local_media_count} 份关联原件`:''}；其他记录未改变`);return true}
   if(button){button.disabled=false;button.setAttribute('aria-label','删除这条完整对话')}
-  toast(x.r.status===409?'这条对话已有新内容，请刷新后再删除':'删除未完成，这条对话仍然保留');return false;
+  toast(x.j.error==='conversation_source_shared'?'这条对话与其他对话共用原话，暂时不能单独删除；资料仍保留':x.r.status===409?'这条对话已有新内容，请刷新后再删除':'删除未完成，这条对话仍然保留');return false;
 }
 function revise(e){
   $('subview').innerHTML=`<h3 id="reviseTitle" tabindex="-1">修订记录</h3><label class="field-label" for="revText">修订后的原话</label><textarea id="revText" rows="4" aria-describedby="reviseStatus">${escapeHtml(e.raw_text)}</textarea><label class="field-label" for="revReason">修订原因（必填）</label><input id="revReason" required aria-describedby="reviseStatus"><button class="primary" id="submitRev">保存修订</button><div id="reviseStatus" role="status" aria-live="polite"></div>`;
@@ -732,7 +833,7 @@ async function handoff(){
   const x=await api('/api/handoffs',{method:'POST',body:handoffBody});b.disabled=false;b.textContent='生成就诊交接材料';
   if(!x.r.ok){const box=$('handoff');box.classList.remove('hidden');box.innerHTML='<div class="load-error" role="status"><b>交接材料暂时无法生成</b><span>原话和原件仍保留，请恢复连接后重试。</span></div>';toast('生成失败，请重试');return;}
   const h=x.j.handoff,box=$('handoff');box.classList.remove('hidden');
-  const conversationReports=(h.conversation_reports||[]).map(item=>`<article class="handoff-conversation"><div class="handoff-report-head"><b>${escapeHtml(item.report?.title||'就诊沟通记录')}</b><span class="badge warn">${escapeHtml(item.report?.status_label||'自动整理 · 本人未核对')}</span></div>${reportSectionsHtml(item.report)}<details class="report-transcript"><summary>查看完整对话（${item.transcript?.length||0} 轮）</summary><ol>${(item.transcript||[]).map(turn=>`<li><span>${turn.role==='assistant'?'小零':'老人'}</span><p>${escapeHtml(turn.text||'')}</p></li>`).join('')}</ol></details><p class="muted">报告第 ${escapeHtml(item.report?.version||1)} 版 · 内容来源为老人原话和已确认的本机健康背景</p></article>`).join('');
+  const conversationReports=(h.conversation_reports||[]).map(item=>`<article class="handoff-conversation"><div class="handoff-report-head"><b>${escapeHtml(item.report?.title||'就诊沟通记录')}</b><span class="badge warn">${escapeHtml(item.report?.status_label||'自动整理 · 本人未核对')}</span></div>${reportSectionsHtml(item.report)}${reportOriginalSourcesHtml(item.report)}<details class="report-transcript"><summary>查看完整对话（${item.transcript?.length||0} 轮）</summary><ol>${(item.transcript||[]).map(turn=>`<li><span>${turn.role==='assistant'?'小零':'老人'}</span><p>${escapeHtml(turn.text||'')}</p></li>`).join('')}</ol></details><p class="muted">报告第 ${escapeHtml(item.report?.version||1)} 版 · 内容来源为老人原话和已确认的本机健康背景</p></article>`).join('');
   box.innerHTML=`<div class="section-head"><h2 id="handoffTitle" tabindex="-1">就诊交接材料</h2><button class="view-btn" onclick="window.print()">打印</button></div><p class="handoff-disclaimer">用于沟通，不是诊断。不会提供加药、减药、停药、剂量或治疗方案。</p><p class="muted">下方列出所选记录关联的原件状态。打印只包含文字与状态，不包含照片；看图请在记录详情点“对照照片原件”。</p><p class="muted">生成于 ${dateText(h.created_at)} · ${h.unresolved_count||0} 项待处理。核对只确认记录准确，不代表医学风险已消除。</p>${conversationReports}`+
     (h.pending_documents||[]).map(i=>`<div class="handoff-item"><b>${dateText(i.recorded_at)} · 照片资料待核对</b><p>识别文字尚未对照原件确认，已从交接正文排除。请查看原件，不根据识别草稿作判断。</p><button class="outline" onclick="showDetail('${escapeHtml(i.record_id)}')">去核对原件</button></div>`).join('')+
     (h.items||[]).filter(i=>!documentNeedsReview(i)).map(i=>`<div class="handoff-item"><b>${dateText(i.recorded_at)} · ${escapeHtml(SOURCE_KIND_LABELS[i.source_kind]||'来源未标明')} · ${stateLabel(i.state)}</b>${i.draft?.summary&&i.draft.summary.trim()!==i.raw_text.trim()?`<p class="handoff-summary"><strong>整理摘要：</strong>${escapeHtml(i.draft.summary)}${i.draft.summary_edited_by==='user'?'<span class="badge">已手动修改</span>':''}</p>`:''}<p class="handoff-original"><strong>${i.source_kind==='document'?'资料文字（需对照原件）：':'原话：'}</strong>${escapeHtml(i.raw_text)}</p>${safetyHtml(i.local_safety)}${i.unresolved?'<span class="badge warn">仍有待处理事项</span>':''}</div>`).join('')+
@@ -766,6 +867,7 @@ function startSilenceWatch(stream){
   }catch{stopSilenceWatch();return false}
 }
 async function startVoice(){
+  if(typeof recognitionBusy!=='undefined'&&recognitionBusy.size){setVoiceStatus('这段语音还在识别或保存，请等完成。');return}
   if(voicePermissionPending||voiceUploadPending)return;
   if(mediaRecorder?.state==='recording'||$('recordBtn').classList.contains('recording')){$('finishVoiceBtn').onclick?.();return}
   const Recorder=globalThis.MediaRecorder,getUserMedia=globalThis.navigator?.mediaDevices?.getUserMedia;
@@ -774,25 +876,44 @@ async function startVoice(){
     const insecure=globalThis.isSecureContext===false||(protocol==='http:'&&!['localhost','127.0.0.1','::1'].includes(host));
     $('voiceHint').textContent=insecure?'当前页面不是安全连接，浏览器不开放麦克风；请使用安全连接，或到“看病资料”上传已有录音、直接输入文字':'此浏览器暂不支持直接录音；您可以到“看病资料”上传已有录音，或直接输入文字';setVoiceStatus($('voiceHint').textContent,'error');return;
   }
-  globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
-  let stream;
+  globalThis.speechSynthesis?.cancel?.();chunks=[];elapsedMs=0;clearInterval(timerId);timerId=null;updateTimer();voicePermissionPending=true;setRecording(false);$('voiceHint').textContent='正在准备录音，请稍候';setVoiceStatus('正在准备录音…');
+  const permissionGeneration=++voicePermissionGeneration,conversationId=activeConversation?.conversation_id;
+  let stream,preflightReady=false,tracksClosed=false;
+  const closePermissionStream=()=>{if(stream&&!tracksClosed){tracksClosed=true;stream.getTracks().forEach(track=>track.stop())}};
   try{
+    const trial=await globalThis.HealthLocal?.trialVoiceState?.();
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      $('voiceHint').textContent='本次录音准备已取消；麦克风未开启。';setVoiceStatus($('voiceHint').textContent);return;
+    }
+    if(trial&&trial.state!=='completed'){setVoiceStatus(trialVoiceMessage(trial),trial.state==='stopped'?'error':'ok');return}
+    preflightReady=true;$('voiceHint').textContent='请允许使用麦克风，授权后才开始录音';setVoiceStatus('正在请求麦克风权限…');
     stream=await getUserMedia.call(globalThis.navigator.mediaDevices,{audio:true});
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      closePermissionStream();$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus($('voiceHint').textContent);return;
+    }
+    cancelPendingMicrophone=closePermissionStream;
+    const lateTrial=await globalThis.HealthLocal?.trialVoiceState?.();
+    if(permissionGeneration!==voicePermissionGeneration||activeConversation?.conversation_id!==conversationId||lateTrial&&lateTrial.state!=='completed'||typeof recognitionBusy!=='undefined'&&recognitionBusy.size){
+      closePermissionStream();$('voiceHint').textContent='本次录音已暂停；麦克风已关闭。';setVoiceStatus(lateTrial&&lateTrial.state!=='completed'?trialVoiceMessage(lateTrial):$('voiceHint').textContent,lateTrial?.state==='stopped'?'error':'ok');return;
+    }
     const preferred=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(type=>typeof Recorder.isTypeSupported==='function'&&Recorder.isTypeSupported(type));
     try{mediaRecorder=preferred?new Recorder(stream,{mimeType:preferred}):new Recorder(stream)}catch{mediaRecorder=new Recorder(stream)}
     const recordingChunks=chunks;
     mediaRecorder.ondataavailable=e=>{if(e.data.size)recordingChunks.push(e.data)};
-    mediaRecorder.onstop=()=>stream.getTracks().forEach(t=>t.stop());
+    mediaRecorder.onstop=closePermissionStream;
     mediaRecorder.onerror=()=>{ $('voiceHint').textContent='录音遇到问题；请结束这一段，系统会尽量保留已录部分';setVoiceStatus('录音遇到问题；请结束这一段，系统会尽量保留已录部分。','error'); };
-    mediaRecorder.start();const autoStop=startSilenceWatch(stream);startedAt=Date.now();timerId=setInterval(updateTimer,1000);$('voiceHint').textContent=autoStop?'正在听，停顿约 3 秒会自动结束':'正在录音；请听完后按“结束这句话”';setVoiceStatus(autoStop?'您慢慢说；停顿约 3 秒会自动保存并回复。':'您慢慢说；听完后按“结束这句话”，录音会自动保存。');
+    cancelPendingMicrophone=null;mediaRecorder.start();const autoStop=startSilenceWatch(stream);startedAt=Date.now();timerId=setInterval(updateTimer,1000);$('voiceHint').textContent=autoStop?'正在听，停顿约 3 秒会自动结束':'正在录音；请听完后按“结束这句话”';setVoiceStatus(autoStop?'您慢慢说；停顿约 3 秒会自动保存并回复。':'您慢慢说；听完后按“结束这句话”，录音会自动保存。');
   }catch(e){
-    stream?.getTracks().forEach(t=>t.stop());mediaRecorder=null;clearInterval(timerId);timerId=null;
+    closePermissionStream();mediaRecorder=null;clearInterval(timerId);timerId=null;
+    if(!preflightReady){$('voiceHint').textContent='暂时无法确认录音状态；麦克风未开启，请重试。';setVoiceStatus($('voiceHint').textContent,'error');return}
     const name=e?.name||'';
     const message=name==='NotAllowedError'||name==='PermissionDeniedError'?'麦克风权限未允许；您可以在浏览器设置中开启，或直接输入文字。':name==='NotFoundError'||name==='DevicesNotFoundError'?'没有找到可用麦克风；请检查设备，或直接输入文字。':name==='NotReadableError'||name==='TrackStartError'?'麦克风正在被其他应用使用；请关闭后重试，或直接输入文字。':name==='SecurityError'||globalThis.location?.protocol==='http:'&&!['localhost','127.0.0.1'].includes(globalThis.location?.hostname)?'当前页面不允许使用麦克风；请在安全连接中打开，或直接输入文字。':'麦克风未能开启；请检查权限或设备，也可以上传已有录音或直接输入文字。';
     $('voiceHint').textContent=message;setVoiceStatus(message,'error');
-  }finally{voicePermissionPending=false;setRecording(mediaRecorder?.state==='recording');updateTimer()}
+  }finally{if(cancelPendingMicrophone===closePermissionStream)cancelPendingMicrophone=null;voicePermissionPending=false;setRecording(mediaRecorder?.state==='recording');updateTimer()}
 }
 function stopVoice(reason){
+  voicePermissionGeneration++;
+  const cancelPermission=cancelPendingMicrophone;cancelPendingMicrophone=null;cancelPermission?.();
   if(mediaRecorder?.state==='recording')elapsedMs+=Date.now()-startedAt;
   clearInterval(timerId);timerId=null;stopSilenceWatch();
   let failed=false;
@@ -825,30 +946,232 @@ if(document.body)for(const id of ['healthContextPickerPanel','conversationReport
 setVoiceComposerEnabled(true);
 async function refreshStorageStatus(){if(!localMode||!$('storageStatus'))return;try{const s=await HealthLocal.storageStatus(),used=(s.usage/1024/1024).toFixed(1),quota=s.quota?`${(s.quota/1024/1024).toFixed(0)} MB`:'未知';$('storageStatus').textContent=`已使用约 ${used} MB / 可用额度 ${quota}。${s.persisted?'浏览器已批准持久存储。':'浏览器尚未批准持久存储，请定期下载备份。'}`}catch{$('storageStatus').textContent='无法读取本机存储额度，请定期下载加密备份。'}}
 const HEALTH_CONTEXT_FIELDS={conditions:'healthConditions',medications:'healthMedications',allergies:'healthAllergies',procedures:'healthProcedures',tests:'healthTests',similar_episodes:'healthSimilarEpisodes'};
+function healthSubjectLabel(subjectId=activeHealthSubjectId){return healthSubjects.find(subject=>subject.subject_id===subjectId)?.label||(subjectId==='subject_self'?'本人':'所属人待读取')}
+const HEALTH_MEMORY_TEMPORAL_LABELS={current:'目前仍适用',historical:'过去的情况',uncertain:'不确定 · 待核实'};
+const HEALTH_MEMORY_SOURCE_LABELS={self_statement:'本人陈述',family_report:'家属转述',document:'已有资料'};
+const HEALTH_MEMORY_FORM_FIELDS=['healthMemoryCategory','healthMemoryText','healthMemoryTemporalStatus','healthMemorySourceKind','healthMemoryOccurredOn','healthMemoryConfirmedBy','healthMemoryConfirmed','healthMemoryRemember'];
+function updateHealthSubjectLabels(){
+  const label=$('voiceSubjectLabel');if(label)label.textContent=`当前记录：${healthSubjectLabel(activeConversation?.subject_id||activeHealthSubjectId)}`;
+}
+function renderHealthSubjects(){
+  const select=$('healthSubjectSelect');if(select){select.innerHTML=healthSubjects.map(subject=>`<option value="${escapeHtml(subject.subject_id)}">${escapeHtml(subject.label)}${subject.relationship==='family'?'（家属）':''}</option>`).join('');select.value=activeHealthSubjectId;select.disabled=healthMemoryBusy||healthSubjectSwitchBusy}
+  updateHealthSubjectLabels();
+}
+function markHealthSubjectChanged(){
+  healthSubjectChanged=true;
+  const message='另一页面已切换所属人；本页输入仍保留。请先重新选择当前所属人，再继续保存或对话。';
+  if($('healthSubjectStatus'))$('healthSubjectStatus').textContent=message;
+  const notice=$('healthSubjectConflictNotice');if(notice){notice.textContent=message;notice.classList.remove('hidden')}
+  $('reselectHealthSubjectBtn')?.classList.remove('hidden');
+  healthMemoryStatus(message,'error');setVoiceComposerEnabled(false);setHealthMemoryBusy(healthMemoryBusy);
+}
+function clearHealthSubjectChangedNotice(){
+  healthSubjectChanged=false;$('healthSubjectConflictNotice')?.classList.add('hidden');$('reselectHealthSubjectBtn')?.classList.add('hidden');
+}
+async function loadHealthSubjects(){
+  if(!localMode)return false;
+  const epoch=healthSubjectUiEpoch,x=await api('/api/health-subjects');if(epoch!==healthSubjectUiEpoch)return false;
+  if(!x.r.ok){if($('healthSubjectStatus'))$('healthSubjectStatus').textContent='所属人暂时无法读取；请重试。';return false}
+  const actual=x.j.active_subject_id||'subject_self',observed=x.j.observed_subject_id;
+  healthSubjects=Array.isArray(x.j.subjects)?x.j.subjects:[];healthSubjectsVersion=x.j.version;
+  if(healthSubjectLoaded&&(actual!==activeHealthSubjectId||observed&&observed!==activeHealthSubjectId)){markHealthSubjectChanged();renderHealthSubjects();return false}
+  if(!healthSubjectLoaded){const unsaved=$('healthMemoryText')?.value.trim()||$('voiceTextInput')?.value.trim();healthSubjectLoaded=true;if(unsaved&&actual!==activeHealthSubjectId){markHealthSubjectChanged();renderHealthSubjects();return false}activeHealthSubjectId=observed||actual;if(activeHealthSubjectId!==actual){markHealthSubjectChanged();renderHealthSubjects();return false}}
+  renderHealthSubjects();return true;
+}
+function healthMemoryFormEntry(){
+  const confirmed=$('healthMemoryConfirmed')?.checked===true,temporal=$('healthMemoryTemporalStatus')?.value||'uncertain';
+  return {category:$('healthMemoryCategory')?.value||'conditions',text:$('healthMemoryText')?.value||'',temporal_status:temporal,source_kind:$('healthMemorySourceKind')?.value||'self_statement',occurred_on:$('healthMemoryOccurredOn')?.value||null,confirmation_status:confirmed?'confirmed':'unconfirmed',confirmed_by:$('healthMemoryConfirmedBy')?.value||'self',remember:$('healthMemoryRemember')?.checked===true&&confirmed&&['current','historical'].includes(temporal)};
+}
+function updateHealthMemoryRememberEligibility(){
+  const remember=$('healthMemoryRemember');if(!remember)return;
+  const allowed=$('healthMemoryConfirmed')?.checked===true&&['current','historical'].includes($('healthMemoryTemporalStatus')?.value);
+  remember.disabled=healthMemoryBusy||!allowed;if(!allowed)remember.checked=false;
+}
+function resetHealthMemoryForm(){
+  healthMemoryEditingId=null;
+  const defaults={healthMemoryCategory:'conditions',healthMemoryText:'',healthMemoryTemporalStatus:'uncertain',healthMemorySourceKind:'self_statement',healthMemoryOccurredOn:'',healthMemoryConfirmedBy:'self'};
+  for(const [id,value] of Object.entries(defaults))if($(id))$(id).value=value;
+  for(const id of ['healthMemoryConfirmed','healthMemoryRemember'])if($(id))$(id).checked=false;
+  if($('healthMemoryFormTitle'))$('healthMemoryFormTitle').textContent='添加一项健康背景';
+  if($('saveHealthMemoryBtn'))$('saveHealthMemoryBtn').textContent='保存这一项';
+  updateHealthMemoryRememberEligibility();
+}
+function healthMemoryStatus(message,tone=''){
+  const status=$('healthMemoryStatus');if(status){status.textContent=message;status.className='status align-left'+(tone?' '+tone:'')}
+}
+function setHealthMemoryBusy(busy){
+  healthMemoryBusy=busy;
+  for(const id of ['saveHealthMemoryBtn','cancelHealthMemoryEditBtn','addHealthSubjectBtn','healthSubjectSelect'])if($(id))$(id).disabled=busy||healthSubjectSwitchBusy||healthSubjectChanged&&['saveHealthMemoryBtn','addHealthSubjectBtn'].includes(id);
+  if($('reselectHealthSubjectBtn'))$('reselectHealthSubjectBtn').disabled=busy||healthSubjectSwitchBusy;
+  $('healthMemoryList')?.querySelectorAll('button').forEach(button=>button.disabled=busy||healthSubjectSwitchBusy||healthSubjectChanged||button.dataset.memoryIneligible==='true');
+  updateHealthMemoryRememberEligibility();
+}
+function renderHealthMemory(){
+  const list=$('healthMemoryList');if(!list)return;
+  if(!healthMemoryEntries.length){list.innerHTML=`<p class="muted">${escapeHtml(healthSubjectLabel())}还没有保存健康背景；可以先空着。</p>`;return}
+  list.innerHTML=healthMemoryEntries.map(entry=>{
+    const id=escapeHtml(entry.context_id),confirmed=entry.confirmation_status==='confirmed',eligible=confirmed&&['current','historical'].includes(entry.temporal_status),temporal=HEALTH_MEMORY_TEMPORAL_LABELS[entry.temporal_status]||'时间状态未核对';
+    const category=entry.category==='medications'?'药物使用记录':HEALTH_CONTEXT_CATEGORY_LABELS[entry.category]||'健康背景';
+    const recorded=entry.recorded_at?dateText(entry.recorded_at):'未知',updated=entry.updated_at?dateText(entry.updated_at):'未知',confirmedAt=entry.confirmed_at?dateText(entry.confirmed_at):'未确认';
+    return `<article class="health-memory-item" data-health-memory-id="${id}"><div class="badges"><span class="badge">${escapeHtml(category)}</span><span class="badge${confirmed?'':' warn'}">${confirmed?'原文已核对':'尚未核对'}</span><span class="badge">${escapeHtml(temporal)}</span>${entry.remember?'<span class="badge">以后对话记住</span>':''}</div><p class="health-memory-text">${escapeHtml(entry.text||'')}</p><dl class="health-memory-provenance"><div><dt>所属人</dt><dd>${escapeHtml(healthSubjectLabel(entry.subject_id||activeHealthSubjectId))}</dd></div><div><dt>原文来源</dt><dd>${escapeHtml(HEALTH_MEMORY_SOURCE_LABELS[entry.source_kind]||'来源未核对')}</dd></div><div><dt>记录时间</dt><dd>${escapeHtml(recorded)}</dd></div><div><dt>更新时间</dt><dd>${escapeHtml(updated)}</dd></div><div><dt>情况日期</dt><dd>${escapeHtml(entry.occurred_on||'未填写')}</dd></div><div><dt>核对人 / 时间</dt><dd>${confirmed?escapeHtml((entry.confirmed_by==='family'?'家属':'本人')+' / '+confirmedAt):'未确认'}</dd></div></dl><div class="health-memory-actions"><button class="outline" type="button" data-health-memory-edit="${id}">更正</button><button class="outline" type="button" data-health-memory-remember="${id}"${eligible?'':' disabled data-memory-ineligible="true"'}>${entry.remember?'停止自动记住':'以后记住'}</button><button class="outline" type="button" data-health-memory-revoke="${id}"${confirmed?'':' disabled data-memory-ineligible="true"'}>取消记忆与确认</button><button class="danger-button" type="button" data-health-memory-delete="${id}">删除</button></div></article>`;
+  }).join('');
+  list.querySelectorAll('[data-health-memory-edit]').forEach(button=>button.onclick=()=>editHealthMemoryEntry(button.dataset.healthMemoryEdit));
+  for(const action of ['remember','revoke','delete'])list.querySelectorAll(`[data-health-memory-${action}]`).forEach(button=>button.onclick=()=>void mutateHealthMemoryEntry(button.dataset[`healthMemory${action[0].toUpperCase()+action.slice(1)}`],action));
+  setHealthMemoryBusy(healthMemoryBusy);
+}
+async function loadHealthMemory({preserveStatus=false}={}){
+  if(!localMode||!$('healthMemoryList'))return false;
+  if(!preserveStatus)healthMemoryStatus('正在读取本机长期记忆…');
+  if(!await loadHealthSubjects())return false;
+  const epoch=healthSubjectUiEpoch,x=await api('/api/health-memory');if(epoch!==healthSubjectUiEpoch)return false;
+  if(!x.r.ok){healthMemoryStatus('长期记忆暂时无法读取；输入和原有资料不会删除。','error');return false}
+  if(x.j.health_context?.subject_id&&x.j.health_context.subject_id!==activeHealthSubjectId){healthMemoryStatus('所属人已变化，请重新读取资料。','error');return false}
+  healthMemoryEntries=Array.isArray(x.j.health_context?.entries)?x.j.health_context.entries:[];healthMemoryVersion=x.j.health_context?.version;
+  renderHealthMemory();await loadHealthContext();
+  if(!preserveStatus)healthMemoryStatus(`当前为${healthSubjectLabel()}保存 ${healthMemoryEntries.length} 项背景，${healthMemoryEntries.filter(entry=>entry.remember).length} 项将在新对话沿用。`);
+  return true;
+}
+function editHealthMemoryEntry(contextId){
+  if(healthMemoryBusy)return false;
+  const entry=healthMemoryEntries.find(item=>item.context_id===contextId);if(!entry)return false;
+  healthMemoryEditingId=contextId;
+  const values={healthMemoryCategory:entry.category,healthMemoryText:entry.text,healthMemoryTemporalStatus:entry.temporal_status||'uncertain',healthMemorySourceKind:entry.source_kind||'self_statement',healthMemoryOccurredOn:entry.occurred_on||'',healthMemoryConfirmedBy:entry.confirmed_by||'self'};
+  for(const [id,value] of Object.entries(values))if($(id))$(id).value=value;
+  // A correction needs a fresh, explicit confirmation of the changed wording.
+  if($('healthMemoryConfirmed'))$('healthMemoryConfirmed').checked=false;if($('healthMemoryRemember'))$('healthMemoryRemember').checked=false;
+  if($('healthMemoryFormTitle'))$('healthMemoryFormTitle').textContent='更正这项健康背景';if($('saveHealthMemoryBtn'))$('saveHealthMemoryBtn').textContent='保存更正';
+  updateHealthMemoryRememberEligibility();$('healthMemoryText')?.focus?.();return true;
+}
+function healthMemoryFailureMessage(error){
+  if(error==='subject_changed'||error==='subject_mismatch')return '另一页面已切换所属人；这次没有保存，输入仍保留。请重新选择当前所属人后再继续。';
+  if(error==='stale_health_memory'||error==='stale_health_subjects')return '资料已在另一页面更新，已重新读取；你正在填写的内容仍保留，请核对后重试。';
+  if(error==='health_memory_remember_limit')return '保存没有完成：最多记住 5 项，请先取消一项自动记忆。输入仍保留。';
+  if(error==='health_memory_remember_invalid')return '只有已核对且时间状态明确的资料才能记住。输入仍保留。';
+  if(error==='local_operations_busy')return '还有记录正在保存或识别，请等完成后重试。';
+  return '保存没有完成；请检查原文、日期和状态，输入仍保留，可以重试。';
+}
+async function refreshConversationAfterHealthMemoryChange(){
+  clearRecordPanels();closeConversationReport();contextPickerRequestId++;healthContextEntries=[];contextDraftSelection.clear();closeHealthContextPicker();
+  if(activeConversation?.conversation_id){
+    const id=activeConversation.conversation_id,epoch=healthSubjectUiEpoch;
+    // Remove cached analysis immediately, then fetch the store's rebuilt report.
+    activeConversation=null;renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(false);
+    const x=await api(`/api/conversations/${encodeURIComponent(id)}`);if(epoch!==healthSubjectUiEpoch)return;
+    if(x.r.ok&&x.j.conversation)syncConversation(x.j.conversation,{speak:false});else{renderVoiceConversation();setVoiceStatus('背景已更新；当前对话暂时无法读取，请重新进入。','error')}
+  }
+  await loadEvents();
+}
+async function saveHealthMemory(event){
+  event?.preventDefault();if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const entry=healthMemoryFormEntry();if(!entry.text.trim()){healthMemoryStatus('请先填写要保留的原文。','error');$('healthMemoryText')?.focus?.();return false}
+  if(entry.occurred_on&&entry.occurred_on>new Date().toISOString().slice(0,10)){healthMemoryStatus('情况日期不能晚于今天；输入仍保留，请更正日期。','error');$('healthMemoryOccurredOn')?.focus?.();return false}
+  const editingId=healthMemoryEditingId,epoch=healthSubjectUiEpoch;
+  setHealthMemoryBusy(true);healthMemoryStatus('正在加密保存这一项…');
+  try{
+    const path=editingId?`/api/health-memory/${encodeURIComponent(editingId)}`:'/api/health-memory';
+    const x=await api(path,{method:editingId?'PATCH':'POST',body:JSON.stringify({subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion,expected_version:healthMemoryVersion,entry})});if(epoch!==healthSubjectUiEpoch)return false;
+    if(!x.r.ok){if(['subject_changed','subject_mismatch'].includes(x.j.error)){markHealthSubjectChanged();await loadHealthSubjects()}else if(x.r.status===409)await loadHealthMemory({preserveStatus:true});healthMemoryStatus(healthMemoryFailureMessage(x.j.error),'error');return false}
+    resetHealthMemoryForm();await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange();healthMemoryStatus('已保存；新对话按最新记忆使用，当前报告也已更新。');return true;
+  }catch{healthMemoryStatus('保存没有完成；输入仍保留，可以重试。','error');return false}
+  finally{setHealthMemoryBusy(false)}
+}
+async function mutateHealthMemoryEntry(contextId,action){
+  if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const entry=healthMemoryEntries.find(item=>item.context_id===contextId);if(!entry)return false;
+  if(action==='delete'&&!confirm('删除这项长期背景？以后新对话不会再使用它；既有原始对话仍保留。'))return false;
+  const epoch=healthSubjectUiEpoch,changes=action==='revoke'?{confirmation_status:'unconfirmed',remember:false}:{remember:!entry.remember};
+  const updated={category:entry.category,text:entry.text,temporal_status:entry.temporal_status||'uncertain',source_kind:entry.source_kind||'self_statement',occurred_on:entry.occurred_on||null,confirmed_by:entry.confirmed_by||'self',confirmation_status:entry.confirmation_status,remember:entry.remember,...changes};
+  setHealthMemoryBusy(true);
+  try{
+    const x=await api(`/api/health-memory/${encodeURIComponent(contextId)}`,{method:action==='delete'?'DELETE':'PATCH',body:JSON.stringify({subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion,expected_version:healthMemoryVersion,...(action==='delete'?{}:{entry:updated})})});if(epoch!==healthSubjectUiEpoch)return false;
+    if(!x.r.ok){if(['subject_changed','subject_mismatch'].includes(x.j.error)){markHealthSubjectChanged();await loadHealthSubjects()}else if(x.r.status===409)await loadHealthMemory({preserveStatus:true});healthMemoryStatus(healthMemoryFailureMessage(x.j.error),'error');return false}
+    if(action==='delete'&&healthMemoryEditingId===contextId)resetHealthMemoryForm();
+    await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange();healthMemoryStatus(action==='delete'?'已删除；以后新对话不再使用这项背景。':action==='revoke'?'已取消确认和记忆；这项背景不会发送给联网 AI。':updated.remember?'以后新对话会带上这项已确认背景。':'已停止自动记住；之后仍可在对话中手动选择。');return true;
+  }catch{healthMemoryStatus('操作没有完成；原有资料和填写内容仍保留，请重试。','error');return false}
+  finally{setHealthMemoryBusy(false)}
+}
+function clearHealthSubjectDisplays(){
+  healthSubjectUiEpoch++;detailRequestSerial++;contextPickerRequestId++;voicePermissionGeneration++;
+  activeConversation=null;current=null;events=[];conversations=[];conversationEditingTurnId=null;pendingConversationTurn=null;pendingMediaRetry=null;lastSpokenTurnId=null;
+  healthMemoryEntries=[];healthMemoryVersion=0;healthContextEntries=[];contextDraftSelection.clear();handoffSelection.clear();knownHandoffEvents.clear();
+  globalThis.speechSynthesis?.cancel?.();closeConversationReport();closeHealthContextPicker();clearRecordPanels();
+  if(typeof releaseOriginalsIn==='function')for(const id of ['archivePhotos','photoPreview','voiceConversationTurns'])releaseOriginalsIn($(id));
+  if(typeof mediaItems!=='undefined')mediaItems=[];if(typeof selectedPhoto!=='undefined')selectedPhoto=null;if(typeof pendingRecordingBlob!=='undefined')pendingRecordingBlob=null;
+  for(const id of ['archivePhotos','photoPreview','homeRecent','eventsList','archiveEvents'])if($(id))$(id).innerHTML='';
+  for(const id of ['voiceTextInput','photoInput','audioUploadInput'])if($(id))$(id).value='';
+  $('savePhotoBtn')?.classList.add('hidden');$('photoPreview')?.classList.add('hidden');$('conversationResumeChoice')?.classList.add('hidden');
+  resetHealthMemoryForm();renderVoiceConversation();renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(false);
+}
+async function activateHealthSubject(subjectId){
+  if(subjectId===activeHealthSubjectId&&!healthSubjectChanged)return true;
+  const reselectSame=subjectId===activeHealthSubjectId&&healthSubjectChanged;
+  const status=$('healthSubjectStatus'),select=$('healthSubjectSelect');
+  const busy=healthMemoryBusy||saveBusy||conversationLoading||mediaRecorder?.state==='recording'||voicePermissionPending||voiceUploadPending||typeof uploadBusy!=='undefined'&&uploadBusy||typeof recognitionBusy!=='undefined'&&recognitionBusy.size;
+  if(busy){if(select)select.value=activeHealthSubjectId;if(status)status.textContent='请等当前保存、录音或识别完成，再切换所属人。';return false}
+  if(!reselectSame&&($('voiceTextInput')?.value.trim()||$('healthMemoryText')?.value.trim()||typeof selectedPhoto!=='undefined'&&selectedPhoto)){if(select)select.value=activeHealthSubjectId;if(status)status.textContent='还有未保存的输入；请先保存或清空，再切换所属人。';return false}
+  const preservedDraft=reselectSame?{editingId:healthMemoryEditingId,fields:HEALTH_MEMORY_FORM_FIELDS.map(id=>({id,value:$(id)?.value,checked:$(id)?.checked})),legacyFields:typeof HEALTH_CONTEXT_FIELDS!=='undefined'?Object.values(HEALTH_CONTEXT_FIELDS).map(id=>({id,value:$(id)?.value})):[],voiceText:$('voiceTextInput')?.value||''}:null;
+  healthSubjectSwitchBusy=true;setHealthMemoryBusy(true);setVoiceComposerEnabled(false);
+  try{
+    await pauseConversation();
+    const x=await api('/api/health-subjects/active',{method:'POST',body:JSON.stringify({subject_id:subjectId,expected_version:healthSubjectsVersion})});
+    if(!x.r.ok){if(select)select.value=activeHealthSubjectId;if(x.r.status===409)await loadHealthSubjects();if(status)status.textContent=healthMemoryFailureMessage(x.j.error);return false}
+    clearHealthSubjectDisplays();activeHealthSubjectId=x.j.active_subject_id||subjectId;healthSubjectsVersion=x.j.version||healthSubjectsVersion;healthSubjectLoaded=true;clearHealthSubjectChangedNotice();
+    if(preservedDraft){healthMemoryEditingId=preservedDraft.editingId;for(const field of preservedDraft.fields){const input=$(field.id);if(input){input.value=field.value;input.checked=field.checked}}if($('voiceTextInput'))$('voiceTextInput').value=preservedDraft.voiceText;if(healthMemoryEditingId){$('healthMemoryFormTitle').textContent='更正这项健康背景';$('saveHealthMemoryBtn').textContent='保存更正'}updateHealthMemoryRememberEligibility()}
+    await loadHealthMemory();if(preservedDraft)for(const field of preservedDraft.legacyFields)if($(field.id))$(field.id).value=field.value;await loadEvents();if(typeof loadMedia==='function')await loadMedia();updateHealthSubjectLabels();if(status)status.textContent=reselectSame?`已重新选择${healthSubjectLabel()}；未保存的输入仍保留，可以继续核对。`:`已切换为${healthSubjectLabel()}；下一段对话将单独记录。`;return true;
+  }finally{healthSubjectSwitchBusy=false;setHealthMemoryBusy(false);if(activeConversation)setVoiceComposerEnabled(true)}
+}
+async function createHealthSubject(){
+  if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const input=$('newHealthSubjectLabel'),status=$('healthSubjectStatus'),label=input?.value.trim();if(!label){if(status)status.textContent='请填写一个家属称呼，不需要身份证号或其他详细资料。';input?.focus?.();return false}
+  setHealthMemoryBusy(true);
+  try{
+    const x=await api('/api/health-subjects',{method:'POST',body:JSON.stringify({label,relationship:'family',expected_version:healthSubjectsVersion})});
+    if(!x.r.ok){if(x.r.status===409)await loadHealthSubjects();if(status)status.textContent=healthMemoryFailureMessage(x.j.error);return false}
+    input.value='';await loadHealthSubjects();if(status)status.textContent='家属称呼已保存；请在上方选择后为其记录。';return true;
+  }finally{setHealthMemoryBusy(false)}
+}
 async function loadHealthContext(){
   if(!localMode||!$('healthContextStatus'))return;
+  const controls=[...Object.values(HEALTH_CONTEXT_FIELDS).map(id=>$(id)),$('saveHealthContextBtn')].filter(Boolean);
+  controls.forEach(control=>control.disabled=true);
   const status=$('healthContextStatus');status.textContent='正在读取本机健康背景…';
-  const x=await api('/api/health-context');
-  if(!x.r.ok){status.textContent='健康背景暂时无法读取，原有内容不会删除。';return}
-  const entries=x.j.health_context?.entries||[];
-  for(const [category,id] of Object.entries(HEALTH_CONTEXT_FIELDS)){const input=$(id);if(input)input.value=entries.filter(item=>item.category===category).map(item=>item.text).join('\n')}
-  status.textContent=entries.length?`已在本机保存 ${entries.length} 项确认背景。不会自动发送；请在每段对话中自行选择。`:'还没有保存健康背景；可以先空着。';
+  try{
+    const x=await api('/api/health-context');
+    if(!x.r.ok){status.textContent='健康背景暂时无法读取，原有内容不会删除。';return}
+    const entries=x.j.health_context?.entries||[];
+    for(const [category,id] of Object.entries(HEALTH_CONTEXT_FIELDS)){const input=$(id);if(input)input.value=entries.filter(item=>item.category===category).map(item=>item.text).join('\n')}
+    status.textContent=entries.length?`有 ${entries.length} 项背景可在对话中手动选择。日期和长期记忆请在上方逐项管理。`:'还没有可手动选择的健康背景；可以先空着。';
+  }finally{const protectedEntries=typeof healthMemoryEntries!=='undefined'&&healthMemoryEntries.some(entry=>entry.legacy_entry!==true);controls.forEach(control=>control.disabled=protectedEntries);if(protectedEntries)status.textContent='已启用逐项管理；请在上方更正资料，原有入口停止整体替换。';}
 }
 async function saveHealthContext(){
   const button=$('saveHealthContextBtn'),status=$('healthContextStatus');if(!button||!status)return;
+  if(typeof healthSubjectChanged!=='undefined'&&healthSubjectChanged){if(typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();status.textContent='另一页面已切换所属人；输入仍保留，请重新选择后再保存。';return false}
+  if(typeof healthMemoryEntries!=='undefined'&&healthMemoryEntries.some(entry=>entry.legacy_entry!==true)){status.textContent='请在上方逐项更正资料，避免整体替换丢失长期记忆。';return false}
   const fields=Object.fromEntries(Object.entries(HEALTH_CONTEXT_FIELDS).map(([category,id])=>[category,$(id)?.value||'']));
   button.disabled=true;button.textContent='保存中…';status.textContent='正在加密保存在本机…';
-  const x=await api('/api/health-context',{method:'POST',body:JSON.stringify({fields})});
+  const x=await api('/api/health-context',{method:'POST',body:JSON.stringify({fields,...(typeof activeHealthSubjectId!=='undefined'?{subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion}:{})})});
   button.disabled=false;button.textContent='保存健康背景';
   const error=x.j?.error;
-  status.textContent=x.r.ok?`已加密保存在本机，共 ${x.j.health_context?.entries?.length||0} 项。不会自动发送；每段对话可单独选择。`:error==='health_context_too_many'?'保存没有完成：每类最多 12 项，总共最多 30 项；每项最多 500 字。输入仍保留，请删减后重试。':error==='health_context_text_too_long'?'保存没有完成：每项最多 500 字。输入仍保留，请缩短后重试。':'保存没有完成，输入仍保留，可以重试。';
+  if(['subject_changed','subject_mismatch'].includes(error)&&typeof markHealthSubjectChanged==='function'){markHealthSubjectChanged();await loadHealthSubjects()}
+  status.textContent=x.r.ok?`已加密保存在本机，共 ${x.j.health_context?.entries?.length||0} 项。不会自动发送；每段对话可单独选择。`:['subject_changed','subject_mismatch'].includes(error)?'另一页面已切换所属人；这次没有保存，输入仍保留，请重新选择后继续。':error==='health_context_requires_memory_editor'?'已有逐项管理资料；请使用上方更正入口。输入仍保留。':error==='health_context_too_many'?'保存没有完成：每类最多 12 项，总共最多 30 项；每项最多 500 字。输入仍保留，请删减后重试。':error==='health_context_text_too_long'?'保存没有完成：每项最多 500 字。输入仍保留，请缩短后重试。':'保存没有完成，输入仍保留，可以重试。';
+  if(x.r.ok&&$('healthMemoryList')){await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange()}
 }
-async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);status.textContent='恢复完成，正在重新读取记录。';await loadEvents();return true}catch{status.textContent='备份无法验证或已损坏，当前数据未被覆盖。';return false}}
+async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);if(typeof clearHealthSubjectDisplays==='function')clearHealthSubjectDisplays();status.textContent='恢复完成，正在重新读取记录。';if(typeof loadHealthMemory==='function')await loadHealthMemory();await loadEvents();return true}catch(error){status.textContent=['local_operations_busy','vault_restore_in_progress'].includes(error.message)?'还有记录正在保存、回复或识别，请等完成后再恢复。当前资料未被替换。':['vault_changed_requires_unlock','vault_locked'].includes(error.message)?'这份资料库已在其他页面恢复，请刷新并重新解锁后再操作。':'备份无法验证或已损坏，当前数据未被覆盖。';return false}}
 if($('downloadBackupBtn'))$('downloadBackupBtn').onclick=async()=>{const s=$('backupStatus');try{await HealthLocal.downloadBackup();s.textContent='加密备份已生成，请确认浏览器的下载位置。'}catch{s.textContent='备份生成失败，本机数据未改变。'}};
 if($('restoreBackupInput'))$('restoreBackupInput').onchange=async e=>{const file=e.target.files?.[0],s=$('backupStatus');e.target.value='';if(file)await restoreEncryptedBackup(file,s)};
 if($('lockVaultBtn'))$('lockVaultBtn').onclick=()=>{HealthLocal.lock();location.reload()};
 if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('feedbackText').value,s=$('feedbackStatus');try{await HealthLocal.saveFeedback(text,document.querySelector('.view.active')?.id);$('feedbackText').value='';s.textContent='内测问题已加密保存在本机，未附带健康原文。'}catch{s.textContent='请先写下问题描述（不要粘贴密钥）。'}};
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
+if($('healthMemoryForm'))$('healthMemoryForm').onsubmit=saveHealthMemory;
+if($('cancelHealthMemoryEditBtn'))$('cancelHealthMemoryEditBtn').onclick=resetHealthMemoryForm;
+for(const id of ['healthMemoryConfirmed','healthMemoryTemporalStatus'])if($(id))$(id).onchange=updateHealthMemoryRememberEligibility;
+if($('healthSubjectSelect'))$('healthSubjectSelect').onchange=event=>void activateHealthSubject(event.target.value);
+if($('addHealthSubjectBtn'))$('addHealthSubjectBtn').onclick=createHealthSubject;
+if($('reselectHealthSubjectBtn'))$('reselectHealthSubjectBtn').onclick=async()=>{await loadHealthSubjects();await activateHealthSubject(activeHealthSubjectId)};
+if($('healthMemoryOccurredOn'))$('healthMemoryOccurredOn').max=new Date().toISOString().slice(0,10);
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
-health().then(loadEvents);
-if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=real-acceptance-20260930-7',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});
+health().then(async()=>{if(localMode)await loadHealthSubjects();await loadEvents()});
+if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=report-conversion-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

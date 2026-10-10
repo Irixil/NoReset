@@ -16,7 +16,8 @@ try:
  from .media_backend import create_default_media_backend
  from .media_store import MediaStoreError
  from .recognition import RecognitionError, recognize_file
- from .safety import scan_danger, document_needs_review
+ from .model_client import reset_trial_context, stop_current_trial, trial_control
+ from .safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from .store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 except ImportError:
  from adapter import AdapterError, Config, organize_event, PROMPT_VERSION, SCHEMA_VERSION, PROMPT_SHA256, payload_sha256
@@ -27,7 +28,8 @@ except ImportError:
  from media_backend import create_default_media_backend
  from media_store import MediaStoreError
  from recognition import RecognitionError, recognize_file
- from safety import scan_danger, document_needs_review
+ from model_client import reset_trial_context, stop_current_trial, trial_control
+ from safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 ROOT=Path(__file__).resolve().parents[1]
 # The elder UI is plain HTML/JS; serve its source when no optional build exists.
@@ -61,6 +63,7 @@ def _media_error_status(error):
  code=getattr(error,'code',str(error))
  if code in {'limit_exceeded','request_too_large'}:return 413
  if code=='media_limits_not_configured':return 503
+ if code in {'trial_authorization_required','trial_budget_exhausted'}:return 503
  if code in {'invalid_media','integrity_mismatch'}:return 422
  if code in {'storage_failed','storage_corrupt','unsafe_storage'}:return 500
  if code in {'unsupported_format','content_type_kind_mismatch'}:return 415
@@ -78,6 +81,7 @@ def _media_error_code(error):
   'provider_unavailable','provider_not_configured','provider_auth_failed',
   'provider_rate_limited','invalid_provider_response','no_text_detected','storage_failed',
   'storage_corrupt','unsafe_storage','media_limits_not_configured','invalid_range',
+  'trial_authorization_required','trial_budget_exhausted',
  }
  return code if code in known else 'media_request_failed'
 
@@ -136,7 +140,9 @@ def model_failure_details(error):
            'model_configuration_invalid':'模型配置无效','model_redirect_rejected':'模型地址返回重定向，已拒绝转发',
            'model_response_too_large':'模型响应超过大小限制','model_output_truncated':'模型输出被截断',
            'model_response_invalid':'模型返回内容格式无效','model_http_error':'模型服务请求失败',
-           'model_account_binding_required':'魔搭账号需先绑定阿里云账号'}
+           'model_account_binding_required':'魔搭账号需先绑定阿里云账号',
+           'trial_authorization_required':'合成试验尚未获预算授权，原文已保留',
+           'trial_budget_exhausted':'合成试验调用额度已用尽，原文已保留'}
  code=error.code if isinstance(error,AdapterError) and type(error.code) is str and error.code in messages else None
  status=error.status if isinstance(error,AdapterError) and code in {'model_http_error','model_account_binding_required'} and type(error.status)==int and 100<=error.status<=599 else None
  if code:
@@ -147,6 +153,13 @@ def model_failure_details(error):
  cause=error.__cause__ or error
  reason=('模型超时' if isinstance(cause,TimeoutError) else '模型返回非法 JSON' if isinstance(cause,json.JSONDecodeError) else '网络连接失败' if isinstance(cause,URLError) else '模型调用失败或返回内容未通过校验')
  return {'failure_reason':reason}
+
+def trial_failure_control(error):
+ # Only internal context/error codes carry authority; never HTTP payload IDs.
+ stop_current_trial('business_validation_failed')
+ if trial_control(stopped=True) or getattr(error,'code',None) in {'trial_authorization_required','trial_budget_exhausted'}:
+  return {'trial_control':{'review_required':True,'stopped':True}}
+ return {}
 
 def local_first_model_evidence(body):
  raw=body.get('raw_text')
@@ -297,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
   if app_access.local_first_enabled() and p=='/':return self.send_json(200,{'ok':True,'service':'bingli-beta-api','kind':'api','frontend_hosted':False})
   if p=='/api/app/config':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
-   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive',**local_first_capabilities()})
+   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive','reviewed_risk_rules':reviewed_risk_manifest(),**local_first_capabilities()})
   if p=='/api/app/session':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
    session=app_access.request_authorized(self.headers.get('Cookie'),write=False)
@@ -398,6 +411,8 @@ class Handler(BaseHTTPRequestHandler):
    if rejection:return self.send_json(rejection[0],{'ok':False,'error':rejection[1]},rejection[2])
    return self.send_json(403,{'ok':False,'error':'csrf_or_origin_rejected'})
   p=urlparse(self.path).path
+  if p.startswith('/api/ai/'):
+   reset_trial_context()
   if app_access.local_first_enabled() and p.startswith('/api/') and p not in {'/api/app/login','/api/app/device/activate','/api/app/logout','/api/ai/organize','/api/ai/conversation-turn','/api/backups/upload-grant','/api/backups/download-grant'} and not p.startswith('/api/ai/media/'):
    return self.send_json(404,{'ok':False,'error':'legacy_api_disabled'})
   if p.startswith('/api/media/') and not p.startswith('/api/media/uploads'):
@@ -410,10 +425,12 @@ class Handler(BaseHTTPRequestHandler):
      return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e)})
     return self.send_json(500,{'ok':False,'error':'internal_server_error'})
   if p=='/api/ai/media/recognize':
+   reset_trial_context()
    try:return self._do_local_first_media_recognize()
    except (StoreError,MediaStoreError,RecognitionError) as e:
-    return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e),'retryable':bool(getattr(e,'retryable',False))})
-   except Exception:return self.send_json(500,{'ok':False,'error':'internal_server_error','retryable':False})
+    control=trial_failure_control(e)
+    return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e),'retryable':False if control else bool(getattr(e,'retryable',False)),**control})
+   except Exception as e:return self.send_json(500,{'ok':False,'error':'internal_server_error','retryable':False,**trial_failure_control(e)})
   if p in {'/api/ai/organize','/api/ai/conversation-turn'} and _mock_text_provider():
    return self.send_json(503,{'ok':False,'error':'provider_mock_unavailable','retryable':True})
   try:b=self.body()
@@ -445,18 +462,22 @@ class Handler(BaseHTTPRequestHandler):
     except cloud_backup.CloudBackupError as e:return self.send_json(e.status,{'ok':False,'error':e.code})
     return self.send_json(200,{'ok':True,'grant':grant})
    if p=='/api/ai/organize':
+    reset_trial_context()
     payload=local_first_model_evidence(b)
     safety=scan_danger(payload['raw_text'])
     try:r=organize_event(payload)
     except Exception as ex:
-     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_organize_failed','trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(payload['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved_on_device':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex)})
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_organize_failed','trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(payload['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved_on_device':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)})
     return self.send_json(200,{'ok':True,'raw_text_preserved_on_device':True,**r})
    if p=='/api/ai/conversation-turn':
+    reset_trial_context()
     try:r=conversation_turn(b)
     except ConversationError as ex:
-     return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata()})
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**trial_failure_control(ex)})
     except Exception as ex:
-     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_conversation_failed','trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**model_failure_details(ex)})
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_conversation_failed','trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)})
+    if r.get('stop_reason')=='model_output_blocked':
+     r.update(trial_failure_control(ConversationError('model_reply_unsafe')))
     return self.send_json(200,{'ok':True,'raw_text_preserved_on_device':True,**r})
    if p=='/api/auth/households':
     result=STORE.create_household(b.get('name'),b.get('display_name'),b.get('role','owner'),b.get('external_key'),b.get('password'))
@@ -531,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
       # Do not expose provider bodies/credentials or misclassify storage/version
       # failures: only the provider+validation call is caught here.
       cause=ex.__cause__ or ex
-      failure={'error':'ai_organize_failed','failure_type':type(ex).__name__,'failure_cause_type':type(cause).__name__,'trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(e['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex)}
+      failure={'error':'ai_organize_failed','failure_type':type(ex).__name__,'failure_cause_type':type(cause).__name__,'trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(e['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)}
       STORE.fail(rid,expected,'organize_failed',actor,failure)
       return self.send_json(422,{'ok':False,'ai_failed':True,'record_id':rid,'event':STORE.get(rid),'local_safety':safety,**failure,**safety})
      # The outward notice includes historical positives retained on rule upgrade.
@@ -569,7 +590,8 @@ class Handler(BaseHTTPRequestHandler):
    if recognition.get('is_mock') is True:
     return self.send_json(503,{'ok':False,'error':'media_mock_unavailable','retryable':True})
    local_safety=scan_danger(recognition['text'])
-   return self.send_json(200,{'ok':True,'recognition':recognition,'local_safety':local_safety})
+   control={'trial_control':{'review_required':True}} if recognition.get('trial_control')=={'review_required':True} else {}
+   return self.send_json(200,{'ok':True,'recognition':recognition,'local_safety':local_safety,**control})
   finally:
    if path is not None:
     try:path.unlink(missing_ok=True)

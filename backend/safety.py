@@ -1,10 +1,136 @@
 """Offline description matching. A match is a notice, never a diagnosis."""
 import re
 import unicodedata
+import hashlib
+import json
+from datetime import date
+from pathlib import Path
 
 RULE_VERSION = 'offline-danger-v2'
 CLINICAL_REVIEW_VERSION = 'offline-review-flags-v1'
 DANGER_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。不要自行加药、减药或停药。'
+SOON_EVALUATION_REMINDER = '您刚才说的情况需要尽快让医生当面评估，请让家属陪同就医。具体需要做哪些检查，由接诊医生判断。'
+URGENT_REVIEWED_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。'
+REVIEWED_RISK_PATH = Path(__file__).resolve().parents[1] / 'config' / 'reviewed-risk-rules.json'
+RISK_CONTRACT_VERSION = 'reviewed-risk-candidates-v1'
+
+
+def load_reviewed_risk_rules(path=None, *, allow_test_fixture=False):
+    """Load trusted local review metadata, never model-authored approval.
+
+    This verifies the software contract, not a clinician's qualifications or
+    clinical performance. Synthetic fixtures are disabled by default.
+    """
+    registry = {'rule_set_version': 'unavailable', 'rules': [], 'config_sha256': None,
+                'clinical_validation': 'not_completed', 'status': 'no_approved_rules'}
+    try:
+        raw = Path(path or REVIEWED_RISK_PATH).read_bytes()
+        if len(raw) > 65536:
+            return registry
+        registry['config_sha256'] = hashlib.sha256(raw).hexdigest()
+        document = json.loads(raw)
+        version = document.get('rule_set_version')
+        if not isinstance(version, str) or not version.strip():
+            return registry
+        registry['rule_set_version'] = version
+        fixture = document.get('scope') == 'synthetic_test_fixture'
+        if document.get('scope') not in {'production', 'synthetic_test_fixture'} or (fixture and not allow_test_fixture):
+            return registry
+        if document.get('medical_signoff') != 'approved' or not isinstance(document.get('rules'), list) or len(document['rules']) > 50:
+            return registry
+        seen = set()
+        for rule in document['rules']:
+            if not isinstance(rule, dict):
+                continue
+            review = rule.get('clinical_review')
+            if not isinstance(review, dict) or review.get('status') != 'approved':
+                continue
+            if any(not isinstance(review.get(key), str) or not review[key].strip()
+                   for key in ('reviewer_id', 'reviewer_role', 'reviewed_at', 'evidence_ref')):
+                continue
+            if review['reviewer_role'] not in {'physician', 'nurse', 'pharmacist'}:
+                continue
+            try:
+                date.fromisoformat(review['reviewed_at'])
+            except ValueError:
+                continue
+            if any(not isinstance(rule.get(key), str) or not rule[key].strip()
+                   for key in ('rule_id', 'version', 'pattern', 'description')):
+                continue
+            if rule['level'] not in {'soon_evaluation', 'urgent'} or len(rule['pattern']) > 500 or rule['rule_id'] in seen:
+                continue
+            try:
+                re.compile(rule['pattern'])
+            except re.error:
+                continue
+            seen.add(rule['rule_id'])
+            registry['rules'].append(dict(rule))
+        if registry['rules']:
+            registry.update(status='reviewed_rules_loaded', clinical_validation=(
+                'synthetic_fixture_only' if fixture else 'clinical_review_metadata_present'))
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        registry['rules'] = []
+    return registry
+
+
+def evaluate_reviewed_risk(candidates, turns, registry=None):
+    """Require current, unabridged patient evidence and a reviewed local match."""
+    registry = registry if registry is not None else load_reviewed_risk_rules()
+    result = {key: registry[key] for key in ('rule_set_version', 'status', 'clinical_validation', 'config_sha256')}
+    result.update(contract_version=RISK_CONTRACT_VERSION, level='none', notice=None,
+                  matched_rules=[], sources=[], rejected_candidates=0)
+    rules = {(rule['rule_id'], rule['version']): rule for rule in registry['rules']}
+    sources = {turn['turn_id']: turn for turn in turns}
+    if not isinstance(candidates, list) or len(candidates) > 8:
+        result['rejected_candidates'] = 1
+        return result
+    accepted = []
+    for candidate in candidates:
+        valid = isinstance(candidate, dict) and set(candidate) == {'rule_id', 'rule_version', 'evidence'}
+        rule = rules.get((candidate.get('rule_id'), candidate.get('rule_version'))) if valid and isinstance(candidate.get('rule_id'), str) and isinstance(candidate.get('rule_version'), str) else None
+        evidence = candidate.get('evidence') if valid else None
+        valid = bool(rule and isinstance(evidence, list) and 1 <= len(evidence) <= 8)
+        if valid:
+            for item in evidence:
+                source = sources.get(item.get('turn_id')) if isinstance(item, dict) and isinstance(item.get('turn_id'), str) else None
+                if (not isinstance(item, dict) or set(item) != {'turn_id', 'version', 'quote'}
+                        or not source or type(item['version']) is not int or item['version'] != source.get('version', 1)
+                        or not isinstance(item['quote'], str) or item['quote'] != source['text']):
+                    valid = False
+                    break
+        if not valid:
+            result['rejected_candidates'] += 1
+            continue
+        # Match full original statements independently; a model cannot obtain
+        # a level by selecting a substring or quoting confirmed history alone.
+        if not any(re.search(rule['pattern'], item['quote']) for item in evidence):
+            continue
+        accepted.append((rule, evidence))
+    for rule, evidence in accepted:
+        match = {'rule_id': rule['rule_id'], 'version': rule['version'], 'level': rule['level'], 'evidence': []}
+        prior = next((item for item in result['matched_rules'] if item['rule_id'] == rule['rule_id'] and item['version'] == rule['version']), None)
+        if prior is None:
+            result['matched_rules'].append(match)
+            prior = match
+        for item in evidence:
+            if item not in prior['evidence']:
+                prior['evidence'].append(dict(item))
+            if item not in result['sources']:
+                result['sources'].append(dict(item))
+        if rule['level'] == 'urgent' or result['level'] == 'none':
+            result['level'] = rule['level']
+    result['notice'] = {'soon_evaluation': SOON_EVALUATION_REMINDER,
+                        'urgent': URGENT_REVIEWED_REMINDER}.get(result['level'])
+    return result
+
+
+def reviewed_risk_manifest(registry=None):
+    """Expose approval identity for the browser; never expose rule patterns."""
+    registry = registry if registry is not None else load_reviewed_risk_rules()
+    return {key: registry[key] for key in ('rule_set_version', 'status', 'clinical_validation', 'config_sha256')} | {
+        'contract_version': RISK_CONTRACT_VERSION,
+        'rules': [{key: rule[key] for key in ('rule_id', 'version', 'level')} for rule in registry['rules']],
+    }
 
 # These are description rules, not clinically validated triage criteria. Only
 # unambiguous, local negation is excluded; uncertain and historical mentions
@@ -96,6 +222,7 @@ def scan_danger(raw_text):
         'danger_reminder': DANGER_REMINDER if matched else None,
         'matched_rules': matched,
         'safety_rule_version': RULE_VERSION,
+        'legacy_clinical_review_status': 'active_unvalidated',
         'clinical_review_flags': clinical_review_flags,
         'clinical_review_version': CLINICAL_REVIEW_VERSION,
         'clinical_review_status': 'candidate_unverified' if clinical_review_flags else 'not_flagged',

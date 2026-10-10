@@ -68,6 +68,57 @@ function harness({ media = false } = {}) {
   };
 }
 
+test('health background cannot be edited or saved before the initial read completes', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run('localMode=true');
+  const loading = h.run('loadHealthContext()');
+  assert.equal(h.element('healthConditions').disabled, true);
+  assert.equal(h.element('saveHealthContextBtn').disabled, true);
+  release({ r: { ok: true }, j: { health_context: { entries: [] } } });
+  await loading;
+  assert.equal(h.element('healthConditions').disabled, false);
+  assert.equal(h.element('saveHealthContextBtn').disabled, false);
+});
+
+test('an organize reply after leaving detail cannot reopen the old record', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:1};detailRequestSerial=10");
+  const pending = h.run("organize(current)");
+  h.run("showView('homeView')");
+  release({ r: { ok: true, status: 200 }, j: { event: { record_id: 'rec_test', raw_text: '虚构旧详情', version: 2, state: 'draft' } } });
+  await pending;
+  assert.equal(h.run('current'), null);
+  assert.equal(h.element('detail').classList.contains('hidden'), true);
+});
+
+test('a review reply after leaving detail does not force navigation back', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:2};detailRequestSerial=10;showDetail=async()=>{current={record_id:'rec_test'}}");
+  const pending = h.run("review(current)");
+  h.run("showView('homeView')");
+  release({ r: { ok: true, status: 200 }, j: {} });
+  await pending;
+  assert.equal(h.run('current'), null);
+});
+
+test('late related history cannot render an older version over a newer draft', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:1,related_record_ids:['rec_other']};detailRequestSerial=10");
+  const pending = h.run('loadRelatedHistory(current)');
+  h.run("current={record_id:'rec_test',version:2,state:'draft',raw_text:'虚构新版'}");
+  release({ r: { ok: true, status: 200 }, j: { event: { record_id: 'rec_other', raw_text: '虚构相关记录' } } });
+  await pending;
+  assert.equal(h.run('current.version'), 2);
+});
+
 test('document OCR remains a reviewable transcription rather than a promise of exact original text', () => {
   const h = harness();
   const html = h.run("detailHtml({source_kind:'document',raw_text:'HEB 130',state:'draft',draft:{summary:'检验表'}})");

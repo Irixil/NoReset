@@ -1,0 +1,888 @@
+{
+  "version": "synthetic-preflight-v1-2026-10-08",
+  "reference_time": "2026-10-08T11:00:00+08:00",
+  "clinical_review_status": "pending",
+  "semantic_review_status": "pending",
+  "source_policy": {
+    "case_data": "synthetic",
+    "external_records_used": false,
+    "authored_for": "NoReset adapter input contract preflight",
+    "real_identity_verified": false,
+    "real_asr_ocr_used": false
+  },
+  "contract_sources": [
+    "docs/sdlc/spec-contextual-dialogue-v10.md",
+    "docs/API.md",
+    "backend/adapter.py",
+    "backend/safety.py:document_needs_review",
+    "config/event-v0.3.schema.json"
+  ],
+  "scope_note": "仅离线整理适配器合同前置准备，不证明动态对话、真实模型、语音、浏览器或医学验收。",
+  "cases": [
+    {
+      "id": "PF001",
+      "input": "虚构老人自述：昨晚开始膝盖疼，发生的具体时刻不清楚。",
+      "source_kind": "elder",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "明确老人来源，保留相对时间",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "elder",
+        "type": "symptom",
+        "time_certainty": "relative"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断",
+        "补写具体发生日期"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "判断下一步追问是否切题，不能按参考日期补成绝对发生时间。"
+      ]
+    },
+    {
+      "id": "PF002",
+      "input": "虚构女儿观察：老人站起来时有点头晕，持续多久不清楚。",
+      "source_kind": "family_observation",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "明确观察与自述不同",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "family_observation",
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "确认报告没有把观察改写为本人自述，没有补写未报告的阴性症状。"
+      ]
+    },
+    {
+      "id": "PF003",
+      "input": "虚构女儿转述：老人说医生曾提过用药，具体药名没有记住。",
+      "source_kind": "family_report",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "转述医生不能升级专业来源",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "clinician_or_pharmacist",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "family_report",
+        "type": "medication"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "保持转述和未知药名，不能变成已核验医嘱或医生已确认。"
+      ]
+    },
+    {
+      "id": "PF004",
+      "input": "虚构照护员记录：血压为140/80，测量方式尚未核对。",
+      "source_kind": "caregiver",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "照护员测量原文与来源",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "caregiver",
+        "type": "measurement"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "数字只作为虚构来源原话，不给出正常、异常或处置结论。"
+      ]
+    },
+    {
+      "id": "PF005",
+      "input": "虚构转写输入：老人说走路时膝盖疼，原话尚未核对。",
+      "source_kind": "audio_transcript",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "手工编写的转写后输入形状",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "audio_transcript",
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "这是合成文字，未进行真实录音识别；真实 ASR 质量与原件保存须另验。"
+      ]
+    },
+    {
+      "id": "PF006",
+      "input": "虚构系统记录：用户已选择结束本次记录，内容尚未核对。",
+      "source_kind": "system",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "系统记录不能冒充患者来源",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "system"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "仅验证整理引擎来源；动态对话结束、恢复和报告一致性须另验。"
+      ]
+    },
+    {
+      "id": "PF007",
+      "input": "虚构发言者自称医生：我只提供这段记录，身份尚未核实。",
+      "source_kind": "unknown",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "自然语言身份声明保持 unknown",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "clinician_or_pharmacist",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "unknown"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "来源 unknown 不得因医生字样升级为 clinician_evidence；自称身份没有实际指令，事件分类由真实语义复核。"
+      ]
+    },
+    {
+      "id": "PF008",
+      "input": "虚构专业来源：医生记录了老人头晕的叙述，内容尚待复核。",
+      "source_kind": "clinician_evidence",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "调用方明确专业来源的合同形状",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "clinician_or_pharmacist",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "clinician_evidence",
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "clinician_evidence 只是合成来源字段；没有真实医生身份认证、签名或医学审签。"
+      ]
+    },
+    {
+      "id": "PF009",
+      "input": "虚构测量资料：血压为138/82，其余内容尚未核对。",
+      "source_kind": "document",
+      "payload": {
+        "source_review": {
+          "method": "original_comparison",
+          "text": "虚构测量资料：血压为138/82，其余内容尚未核对。",
+          "confirmed_at": "2026-10-08T11:00:00+08:00"
+        }
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "当前资料完整原文核对声明",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "document",
+        "type": "measurement"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "source_review 只模拟文字与原件对照声明，未做真实 OCR 或医学核对。"
+      ]
+    },
+    {
+      "id": "PF010",
+      "input": "虚构资料：心率[无法辨认]，单位[无法辨认]。",
+      "source_kind": "document",
+      "payload": {
+        "source_review": {
+          "method": "original_comparison",
+          "text": "虚构资料：心率[无法辨认]，单位[无法辨认]。",
+          "confirmed_at": "2026-10-08T11:00:00+08:00"
+        }
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "已核对资料中的未知值仍保留",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "document",
+        "type": "measurement"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "不得推测无法辨认的数字或单位，原件可读性与 OCR 准确率另验。"
+      ]
+    },
+    {
+      "id": "PF011",
+      "input": "虚构老人自述：在明确登记的发生时刻膝盖疼。",
+      "source_kind": "elder",
+      "payload": {
+        "occurred_time": "2026-10-07T09:15:00+08:00"
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "后端 supplied 绝对发生时间",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": "2026-10-07T09:15:00+08:00",
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "elder",
+        "type": "symptom",
+        "time_certainty": "exact"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "发生时间由合成调用方明确提供；不声称推断原话或证明回忆准确。"
+      ]
+    },
+    {
+      "id": "PF012",
+      "input": "虚构老人自述：昨天有点头晕，今天只来补记，具体时刻忘了。",
+      "source_kind": "elder",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "参考时刻用于 recorded 而非发生时间推断",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "elder",
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断",
+        "把录入时间当成发生日期"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "参考时刻明确，但当前合同仍不将昨天换算为绝对日期。"
+      ]
+    },
+    {
+      "id": "PF013",
+      "input": "虚构女儿转述：2026-10-01是看资料的日期，老人膝盖疼的发生日期未确认。",
+      "source_kind": "family_report",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "原文他人资料日期不授权发生时间",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "family_report",
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断",
+        "把他人资料日期写成发生日期"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "资料日期不能归给老人事件，整段来源语义仍须人工复核。"
+      ]
+    },
+    {
+      "id": "PF014",
+      "input": "虚构女儿转述：2026-10-01是资料日期，膝盖疼按已提供的发生时刻登记。",
+      "source_kind": "family_report",
+      "payload": {
+        "occurred_time": "2026-10-05T12:00:00+08:00"
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "supplied 时间优先于资料日期",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": "2026-10-05T12:00:00+08:00",
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source_kind": "family_report",
+        "type": "symptom",
+        "time_certainty": "exact"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断",
+        "把资料日期写成发生日期"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "原文资料日期与明确提供发生时刻分别保留，不得混同。"
+      ]
+    },
+    {
+      "id": "PF015",
+      "input": "虚构老人自述：同一次站立事件，我明确说没有头晕。",
+      "source_kind": "elder",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PF015-history-family",
+            "raw_text": "虚构女儿转述：同一次站立事件，老人明确说头晕。",
+            "source_kind": "family_report",
+            "event_kind": "symptom",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": "2026-10-08T08:00:00+08:00"
+          }
+        ],
+        "occurred_time": "2026-10-08T08:00:00+08:00"
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "同次事件相反转述由两条原始记录保留待核",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": "2026-10-08T08:00:00+08:00",
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": true,
+        "conflict_record_refs": [
+          "PF015",
+          "PF015-history-family"
+        ],
+        "source": "老人自述",
+        "preserve_both_sources": true,
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "两份原话对同次事件的叙述相反，保留来源且不得选择谁正确；事件同一性和完整交接仍待人工核实。"
+      ]
+    },
+    {
+      "id": "PF016",
+      "input": "虚构女儿观察：同一次测量仪显示血压128/78，照护员记录了另一数值。",
+      "source_kind": "family_observation",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PF016-history-caregiver",
+            "raw_text": "虚构照护员记录：同一次测量仪显示血压145/85，原件尚待人工复核。",
+            "source_kind": "caregiver",
+            "event_kind": "measurement",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": "2026-10-08T08:30:00+08:00"
+          }
+        ],
+        "occurred_time": "2026-10-08T08:30:00+08:00"
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "同次测量不同来源保留互异 ID",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": "2026-10-08T08:30:00+08:00",
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": true,
+        "conflict_record_refs": [
+          "PF016",
+          "PF016-history-caregiver"
+        ],
+        "source": "家属观察",
+        "preserve_both_sources": true,
+        "type": "measurement"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "核对双方原话、仪器和同次测量归属；不选择某个读数，也不诊断。"
+      ]
+    },
+    {
+      "id": "PF017",
+      "input": "虚构记录：老人说昨晚膝盖疼。",
+      "source_kind": "family_report",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PF017-history-elder",
+            "raw_text": "虚构记录：老人说昨晚膝盖疼。",
+            "source_kind": "elder",
+            "event_kind": "symptom",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": null
+          }
+        ]
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "两条同文记录保留各自来源与 ID",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": null,
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": false,
+        "conflict_record_refs": [],
+        "source": "家属转述",
+        "preserve_both_sources": true,
+        "type": "symptom"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "同文不应制造冲突，也不能证明同一事件或自动去重；两记录仍由输入保留。"
+      ]
+    },
+    {
+      "id": "PF018",
+      "input": "虚构女儿转述：同一次测量血压132/82，与资料中的数值不同，待核对。",
+      "source_kind": "family_report",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PF018-history-document",
+            "raw_text": "虚构已对照资料：同一次测量血压138/84，其他栏[无法辨认]。",
+            "source_kind": "document",
+            "event_kind": "measurement",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": "2026-10-07T20:00:00+08:00",
+            "source_review": {
+              "method": "original_comparison",
+              "text": "虚构已对照资料：同一次测量血压138/84，其他栏[无法辨认]。",
+              "confirmed_at": "2026-10-08T11:00:00+08:00"
+            }
+          }
+        ],
+        "occurred_time": "2026-10-07T20:00:00+08:00"
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "purpose": "历史资料必须先对照完整原文",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false,
+        "source_declaration": "fixture_only_identity_unverified"
+      },
+      "expected": {
+        "summary_equals_input": true,
+        "current_claims_full_input": true,
+        "occurred_time": "2026-10-07T20:00:00+08:00",
+        "recorded_time": "2026-10-08T11:00:00+08:00",
+        "review_role": "family",
+        "plan_change_allowed": false,
+        "evidence_required": true,
+        "conflict_present": true,
+        "conflict_record_refs": [
+          "PF018",
+          "PF018-history-document"
+        ],
+        "source": "家属转述",
+        "preserve_both_sources": true,
+        "type": "measurement"
+      },
+      "must_not": [
+        "直接写入方案",
+        "作出诊断"
+      ],
+      "manual_required": [
+        "临床相关性、分类、风险规则适当性与交接语义须合格临床人员审查；Mock 不证明临床安全。",
+        "合成核对声明不证明 OCR 正确；真实交接需保留两源及无法辨认项，Mock 不证明完整交接。"
+      ]
+    }
+  ],
+  "rejection_cases": [
+    {
+      "id": "PFR001",
+      "input": "虚构资料候选：血压[无法辨认]。",
+      "source_kind": "document",
+      "payload": {},
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "当前资料未核对，调用供应商前拒绝",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    },
+    {
+      "id": "PFR002",
+      "input": "虚构资料候选：血压[无法辨认]。",
+      "source_kind": "document",
+      "payload": {
+        "source_review": {
+          "method": "original_comparison",
+          "text": "虚构旧版资料候选：血压120/80。",
+          "confirmed_at": "2026-10-08T11:00:00+08:00"
+        }
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "核对声明绑定旧文字",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    },
+    {
+      "id": "PFR003",
+      "input": "虚构资料候选：血压[无法辨认]。",
+      "source_kind": "document",
+      "payload": {
+        "source_review": {
+          "method": "model_guess",
+          "text": "虚构资料候选：血压[无法辨认]。",
+          "confirmed_at": "2026-10-08T11:00:00+08:00"
+        }
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "模型猜测不能替代原件对照",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    },
+    {
+      "id": "PFR004",
+      "input": "虚构资料候选：血压[无法辨认]。",
+      "source_kind": "document",
+      "payload": {
+        "source_review": {
+          "method": "original_comparison",
+          "text": "虚构资料候选：血压[无法辨认]。",
+          "confirmed_at": ""
+        }
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "空核对时间不能通过",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    },
+    {
+      "id": "PFR005",
+      "input": "虚构女儿转述：需要关联这份资料。",
+      "source_kind": "family_report",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PFR005-history-document",
+            "raw_text": "虚构资料候选：血压[无法辨认]。",
+            "source_kind": "document",
+            "event_kind": "measurement",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": null
+          }
+        ]
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "历史资料缺核对声明",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    },
+    {
+      "id": "PFR006",
+      "input": "虚构女儿转述：需要关联修订后的资料。",
+      "source_kind": "family_report",
+      "payload": {
+        "history": [
+          {
+            "record_id": "PFR006-history-document",
+            "raw_text": "虚构资料候选：血压[无法辨认]。",
+            "source_kind": "document",
+            "event_kind": "measurement",
+            "recorded_at": "2026-10-08T10:45:00+08:00",
+            "occurred_time": null,
+            "source_review": {
+              "method": "original_comparison",
+              "text": "虚构历史旧文字。",
+              "confirmed_at": "2026-10-08T11:00:00+08:00"
+            }
+          }
+        ]
+      },
+      "synthetic_only": true,
+      "clinical_review_status": "pending",
+      "provenance": {
+        "kind": "agent_authored_synthetic",
+        "external_record_used": false
+      },
+      "purpose": "历史资料声明未绑定当前完整文字",
+      "expected_rejection": "document_source_review_required",
+      "manual_required": [
+        "拒绝仅验证核对声明门槛，不证明资料或临床质量。"
+      ]
+    }
+  ]
+}

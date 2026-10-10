@@ -10,18 +10,20 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 import uuid
+from datetime import date, datetime, timezone
 from typing import Any
 
 try:
     from .adapter import MockProvider, provider_from
-    from .safety import DANGER_REMINDER, scan_danger
+    from .safety import DANGER_REMINDER, scan_danger, load_reviewed_risk_rules, evaluate_reviewed_risk, RISK_CONTRACT_VERSION
 except ImportError:
     from adapter import MockProvider, provider_from
-    from safety import DANGER_REMINDER, scan_danger
+    from safety import DANGER_REMINDER, scan_danger, load_reviewed_risk_rules, evaluate_reviewed_risk, RISK_CONTRACT_VERSION
 
 
-PROMPT_VERSION = "clinical-intake-v7"
+PROMPT_VERSION = "clinical-intake-v10-source-grounded-memory-recall"
 CATEGORIES = (
     "main_complaint", "onset_course", "symptom_character",
     "aggravating_relieving", "associated_symptoms", "functional_impact",
@@ -85,10 +87,19 @@ SYSTEM_PROMPT = """你是“NoReset”的健康对话助手，负责理解患者
 - known/unknown/declined 必须至少有一个真实 turn_id 或 context_id；missing/not_applicable 不得伪造来源；
 - unknowns 和 contradictions 的每项结构为 {"text":"……","evidence_turn_ids":[],"context_ids":[]} 且至少有一个来源；
 - summary、unknowns、contradictions 都必须是客观事实表达，不得包含推测或建议。known summary 尽量简短；unknowns.text 应对应来源中明确表达“不知道/不记得/不想说”的原话，不能把信息缺口改写成患者事实。"""
+SYSTEM_PROMPT += """\n风险合同 reviewed-risk-candidates-v1：新增 risk_candidates 数组。只从程序提供的 approved_risk_rules 选择编号和版本；目录为空时必须返回 []。每项严格为 {"rule_id":"目录编号","rule_version":"目录版本","evidence":[{"turn_id":"真实患者回合编号","version":1,"quote":"该版本回合完整原话"}]}，最多8项。证据必须是当前患者回合全文与当前version，不能剪裁否定或历史词，不能引用助手问题，也不能只引用health_context。缺省version为1。模型不得输出等级、提醒、诊断或检查建议，最终判断和固定文案由本地审核规则决定。"""
+SYSTEM_PROMPT += """\n长期背景合同 health-memory-v1：health_context 是用户为本轮明确选择的必要背景，不是经过医生核实的诊断。subject_id（如有）限定本次记录所属人，不能引用或推测其他家庭成员的资料。source=user_confirmed 只说明用户确认了这条陈述；confirmed_by=self/family 和 source_kind=self_statement/family_report/document 分别保留本人、家属或资料陈述的来源，不代表本人或医生证实医学结论。记忆不能从模型回复中生成。
+每轮决定回复或下一问之前，先审阅本轮已选背景，把与最新主诉或当前话语确实相关、已经确认的背景纳入本轮来源状态。直接读取 health_context 的有效 context_id，不以患者再次说出既往病史为前提；不因当前只收到一句新主诉、尚未问到既往史或下一问属于其他维度而忽略这些来源。
+有相关已确认背景时，在 clinical_state.relevant_history 保留用户陈述：status=known，summary 客观说明已记录的既往经历及时间或局部不确定性，context_ids 引用这些实际背景编号，evidence_turn_ids 只引用患者本轮确实说过的原话；同时将实际使用的编号放入 relevant_context_ids。相关用户既往诊断陈述可以保留为用户提供的历史来源，不能据此宣布本次诊断。无需为读取已确认背景再要求用户重复确认，但遇到当前原话纠正或冲突仍须标记并核实。
+没有相关条目时保留 missing 和空引用；不能为满足召回而复制全部背景、猜测关联、引用其他成员、创造 context_id 或把历史用药变成当前用药。追问仍根据当前真正缺口动态决定，记录了相关背景不强制增加一个既往史问题。
+仅使用与最新话语确实相关的 context_id。recorded_at、confirmed_at、updated_at 是记录、确认与更新的时间，occurred_on 是用户提供的发生日期或 null；不要把记录时间当作发病日期，不补猜缺失日期。四字段旧记录没有这些元数据时，明确按元数据不全的旧背景理解，不推定其身份、日期、确认者或当前状态。
+temporal_status=current/historical 区分当前与历史；历史用药、已经不用的药和既往症状不得改写成当前正在用药或当前症状。remember 只控制下次新对话自动沿用，false 的条目仍可能是用户本轮明确选择的背景。即使整条陈述已确认，也必须保留原文中的“不确定”“不记得”“可能”等局部不确定性，不把它们升级成肯定病史或过敏诊断。当前原话纠正既往背景时，保留时间和来源区别；不能用旧背景覆盖新纠正，冲突仍待用户核实。"""
 PROMPT_SHA256 = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 
 _TURN_ID = re.compile(r"^turn_[A-Za-z0-9_-]{8,100}$")
 _CONTEXT_ID = re.compile(r"^context_[A-Za-z0-9_-]{8,100}$")
+_SUBJECT_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_CONTEXT_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$")
 _DECLINED = re.compile(r"不知道|不清楚|不记得|记不清|想不起来|不想说|不方便说|说不上来")
 _EXPLICIT_UNKNOWN = _DECLINED
 _EXPLICIT_FINISH = re.compile(r"^(?:没有了?|没了|就这些|就这样|先这样|不说了|结束吧?|可以了)[。！! ]*$")
@@ -102,11 +113,12 @@ _META_FEEDBACK = re.compile(
 _CORRECTION = re.compile(r"说错了|不是.{0,10}是|改一下|更正|纠正")
 _DIAGNOSIS_REQUEST = re.compile(r"(?:这是|到底|究竟)?(?:怎么了|怎么回事|什么情况|什么病)|为什么会这样|能不能告诉我.{0,12}(?:怎么了|什么情况|什么病)")
 _NEGATIVE_ANSWER = re.compile(r"^(?:没有|没|无|不是|从来没有|没什么|没有别的)")
+_TEMPORAL_CHANGE = r"(?:早晨|清晨|早上|上午|中午|下午|傍晚|晚上|昨晚|夜间|夜里|凌晨|白天)[^，。！？；,!?;]{0,8}(?:明显|加重|减轻|缓解|好转|好些)"
 _PATTERNS = {
     "main_complaint": re.compile(r"疼|痛|酸|胀|刺痛|灼痛|晕|咳|喘|闷|恶心|吐|发热|发烧|无力|没劲|麻|痒|肿胀|肿起来|肿得|发肿|不舒服|难受|睡不着|吃不下|伸不直"),
     "onset_course": re.compile(r"今天|昨天|前天|刚才|早上|上午|中午|下午|晚上|半夜|最近|小时|分钟|天|周|月|年|开始|一直|后来|突然|慢慢|越来越|反复|时好时坏"),
     "symptom_character": re.compile(r"刺痛|胀痛|酸痛|酸|麻|烧|灼|跳着|隐隐|钝|刀割|压着|一阵|持续|较轻|轻微|不算重|偏重|剧烈疼痛|很疼|非常疼|程度|[一二三四五六七八九十\d]+分"),
-    "aggravating_relieving": re.compile(r"活动|走路|上楼|下楼|弯|伸|躺|坐|站|休息|吃饭|空腹|更疼|减轻|缓解"),
+    "aggravating_relieving": re.compile(_TEMPORAL_CHANGE + r"|活动|走路|上楼|下楼|弯|伸|躺|坐|站|休息|吃饭|空腹|更疼|减轻|缓解"),
     "associated_symptoms": re.compile(r"同时|还会|伴随|另外|胸(?:口|部)?(?:疼|痛)|胸闷|发烧|咳|吐|恶心|晕|麻|肿|喘|心慌|出汗"),
     "functional_impact": re.compile(r"影响|费劲|不稳|抓不住|拿不住|抬不起来|睡不着|睡不好|睡得(?:还好|好|不好)|睡眠(?:正常|还好|不好|受影响)|睡觉(?:受影响|不好|还好)|吃不下|走不了|不能走|平地(?:能|可)走|能(?:自己)?走路|可以自己走|走楼梯|上下楼|下不了地|起不来|伸不直|活动|自理|干活"),
     "relevant_history": re.compile(r"以前|之前也|老毛病|长期|过敏|手术|住院|一直吃|既往|病史"),
@@ -114,10 +126,23 @@ _PATTERNS = {
 }
 _QUESTION_SCOPE = re.compile(r"哪里|哪儿|部位|感觉|怎么|什么时候|多久|开始|变化|后来|突然|逐渐|加重|减轻|反复|程度|影响|走|站|起|拿|抬|吃|睡|活动|发生|之前|前后|还有|伴随|同时|以前|类似|用药|过敏|手术|住院|量过|测过|做过|结果|资料|报告")
 _UNSAFE_REPLY = re.compile(
+    r"诊断为|确诊为|患有|(?:您|你)(?:已经)?得了|"
+    r"(?:这是|就是|属于|判断为|表现为)[^，。！？;；!?]{0,16}(?:病|炎|症|癌|感染|梗|卒中|结石)(?=[，。！？;；!?]|$)|"
     r"(?:可能|考虑|怀疑|应当|应该|建议|最好).{0,12}(?:是|病|炎|癌|症|就医|检查|治疗|服用|用药)|"
     r"(?:建议|应该|应当|最好|可以|需要|请|先|自行|直接).{0,8}(?:吃药|服药|用药|做(?:核磁|CT|彩超|B超|化验|检查))|"
     r"加药|减药|停药|换药|加量|减量|改药|处方|剂量|药量|治疗方案|"
     r"去医院|去急诊|拨打\s*120|做(?:核磁|CT|彩超|B超|化验|检查)",
+    re.IGNORECASE,
+)
+_DIRECT_MEDICAL_INSTRUCTION = re.compile(
+    r"(?:服用|口服|注射|吃|用)[^，。！？;；!?]{0,12}[0-9一二三四五六七八九十百两半]+"
+    r"(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|"
+    r"(?:增加|减少|增至|减至|调整到|改为)[^，。！？;；!?]{0,8}[0-9一二三四五六七八九十百两半]+"
+    r"(?:毫克|微克|克|毫升|片|粒|滴|单位|mg|mcg|ml)|"
+    r"(?:建议|应该|应当|最好|可以|需要|请|先|直接|去)[^，。！？;；!?]{0,8}"
+    r"(?:血常规|血生化|心电图|脑电图|胃镜|肠镜|胸片|X光|MRI|CT|核磁|彩超|B超)|"
+    r"(?:您|你|情况|身体|目前|现在)[^，。！？;；!?]{0,8}(?:很安全|没有问题|没事)|"
+    r"没有.{0,3}(?:危险|风险)|(?:不用|无需|不需要|不必).{0,6}(?:就医|去医院|急救|120|看医生)",
     re.IGNORECASE,
 )
 _NON_HEALTH_ACTION = re.compile(r"银行卡|支付|付款|转账|密码|验证码|身份证|手机号|下载|打开链接|点击链接|扫码")
@@ -126,8 +151,10 @@ _CONTEXT_CATEGORIES = {"conditions", "medications", "allergies", "procedures", "
 
 def _unsafe_reply(text: str) -> bool:
     """Allow recording past facts while still blocking new medical advice."""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\s\u200b-\u200f\ufeff]", "", text)
     factual = re.sub(
-        r"(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)?做(?:过)?(?:核磁|CT|彩超|B超|化验|检查)",
+        r"(?:(?:没|没有|尚未|还没|已经|曾经|以前|有没有|是否)做(?:过)?|做过)(?:核磁|CT|彩超|B超|化验|检查)",
         "已核对既往资料",
         text,
         flags=re.IGNORECASE,
@@ -137,7 +164,7 @@ def _unsafe_reply(text: str) -> bool:
         "已核对既往用药",
         factual,
     )
-    return bool(_UNSAFE_REPLY.search(factual))
+    return bool(_UNSAFE_REPLY.search(factual) or _DIRECT_MEDICAL_INSTRUCTION.search(factual))
 
 
 class ConversationError(RuntimeError):
@@ -165,7 +192,10 @@ def _clean_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
             raise ConversationError("turn_id_invalid")
         if not isinstance(text, str) or not text.strip() or len(text) > 10000:
             raise ConversationError("turn_text_invalid")
-        turn: dict[str, Any] = {"turn_id": turn_id, "text": text.strip()}
+        version = row.get("version", 1)
+        if type(version) is not int or version < 1:
+            raise ConversationError("turn_version_invalid")
+        turn: dict[str, Any] = {"turn_id": turn_id, "text": text.strip(), "version": version}
         responding_to = row.get("responding_to")
         if responding_to is not None:
             if not isinstance(responding_to, dict) or set(responding_to) != {"turn_id", "text"}:
@@ -190,22 +220,79 @@ def _clean_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return turns
 
 
-def _clean_health_context(payload: dict[str, Any]) -> list[dict[str, str]]:
+def _context_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not _CONTEXT_TIMESTAMP.fullmatch(value):
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid") from None
+    if stamp.utcoffset() is None or stamp > datetime.now(timezone.utc):
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+    return stamp
+
+
+def _clean_health_context(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    subject = payload.get("subject_id")
+    if "subject_id" in payload and (not isinstance(subject, str) or not _SUBJECT_ID.fullmatch(subject)):
+        raise ConversationError("health_context_subject_invalid", "health_context_subject_invalid")
     rows = payload.get("health_context", [])
     if not isinstance(rows, list) or len(rows) > 30:
-        raise ConversationError("health_context_invalid")
+        raise ConversationError("health_context_invalid", "health_context_invalid")
     result = []
     for row in rows:
         if not isinstance(row, dict):
-            raise ConversationError("health_context_invalid")
+            raise ConversationError("health_context_invalid", "health_context_invalid")
         context_id, category, text = row.get("context_id"), row.get("category"), row.get("text")
         if not isinstance(context_id, str) or not _CONTEXT_ID.fullmatch(context_id):
-            raise ConversationError("health_context_id_invalid")
-        if category not in _CONTEXT_CATEGORIES or not isinstance(text, str) or not text.strip() or len(text) > 500:
-            raise ConversationError("health_context_invalid")
-        result.append({"context_id": context_id, "category": category, "text": text.strip(), "source": "user_confirmed"})
+            raise ConversationError("health_context_id_invalid", "health_context_id_invalid")
+        if not isinstance(category, str) or category not in _CONTEXT_CATEGORIES or not isinstance(text, str) or not text.strip() or len(text) > 500:
+            raise ConversationError("health_context_invalid", "health_context_invalid")
+        # Confirmation is asserted by the local user's explicit action. It must
+        # never be manufactured from an arbitrary source or a revoked entry.
+        if row.get("source") != "user_confirmed":
+            raise ConversationError("health_context_source_invalid", "health_context_source_invalid")
+        if ("confirmation_status" in row and row["confirmation_status"] != "confirmed"
+                or "confirmed" in row and row["confirmed"] is not True
+                or "revoked" in row and row["revoked"] is not False
+                or "status" in row and row["status"] not in ("active", "confirmed")):
+            raise ConversationError("health_context_unconfirmed", "health_context_unconfirmed")
+        if "temporal_status" in row and row["temporal_status"] not in ("current", "historical"):
+            raise ConversationError("health_context_temporal_invalid", "health_context_temporal_invalid")
+        row_subject = row.get("subject_id")
+        if ("subject_id" in row and (not isinstance(row_subject, str) or not _SUBJECT_ID.fullmatch(row_subject))):
+            raise ConversationError("health_context_subject_invalid", "health_context_subject_invalid")
+        if (subject is not None or "subject_id" in row) and row_subject != subject:
+            raise ConversationError("health_context_subject_mismatch", "health_context_subject_mismatch")
+        if "confirmed_by" in row and row["confirmed_by"] not in ("self", "family"):
+            raise ConversationError("health_context_confirmation_invalid", "health_context_confirmation_invalid")
+        if "source_kind" in row and row["source_kind"] not in ("self_statement", "family_report", "document"):
+            raise ConversationError("health_context_source_invalid", "health_context_source_invalid")
+        if "remember" in row and type(row["remember"]) is not bool:
+            raise ConversationError("health_context_remember_invalid", "health_context_remember_invalid")
+        stamps = {key: _context_timestamp(row[key]) for key in ("recorded_at", "confirmed_at", "updated_at") if key in row}
+        if ("updated_at" in stamps and any(stamp > stamps["updated_at"] for key, stamp in stamps.items() if key != "updated_at")):
+            raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+        if "occurred_on" in row and row["occurred_on"] is not None:
+            value = row["occurred_on"]
+            if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+            try:
+                occurred = date.fromisoformat(value)
+            except ValueError:
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid") from None
+            if occurred > datetime.now(timezone.utc).date():
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+        clean = {"context_id": context_id, "category": category, "text": text.strip(), "source": row["source"]}
+        # Keep valid supplied metadata exactly; missing legacy metadata remains
+        # absent instead of receiving invented dates, identity or status.
+        for key in ("subject_id", "recorded_at", "confirmed_at", "updated_at", "temporal_status",
+                    "confirmation_status", "confirmed_by", "occurred_on", "remember", "source_kind"):
+            if key in row:
+                clean[key] = row[key]
+        result.append(clean)
     if len({row["context_id"] for row in result}) != len(result):
-        raise ConversationError("health_context_id_duplicate")
+        raise ConversationError("health_context_id_duplicate", "health_context_id_duplicate")
     return result
 
 
@@ -218,8 +305,212 @@ def _empty_state() -> dict[str, dict[str, Any]]:
     return {category: {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []} for category in CATEGORIES}
 
 
-def _correction_span(text: str) -> tuple[int, int] | None:
+def _easy_single_question(question: str) -> bool:
+    """Reject explicit compound presence checks without inventing a replacement.
+
+    Single-dimension choices such as left versus right remain available. This
+    lexical guard does not claim to decide every question's semantic complexity.
+    """
+    presence = list(re.finditer(r"有没有|有无|是否(?:还)?有|同时(?:还)?有|还(?:会|有)", question))
+    return len(presence) <= 1 and not (presence and "、" in question[presence[0].end():])
+
+
+def _presence_items(question: str):
+    """Read only an explicit presence list, preserving its shared qualifier.
+
+    Ambiguous negation/conditions and other clauses stay blocked. This is a
+    narrow grammar, not a general medical or Chinese sentence parser.
+    """
+    presence = list(re.finditer(r"有没有|有无|是否(?:还)?有|同时(?:还)?有|还(?:会|有)", question))
+    if len(presence) != 1 or not re.fullmatch(r"[^。！？；.!?;]+[？?]", question):
+        return None
+    match = presence[0]
+    prefix, body = question[:match.end()], question[match.end():-1]
+    if (_DECLINED.search(question)
+            or re.search(r"如果|假如|假设|要是|若|可能|不确定|不一定|并非|不是|但|却|虽", question)):
+        return None
+    suffix = "的情况" if body.endswith("的情况") else ""
+    if suffix:
+        body = body[:-len(suffix)]
+    items = re.split(r"、|或者|或", body)
+    # ponytail: conservative phrase grammar; unsupported wording stays blocked.
+    if not items or any(
+        not re.fullmatch(r"发(?:烧|热)|嗓子疼|咽痛|喘不上气|气短|胸口不舒服", item)
+        for item in items
+    ):
+        return None
+    return prefix, items, suffix, question[-1]
+
+
+def _presence_item_key(item: str) -> str:
+    # Only skip already asked wording; never rewrite a patient fact or output.
+    return {"发热": "发烧", "咽痛": "嗓子疼", "气短": "喘不上气"}.get(item, item)
+
+
+def _presence_question_key(question: str):
+    parts = _presence_items(question)
+    return (parts[0], _presence_item_key(parts[1][0]), parts[2]) if parts and len(parts[1]) == 1 else None
+
+
+def _bound_presence_answer(row: dict[str, Any], asked_questions: list[str]) -> bool:
+    """A plain yes/no answers its actual single question, not the session."""
+    if not re.fullmatch(r"(?:没有|没|无|不是|有|是|有的)[。！! ]*", row["text"].strip()):
+        return False
+    previous = row.get("responding_to")
+    return bool(isinstance(previous, dict) and any(
+        previous.get("text", "").endswith(question)
+        and (parts := _presence_items(question)) and len(parts[1]) == 1
+        for question in asked_questions
+    ))
+
+
+def _followup_answered(question: str, turns: list[dict[str, Any]], controller: dict[str, Any]) -> bool:
+    parts = _presence_items(question)
+    if not parts or len(parts[1]) != 1:
+        return False
+    item = _presence_item_key(parts[1][0])
+    names = {"发烧": r"发烧|发热", "嗓子疼": r"嗓子疼|咽痛", "喘不上气": r"喘不上气|气短",
+             "胸口不舒服": r"胸口(?:这几天|今天|现在|最近|没有|没|也|一直|都|还){0,3}不舒服"}.get(item, re.escape(item))
+    for row in turns:
+        # Candidate coverage is metadata, never a new patient fact. Uncertain,
+        # hypothetical, historic or superseded words cannot close a current gap.
+        if (_EXPLICIT_UNKNOWN.search(row["text"])
+                or re.search(r"不确定|不肯定|不敢肯定|不太清楚|拿不准|可能|也许|大概|好像|是否|算不算|怎么算|怎么才算", row["text"])
+                or re.search(r"(?:还没|尚未|没|没有)(?:告诉|回答|说过|说清)|有没有|有无", row["text"])
+                or list(_literal_corrections(row["turn_id"], turns))):
+            continue
+        if _bound_presence_answer(row, controller["asked_questions"]) and any(
+            row["responding_to"]["text"].endswith(asked)
+            and _presence_question_key(asked) == _presence_question_key(question)
+            for asked in controller["asked_questions"]
+        ):
+            return True
+        for clause in re.split(r"[，。！？；,.!?;\n]", row["text"]):
+            if re.search(r"以前|之前|过去|曾经|小时候|那时候|那时|上次|去年|前年|上个月|前几年|[0-9一二三四五六七八九十两]+年前|"
+                         r"如果|假如|假设|要是|会不会|是不是|家人|家属|孩子|儿子|女儿|父亲|母亲|爸爸|妈妈|妻子|丈夫|朋友|同事|邻居|别人|他|她", clause):
+                continue
+            if re.search(names, clause) and not re.search(r"[？?]", row["text"]):
+                return True
+    return False
+
+
+def _pending_followups(controller: dict[str, Any], turns: list[dict[str, Any]]) -> list[str]:
+    return [question for question in controller.get("followup_questions", [])
+            if not _followup_answered(question, turns, controller)]
+
+
+def _remember_followups(controller: dict[str, Any], question: str, category: str | None,
+                        state: dict[str, dict[str, Any]]) -> None:
+    questions = [item for item in controller.get("followup_questions", [])
+                 if _question_in_scope(item, "associated_symptoms", state)]
+    parts = _presence_items(question) if category == "associated_symptoms" else None
+    if parts and len(parts[1]) > 1:
+        prefix, items, suffix, ending = parts
+        questions.extend(prefix + item + suffix + ending for item in items)
+    unique = {}
+    for item in questions:
+        parts = _presence_items(item)
+        if (parts and len(parts[1]) == 1 and _question_in_scope(item, "associated_symptoms", state)
+                and _easy_single_question(item) and not _unsafe_reply(item) and not _NON_HEALTH_ACTION.search(item)):
+            unique.setdefault(_presence_item_key(parts[1][0]), item)
+    if unique or "followup_questions" in controller:
+        controller["followup_questions"] = list(unique.values())[:MAX_QUESTIONS]
+
+
+def _single_candidate_question(question: str, category: str | None, asked_questions: list[str]) -> str:
+    if _unsafe_reply(question) or _NON_HEALTH_ACTION.search(question):
+        return ""
+    if _normalise_text(question) in {_normalise_text(item) for item in asked_questions}:
+        return ""
+    if category != "associated_symptoms":
+        return question
+    parts = _presence_items(question)
+    if not parts:
+        # Never rescue a compound candidate whose qualifiers cannot be kept.
+        return "" if re.search(r"有没有|有无|是否(?:还)?有|、|或者", question) else question
+    prefix, items, suffix, ending = parts
+    asked_items = {
+        _presence_item_key(item)
+        for previous in asked_questions
+        if (previous_parts := _presence_items(previous))
+        for item in previous_parts[1]
+    }
+    item = next((item for item in items if _presence_item_key(item) not in asked_items), None)
+    return prefix + item + suffix + ending if item else ""
+
+
+def _question_in_scope(question: str, category: str | None, state: dict[str, dict[str, Any]]) -> bool:
+    complaint = state["main_complaint"]
+    if category == "associated_symptoms" and (parts := _presence_items(question)):
+        if complaint["status"] == "known" and complaint["evidence_turn_ids"] and len(parts[1]) == 1:
+            prefix = parts[0]
+            stem = re.sub(r"(?:有没有|有无|是否(?:还)?有)$", "", prefix)
+            anchored = re.fullmatch(
+                r"(?:除了(?P<except>[^，。！？；,!?;、]{1,40})[，,](?:这几天|今天|最近|现在)?|"
+                r"(?:这几天|今天|最近|现在)?(?P<during>[^，。！？；,!?;、]{1,40})(?:的时候|时)[，,]?)", stem,
+            )
+            if anchored:
+                subject = anchored.group("except") or anchored.group("during")
+                return bool(
+                    _normalise_text(subject) in _normalise_text(complaint["summary"])
+                    and not re.search(r"和|或|并|因为|导致|病|炎|癌|症|感染|药|检查", subject)
+                    and _PATTERNS["main_complaint"].search(subject)
+                )
+        return False
+    if _QUESTION_SCOPE.search(question):
+        return True
+    if category != "symptom_character" or complaint["status"] != "known" or not complaint["evidence_turn_ids"]:
+        return False
+    # A natural choice about an already sourced symptom need not contain a
+    # legacy field word. Require the same literal complaint in a narrow choice
+    # shape and reject recognised extra symptoms or diagnostic premises.
+    choice = re.fullmatch(
+        r"(?P<subject>[^，。！？；,!?;、]{1,40})(?:的时候|时)"
+        r"(?P<first>(?:有|是)[^，。！？；,!?;、]{1,16})吗[，,]?\s*还是"
+        r"(?P<second>[^，。！？；,!?;、]{1,16})[？?]",
+        question,
+    )
+    if not choice:
+        return False
+    if _normalise_text(choice.group("subject")) not in _normalise_text(complaint["summary"]):
+        return False
+    if re.search(r"和|或|并|另外|同时|伴随|以及|还有|病|炎|癌|症|感染|药|检查", question):
+        return False
+    anchors = set(_PATTERNS["main_complaint"].findall(complaint["summary"]))
+    question_symptoms = (_PATTERNS["main_complaint"].findall(question)
+                         + _PATTERNS["associated_symptoms"].findall(question))
+    return any(
+        anchor in choice.group("subject") and anchor in choice.group("second")
+        and all(symptom == anchor for symptom in question_symptoms)
+        for anchor in anchors
+    )
+
+
+def _correction_context_span(text: str, match) -> tuple[int, int]:
+    separators = "。！？；.!?;\n"
+    start = max((text.rfind(char, 0, match.start()) for char in separators), default=-1) + 1
+    ends = [index for char in separators if (index := text.find(char, match.end())) >= 0]
+    return start, min(ends) + 1 if ends else len(text)
+
+
+def _correction_context(text: str, match) -> str:
+    start, end = _correction_context_span(text, match)
+    return text[start:end]
+
+
+def _direct_correction(text: str):
     match = _CORRECTION_REPLACEMENT.search(text)
+    if match and re.search(
+        r"如果|假如|假设|要是|会不会|[？?]|(?:没|没有|未)(?:说|更正|改|表示)|"
+        r"(?:医生|药师|家属|别人|他|她).{0,6}(?:说|建议|嘱咐|提到)",
+        _correction_context(text, match),
+    ):
+        return None
+    return match
+
+
+def _correction_span(text: str) -> tuple[int, int] | None:
+    match = _direct_correction(text)
     return (match.start("new"), match.end("new")) if match else None
 
 
@@ -229,19 +520,32 @@ def _source_excerpt(text: str, category: str | None = None) -> str:
     if matcher is None:
         return text.strip()
     correction = _correction_span(text)
-    search_start, search_end = correction if correction else (0, len(text))
-    matches = list(matcher.finditer(text, search_start, search_end))
+    correction_match = _CORRECTION_REPLACEMENT.search(text)
+    correction_context = _correction_context_span(text, correction_match) if correction_match else None
+    matches = list(matcher.finditer(text))
     if not matches:
         return ""
     separators = "，。！？；,.!?;\n"
     excerpts = []
     for match in matches:
+        search_start, search_end = 0, len(text)
+        if correction_context and correction_context[0] <= match.start() < correction_context[1]:
+            if not correction or not correction[0] <= match.start() < correction[1]:
+                continue
+            search_start, search_end = correction
         previous = max((text.rfind(char, 0, match.start()) for char in separators), default=-1)
         following = [index for char in separators if (index := text.find(char, match.end())) >= 0]
         start = max(previous + 1, search_start)
         end = min(min(following) + 1 if following else len(text), search_end)
         clause = text[start:end].strip()
         if re.search(r"[？?]", clause):
+            continue
+        if category not in {"relevant_history", "prior_actions_results", "unknown"}:
+            if re.search(r"如果|假如|假设|要是|会不会", clause):
+                continue
+        if category == "aggravating_relieving" and re.fullmatch(_TEMPORAL_CHANGE, match.group()) and re.search(
+            r"建议|应该|应当|请|就医|医院|急诊|检查", clause,
+        ):
             continue
         if category != "unknown" and _EXPLICIT_UNKNOWN.search(clause):
             continue
@@ -265,12 +569,74 @@ def _source_excerpt(text: str, category: str | None = None) -> str:
     return "；".join(excerpts)
 
 
+def _unperformed_action_excerpt(text: str) -> str:
+    """A stated unperformed action is a fact; it is not a normal result."""
+    values = []
+    for match in re.finditer(r"[^，。！？；,.!?;\n]+[，。！？；,.!?;]?", text):
+        clause = match.group().strip()
+        if re.fullmatch(
+            r"(?:我)?(?:还没有|尚未|并未|没有|还没|没|未)"
+            r"(?:量|测|做|查|检查)(?:过)?[^，。！？；,.!?;\n]+[，。；,.;]?", clause,
+        ) and not _EXPLICIT_UNKNOWN.search(clause):
+            values.append(clause)
+    return "；".join(dict.fromkeys(values))
+
+
+def _literal_corrections(ref: str, turns: list[dict[str, Any]]):
+    positions = {row["turn_id"]: index for index, row in enumerate(turns)}
+    position = positions[ref]
+    for index, row in enumerate(turns):
+        if index < position:
+            continue
+        correction = _direct_correction(row["text"])
+        if not correction:
+            continue
+        old = correction.group("old").strip()
+        numeric = "0123456789零〇一二三四五六七八九十百千万两"
+        left = r"(?<![0-9零〇一二三四五六七八九十百千万两])" if old and old[0] in numeric else ""
+        right = r"(?![0-9零〇一二三四五六七八九十百千万两])" if old and old[-1] in numeric else ""
+        pattern = re.compile(left + re.escape(old) + right)
+        owners = [(source["turn_id"], len(list(pattern.finditer(source["text"])))) for source in turns[:index]]
+        occurrences = sum(count for _, count in owners)
+        if position == index or any(source == ref and count for source, count in owners):
+            yield old, pattern, occurrences, position == index
+
+
+def _current_source_excerpt(ref: str, category: str, turns: list[dict[str, Any]]) -> str:
+    source = next(row["text"] for row in turns if row["turn_id"] == ref)
+    excerpt = _source_excerpt(source, category)
+    if category == "prior_actions_results":
+        return "；".join(dict.fromkeys(value for value in
+                          (excerpt, _unperformed_action_excerpt(source)) if value))
+    if category in {"relevant_history", "prior_actions_results", "unknown", None}:
+        return excerpt
+    for old, pattern, occurrences, is_correction in _literal_corrections(ref, turns):
+        if is_correction:
+            if occurrences != 1 and not (category == "main_complaint" and _PATTERNS[category].search(excerpt)):
+                return ""  # No unique earlier attribute to attach this replacement to.
+            continue
+        if not pattern.search(excerpt):
+            continue  # Unchanged clauses in this source remain literal facts.
+        if re.match(r"^(?:不|没|未|无|否认)", old) or old in {"是", "有"}:
+            return ""  # Never make an affirmative fact by deleting a negation.
+        # Keep only still-supported category fragments, never paste new words
+        # into an old quote. Ambiguous attributes remain unassigned; raw history
+        # retains every occurrence and other source clauses stay available.
+        # Split the existing extract into clauses before removing an old
+        # attribute. Otherwise a dangling suffix such as "了" can borrow a
+        # match from a separate unchanged evening clause and become a fact.
+        excerpt = "；".join(part.strip() for clause in re.split(r"[，。！？；,.!?;\n]", excerpt)
+                           for part in pattern.split(clause)
+                           if part.strip() and _PATTERNS[category].search(part))
+    return excerpt
+
+
 def _current_main_complaint_refs(refs: list[str], turns: list[dict[str, Any]]) -> list[str]:
     """Drop an earlier side-specific complaint explicitly replaced by a correction."""
     positions = {row["turn_id"]: index for index, row in enumerate(turns)}
     current = set(refs)
     for correction in turns:
-        match = _CORRECTION_REPLACEMENT.search(correction["text"])
+        match = _direct_correction(correction["text"])
         if not match:
             continue
         old_side = "右" if "右" in match.group("old") else "左" if "左" in match.group("old") else None
@@ -294,7 +660,7 @@ def _source_summary(
     """Use concise extractive evidence, never unsupported model prose."""
     turn_text = {row["turn_id"]: row["text"] for row in turns}
     context_text = {row["context_id"]: row["text"] for row in health_context}
-    values = [_source_excerpt(turn_text[ref], category) for ref in turn_ids if ref in turn_text]
+    values = [_current_source_excerpt(ref, category, turns) for ref in turn_ids if ref in turn_text]
     values.extend(context_text[ref].strip() for ref in context_ids if ref in context_text)
     result = []
     for value in dict.fromkeys(values):
@@ -307,19 +673,108 @@ def _source_summary(
     return "；".join(result)
 
 
+def _bound_answer_corrections(answers: list[dict[str, Any]], turns: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Resolve only an explicit, uniquely targeted literal answer correction.
+
+    The complete declared subject comes from patient syntax, not a symptom
+    inventory. Ambiguous or explicitly unknown targets retire the old answer
+    without authorizing a new known fact. Full sentences preserve time and
+    negation; the actual new responding_to stays separate from the old question.
+    """
+    positions = {row["turn_id"]: index for index, row in enumerate(turns)}
+    resolved = {}
+    for index, row in enumerate(turns):
+        for match in re.finditer(r"[^。！？；.!?;\n]+[。！？；.!?;]?", row["text"]):
+            sentence = match.group().strip()
+            marker = re.search(r"说错了|改一下|更正|纠正", sentence)
+            if not marker or re.search(
+                r"如果|假如|假设|(?<!主)要是|会不会|[？?]|(?:没|没有|未)(?:说|更正|改|表示)|"
+                r"(?:医生|药师|家属|别人|他|她).{0,6}(?:说|建议|嘱咐|提到)", sentence,
+            ):
+                continue
+            targets = []
+            for clause in re.split(r"[，,]", sentence[marker.end():].strip("，, ")):
+                copula = re.fullmatch(r"(?P<subject>[^，。！？；,.!?;]{1,24})是[^，。！？；,.!?;]+[。.;]?", clause.strip())
+                if not copula:
+                    continue
+                subject = copula.group("subject").strip()
+                # These are grammatical qualifiers/pronouns, not a declared
+                # attribute. Never discover a target from arbitrary n-grams.
+                if subject in {"我", "它", "这", "那", "有", "无", "不", "没", "未", "没有",
+                               "主要", "大多", "通常", "一般", "偶尔", "本来", "现在", "今天", "昨天", "前天", "以前"}:
+                    continue
+                owners = [answer for answer in answers
+                          if positions.get(answer["turn_id"], len(turns)) < index
+                          and subject in answer["quote"]]
+                if owners:
+                    targets.append(owners)
+            if not targets:
+                continue
+            unique = len(targets) == 1 and len(targets[0]) == 1
+            fact = sentence if unique and len(row["text"]) <= 120 and not (
+                _EXPLICIT_UNKNOWN.search(sentence) or _META_FEEDBACK.search(sentence)
+                or _DIAGNOSIS_REQUEST.search(sentence) or _unsafe_reply(sentence)
+            ) else ""
+            for owners in targets:
+                for answer in owners:
+                    resolved[answer["category"]] = {"source": row, "excerpt": fact}
+    return resolved
+
+
 def _ground_clinical_state(
         state: dict[str, dict[str, Any]], turns: list[dict[str, Any]],
-        health_context: list[dict[str, str]], controller: dict[str, Any]) -> None:
+        health_context: list[dict[str, str]], controller: dict[str, Any],
+        model_intent: str) -> None:
     """Only raw words that actually answer a category may close that category."""
     turn_text = {row["turn_id"]: row["text"] for row in turns}
     latest = turns[-1]
     last_category = controller.get("last_question_category")
     negative_categories = {"aggravating_relieving", "associated_symptoms", "relevant_history", "prior_actions_results"}
+    # A keyword-free answer remains evidence for the question it answered.
+    # Bind the complete patient source, never the model's summary or question
+    # text as a patient fact. Edits and corrections invalidate the old binding.
+    sources = {row["turn_id"]: row for row in turns}
+    origins = [item for item in controller.get("grounded_answers", [])
+               if item["turn_id"] in sources
+               and sources[item["turn_id"]].get("version", 1) == item["version"]
+               and sources[item["turn_id"]]["text"] == item["quote"]
+               and sources[item["turn_id"]].get("responding_to") == item["responding_to"]
+               and item["question"] in controller["asked_questions"]
+               and item["category"] in controller["asked_categories"]
+               and controller["question_counts"].get(item["category"], 0) > 0
+               and not list(_literal_corrections(item["turn_id"], turns))]
+    corrections = _bound_answer_corrections(origins, turns)
+    answers = []
+    for answer in origins:
+        correction = answer.get("correction")
+        if correction:
+            source = sources.get(correction["turn_id"])
+            if not (source and source.get("version", 1) == correction["version"]
+                    and source["text"] == correction["quote"]
+                    and source.get("responding_to") == correction["responding_to"]):
+                continue
+        answers.append(answer)
+    if answers:
+        controller["grounded_answers"] = answers
+    else:
+        controller.pop("grounded_answers", None)
 
     for category in CATEGORIES:
         item = state[category]
         refs = [ref for ref in item["evidence_turn_ids"] if ref in turn_text]
         contexts = item["context_ids"] if category == "relevant_history" else []
+        targeted = corrections.get(category)
+        retired_refs = {answer["turn_id"] for answer in origins
+                        if answer["category"] == category and (targeted or answer.get("correction"))}
+        if item["status"] == "known" and targeted and targeted["excerpt"] and targeted["source"]["turn_id"] in refs:
+            for answer in answers:
+                if answer["category"] == category:
+                    source = targeted["source"]
+                    answer["correction"] = {
+                        "turn_id": source["turn_id"], "version": source.get("version", 1),
+                        "quote": source["text"], "responding_to": source.get("responding_to"),
+                    }
+                    controller["grounded_answers"] = answers
 
         short_answer = (
             category == last_category
@@ -329,31 +784,82 @@ def _ground_clinical_state(
             and not _DIAGNOSIS_REQUEST.search(latest["text"])
             and not _DECLINED.search(latest["text"])
             and not re.search(r"[？?]", latest["text"])
-            and not _EXPLICIT_FINISH.fullmatch(latest["text"].strip())
+            and model_intent != "correction"
+            and (model_intent != "explicit_finish" or _bound_presence_answer(latest, controller["asked_questions"]))
+            and not _CORRECTION.search(latest["text"])
+            and (not _EXPLICIT_FINISH.fullmatch(latest["text"].strip())
+                 or _bound_presence_answer(latest, controller["asked_questions"]))
             and not _source_excerpt(latest["text"], category)
         )
         if short_answer and item["status"] == "known" and latest["turn_id"] in refs:
+            question = controller["asked_questions"][-1] if controller["asked_questions"] else ""
+            if (question and latest["responding_to"]["text"].endswith(question)
+                    and category in controller["asked_categories"]
+                    and controller["question_counts"].get(category, 0) > 0):
+                binding = {
+                    "category": category, "turn_id": latest["turn_id"],
+                    "version": latest.get("version", 1), "quote": latest["text"],
+                    "responding_to": dict(latest["responding_to"]), "question": question,
+                }
+                answers = [answer for answer in answers
+                           if (answer["category"], answer["question"]) != (category, question)] + [binding]
+                controller["grounded_answers"] = answers
             existing_refs = [
                 ref for ref in refs
                 if ref != latest["turn_id"]
                 and not _META_FEEDBACK.search(turn_text[ref])
-                and _source_excerpt(turn_text[ref], category)
+                and _current_source_excerpt(ref, category, turns)
             ]
+            literal_answers = [answer for answer in answers
+                               if answer["category"] == category and not answer.get("correction")
+                               and answer["turn_id"] in refs]
+            existing_refs = list(dict.fromkeys(existing_refs + [answer["turn_id"] for answer in literal_answers]))
             summary = _source_summary(existing_refs, contexts, turns, health_context, category=category)
             state[category] = {
                 "status": "known",
-                "summary": "；".join(part for part in (summary, latest["text"]) if part),
+                "summary": "；".join(dict.fromkeys(part for part in
+                           [summary] + [answer["quote"] for answer in literal_answers] + [latest["text"]] if part)),
                 "evidence_turn_ids": list(dict.fromkeys(existing_refs + [latest["turn_id"]])),
                 "context_ids": contexts,
             }
             continue
 
         if item["status"] == "known":
+            # A source-checked model may identify a complaint outside the
+            # legacy keyword inventory. Preserve only its complete literal
+            # source, never an inferred medical meaning or an unsourced recap.
+            literal_complaint_refs = []
+            if category == "main_complaint" and model_intent in {"health_fact", "answer", "correction"}:
+                literal_complaint_refs = [
+                    ref for ref in refs
+                    if ref not in retired_refs
+                    and item["summary"] == turn_text[ref].strip()
+                    and not _source_excerpt(turn_text[ref], category)
+                    and not list(_literal_corrections(ref, turns))
+                    and not _META_FEEDBACK.search(turn_text[ref])
+                    and not _DIAGNOSIS_REQUEST.search(turn_text[ref])
+                    and not _DECLINED.search(turn_text[ref])
+                    and not _EXPLICIT_FINISH.fullmatch(turn_text[ref].strip())
+                    and not re.search(r"[？?]", turn_text[ref])
+                ]
+            literal_answers = []
+            for answer in answers:
+                if answer["category"] != category:
+                    continue
+                correction = answer.get("correction")
+                if correction:
+                    if (targeted and targeted["excerpt"]
+                            and targeted["source"]["turn_id"] == correction["turn_id"]
+                            and correction["turn_id"] in refs):
+                        literal_answers.append((correction["turn_id"], targeted["excerpt"]))
+                elif not targeted and answer["turn_id"] in refs:
+                    literal_answers.append((answer["turn_id"], answer["quote"]))
+            literal_answer_refs = [ref for ref, _text in literal_answers]
             grounded_refs = [
                 ref for ref in refs
-                if not _META_FEEDBACK.search(turn_text[ref])
-                and _source_excerpt(turn_text[ref], category)
-            ]
+                if ref not in retired_refs and not _META_FEEDBACK.search(turn_text[ref])
+                and _current_source_excerpt(ref, category, turns)
+            ] + literal_complaint_refs + literal_answer_refs
             if category == "main_complaint":
                 grounded_refs = _current_main_complaint_refs(grounded_refs, turns)
             if (
@@ -368,7 +874,12 @@ def _ground_clinical_state(
             if not grounded_refs and not contexts:
                 state[category] = {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
                 continue
-            summary = _source_summary(grounded_refs, contexts, turns, health_context, category=category)
+            summary = _source_summary([ref for ref in grounded_refs if ref not in literal_answer_refs],
+                                      contexts, turns, health_context, category=category)
+            if not summary and literal_complaint_refs:
+                summary = turn_text[literal_complaint_refs[0]].strip()
+            summary = "；".join(dict.fromkeys(part for part in
+                                [summary] + [text for _ref, text in literal_answers] if part))
             state[category] = {
                 "status": "known",
                 "summary": summary,
@@ -397,29 +908,31 @@ def _ground_clinical_state(
             state[category] = {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
 
 
-def _merge_obvious_facts(state: dict[str, dict[str, Any]], turns: list[dict[str, Any]]) -> None:
+def _merge_obvious_facts(state: dict[str, dict[str, Any]], turns: list[dict[str, Any]], *, infer_associated: bool = False) -> None:
     """Prevent obvious repetition; never create a medical interpretation."""
     for category in _PATTERNS:
+        if category == "associated_symptoms" and not infer_associated:
+            continue  # A primary symptom does not establish a second symptom.
         if state[category]["status"] != "missing":
             continue
         refs = [
             row["turn_id"] for row in turns
-            if not _META_FEEDBACK.search(row["text"]) and _source_excerpt(row["text"], category)
+            if not _META_FEEDBACK.search(row["text"]) and _current_source_excerpt(row["turn_id"], category, turns)
         ]
         if category == "main_complaint":
             refs = _current_main_complaint_refs(refs, turns)
         if refs:
             excerpts = [
-                _source_excerpt(next(row["text"] for row in turns if row["turn_id"] == ref), category)
+                _current_source_excerpt(ref, category, turns)
                 for ref in refs[-2:]
             ]
             state[category] = {"status": "known", "summary": "；".join(excerpts)[:500], "evidence_turn_ids": refs, "context_ids": []}
 
 
-def _mock_assessment(turns: list[dict[str, Any]], controller: dict[str, Any]) -> dict[str, Any]:
+def _mock_assessment(turns: list[dict[str, Any]], controller: dict[str, Any], *, infer_associated: bool = True) -> dict[str, Any]:
     latest = turns[-1]
     state = _empty_state()
-    _merge_obvious_facts(state, turns)
+    _merge_obvious_facts(state, turns, infer_associated=infer_associated)
     text = latest["text"]
     intent = "meta_feedback" if _META_FEEDBACK.search(text) else "patient_question" if _DIAGNOSIS_REQUEST.search(text) or "?" in text or "？" in text else "correction" if _CORRECTION.search(text) else "explicit_finish" if _EXPLICIT_FINISH.fullmatch(text.strip()) else "answer" if len(turns) > 1 else "health_fact"
     earlier = {_normalise_text(row["text"]) for row in turns[:-1]}
@@ -459,7 +972,7 @@ def _clean_notes(value: Any, known_turns: set[str], known_context: set[str], *, 
 
 def _validate_assessment(value: Any, turns: list[dict[str, Any]], health_context: list[dict[str, str]]) -> dict[str, Any]:
     required = {"user_intent", "latest_turn_adds_fact", "suggested_action", "question_category", "question_importance", "candidate_question", "clinical_state", "relevant_context_ids", "unknowns", "contradictions"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"reply_text"} or not isinstance(value.get("clinical_state"), dict) or set(value["clinical_state"]) != set(CATEGORIES):
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"reply_text", "risk_candidates"} or not isinstance(value.get("clinical_state"), dict) or set(value["clinical_state"]) != set(CATEGORIES):
         raise ConversationError("model_schema_invalid", "model_schema_invalid")
     known_turns = {row["turn_id"] for row in turns}
     known_context = {row["context_id"] for row in health_context}
@@ -514,13 +1027,14 @@ def _validate_assessment(value: Any, turns: list[dict[str, Any]], health_context
         "relevant_context_ids": list(dict.fromkeys(relevant)),
         "unknowns": _clean_notes(value.get("unknowns"), known_turns, known_context, require_evidence=False),
         "contradictions": _clean_notes(value.get("contradictions"), known_turns, known_context),
+        "risk_candidates": value.get("risk_candidates", []),
     }
 
 
 def _controller_state(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     raw_counts = source.get("question_counts") if isinstance(source.get("question_counts"), dict) else {}
-    counts = {category: min(max(int(raw_counts.get(category, 0) or 0), 0), 3) for category in CATEGORIES}
+    counts = {category: min(max(int(raw_counts.get(category, 0) or 0), 0), MAX_QUESTIONS) for category in CATEGORIES}
     legacy = {"main_discomfort": "main_complaint", "onset_change": "onset_course", "life_impact": "functional_impact", "other_facts": "associated_symptoms"}
     for old, new in legacy.items():
         counts[new] = max(counts[new], min(max(int(raw_counts.get(old, 0) or 0), 0), 2))
@@ -528,7 +1042,7 @@ def _controller_state(value: Any) -> dict[str, Any]:
     closed = [legacy.get(item, item) for item in source.get("closed_categories", []) if legacy.get(item, item) in CATEGORIES]
     asked_questions = [str(item).strip()[:160] for item in source.get("asked_questions", []) if isinstance(item, str) and item.strip()][-12:]
     last = legacy.get(source.get("last_question_category"), source.get("last_question_category"))
-    return {
+    result = {
         "asked_categories": list(dict.fromkeys(asked)), "closed_categories": list(dict.fromkeys(closed)),
         "question_counts": counts, "asked_questions": asked_questions,
         "question_count": min(max(int(source.get("question_count", 0) or 0), 0), MAX_QUESTIONS),
@@ -536,6 +1050,66 @@ def _controller_state(value: Any) -> dict[str, Any]:
         "last_question_category": last if last in CATEGORIES else None,
         "linked_context_ids": [item for item in source.get("linked_context_ids", []) if isinstance(item, str) and _CONTEXT_ID.fullmatch(item)][:30],
     }
+    if "followup_questions" in source:
+        followups = source["followup_questions"]
+        if not isinstance(followups, list) or len(followups) > MAX_QUESTIONS or any(
+            not isinstance(question, str) or len(question) > 160
+            or not (parts := _presence_items(question)) or len(parts[1]) != 1
+            or _unsafe_reply(question) or _NON_HEALTH_ACTION.search(question)
+            for question in followups
+        ):
+            raise ConversationError("controller_followup_invalid")
+        result["followup_questions"] = list(dict.fromkeys(followups))
+    if "grounded_answers" in source:
+        answers = source["grounded_answers"]
+        fields = {"category", "turn_id", "version", "quote", "responding_to", "question"}
+        if not isinstance(answers, list) or len(answers) > MAX_QUESTIONS:
+            raise ConversationError("controller_answer_invalid")
+        cleaned = []
+        for answer in answers:
+            if (not isinstance(answer, dict) or not fields <= set(answer) or set(answer) - fields - {"correction"}
+                    or answer.get("category") not in CATEGORIES
+                    or not isinstance(answer.get("turn_id"), str) or not _TURN_ID.fullmatch(answer["turn_id"])
+                    or type(answer.get("version")) is not int or answer["version"] < 1
+                    or not isinstance(answer.get("quote"), str) or not answer["quote"].strip() or len(answer["quote"]) > 120
+                    or not isinstance(answer.get("question"), str) or not answer["question"].strip() or len(answer["question"]) > 160
+                    or not isinstance(answer.get("responding_to"), dict) or set(answer["responding_to"]) != {"turn_id", "text"}):
+                raise ConversationError("controller_answer_invalid")
+            question_source = answer["responding_to"]
+            if (not isinstance(question_source["turn_id"], str) or not _TURN_ID.fullmatch(question_source["turn_id"])
+                    or question_source["turn_id"] == answer["turn_id"]
+                    or not isinstance(question_source["text"], str) or len(question_source["text"]) > 1000
+                    or not question_source["text"].endswith(answer["question"])
+                    or _META_FEEDBACK.search(answer["quote"]) or _DIAGNOSIS_REQUEST.search(answer["quote"])
+                    or _DECLINED.search(answer["quote"]) or re.search(r"[？?]", answer["quote"])
+                    or (_EXPLICIT_FINISH.fullmatch(answer["quote"].strip())
+                        and not _bound_presence_answer({"text": answer["quote"], "responding_to": question_source}, [answer["question"]]))):
+                raise ConversationError("controller_answer_invalid")
+            cleaned_answer = {**answer, "responding_to": dict(question_source)}
+            if "correction" in answer:
+                correction = answer["correction"]
+                if (not isinstance(correction, dict) or set(correction) != {"turn_id", "version", "quote", "responding_to"}
+                        or not isinstance(correction.get("turn_id"), str) or not _TURN_ID.fullmatch(correction["turn_id"])
+                        or correction["turn_id"] == answer["turn_id"]
+                        or type(correction.get("version")) is not int or correction["version"] < 1
+                        or not isinstance(correction.get("quote"), str) or not correction["quote"].strip() or len(correction["quote"]) > 120):
+                    raise ConversationError("controller_answer_invalid")
+                actual_question = correction["responding_to"]
+                if actual_question is not None and (
+                    not isinstance(actual_question, dict) or set(actual_question) != {"turn_id", "text"}
+                    or not isinstance(actual_question.get("turn_id"), str) or not _TURN_ID.fullmatch(actual_question["turn_id"])
+                    or actual_question["turn_id"] == correction["turn_id"]
+                    or not isinstance(actual_question.get("text"), str) or not actual_question["text"].strip()
+                    or len(actual_question["text"]) > 1000
+                ):
+                    raise ConversationError("controller_answer_invalid")
+                cleaned_answer["correction"] = {**correction, "responding_to": dict(actual_question) if actual_question else None}
+            cleaned.append(cleaned_answer)
+        if len({(answer["category"], answer["question"]) for answer in cleaned}) != len(cleaned):
+            raise ConversationError("controller_answer_invalid")
+        if cleaned:
+            result["grounded_answers"] = cleaned
+    return result
 
 
 def _response_text(reply: str, question: str) -> str:
@@ -596,21 +1170,27 @@ def _result(*, started: float, provider_name: str, model_id: str, action: str, a
             question_category: str | None, stop_reason: str | None, controller: dict[str, Any],
             clinical_state: dict[str, dict[str, Any]], safety: dict[str, Any], model_intent: str | None = None,
             relevant_context_ids: list[str] | None = None, unknowns: list[dict[str, Any]] | None = None,
-            contradictions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            contradictions: list[dict[str, Any]] | None = None,
+            risk_assessment: dict[str, Any] | None = None,
+            pending_questions: list[str] | None = None) -> dict[str, Any]:
     completeness = {
-        "complete": all(clinical_state[item]["status"] in {"known", "declined"} for item in CLOSURE_CATEGORIES),
+        "complete": not pending_questions and all(clinical_state[item]["status"] in {"known", "declined"} for item in CLOSURE_CATEGORIES),
         "clinical_state": clinical_state,
         "evidence_turn_ids": list(dict.fromkeys(ref for item in clinical_state.values() for ref in item["evidence_turn_ids"])),
         "relevant_context_ids": relevant_context_ids or [], "unknowns": unknowns or [], "contradictions": contradictions or [],
     }
+    if "followup_questions" in controller:
+        completeness["pending_questions"] = pending_questions or []
     return {
         "ok": True, "trace_id": "ctr_" + uuid.uuid4().hex, "provider": provider_name,
         "model_id": model_id, "prompt_version": PROMPT_VERSION, "prompt_sha256": PROMPT_SHA256,
         "latency_ms": round((time.perf_counter() - started) * 1000, 2), "action": action,
         "assistant_text": assistant_text, "question_category": question_category, "stop_reason": stop_reason,
         "controller": controller, "completeness": completeness, "model_intent": model_intent,
-        "risk_level": "urgent" if safety.get("danger_detected") else "needs_review" if safety.get("clinical_review_required") else "routine",
+        "risk_level": risk_assessment["level"] if risk_assessment and risk_assessment["level"] in {"soon_evaluation", "urgent"} else "urgent" if safety.get("danger_detected") else "needs_review" if safety.get("clinical_review_required") else "routine",
         "local_safety": safety,
+        "risk_contract_version": RISK_CONTRACT_VERSION,
+        "risk_assessment": risk_assessment if risk_assessment is not None else evaluate_reviewed_risk([], []),
     }
 
 
@@ -622,18 +1202,23 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     controller = _controller_state(payload.get("controller"))
     latest = turns[-1]["text"]
     safety = scan_danger(latest)
+    risk_registry = load_reviewed_risk_rules()
     started = time.perf_counter()
 
     if safety["danger_detected"]:
-        assessment = _mock_assessment(turns, controller)
-        return _result(started=started, provider_name="LocalDangerRule", model_id="local-danger-rule-v1", action="urgent", assistant_text=DANGER_REMINDER, question_category=None, stop_reason="urgent_rule", controller={**controller, "last_question_category": None}, clinical_state=assessment["clinical_state"], safety=safety, model_intent=assessment["user_intent"])
+        assessment = _mock_assessment(turns, controller, infer_associated=False)
+        return _result(started=started, provider_name="LocalDangerRule", model_id="local-danger-rule-v1", action="urgent", assistant_text=DANGER_REMINDER, question_category=None, stop_reason="urgent_rule", controller={**controller, "last_question_category": None}, clinical_state=assessment["clinical_state"], safety=safety, model_intent=assessment["user_intent"], pending_questions=_pending_followups(controller, turns))
 
     selected_provider = provider or provider_from()
     if isinstance(selected_provider, MockProvider):
         draft = _mock_assessment(turns, controller)
         model_id = "mock-clinical-intake-v1"
     else:
-        draft = selected_provider.complete_json(SYSTEM_PROMPT, {"turns": turns, "health_context": health_context, "controller": controller})
+        model_payload = {"turns": turns, "health_context": health_context, "controller": controller,
+            "approved_risk_rules": [{key: rule[key] for key in ("rule_id", "version", "description")} for rule in risk_registry["rules"]]}
+        if "subject_id" in payload:
+            model_payload["subject_id"] = payload["subject_id"]
+        draft = selected_provider.complete_json(SYSTEM_PROMPT, model_payload)
         model_id = getattr(getattr(selected_provider, "c", None), "model", None) or "unknown"
     provider_name = type(selected_provider).__name__
     try:
@@ -641,25 +1226,42 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
     except ConversationError as error:
         if error.code != "model_reply_unsafe":
             raise
-        fallback = _mock_assessment(turns, controller)
-        return _result(started=started, provider_name=provider_name, model_id=model_id, action="reply", assistant_text=MODEL_OUTPUT_BLOCKED_TEXT, question_category=None, stop_reason="model_output_blocked", controller=controller, clinical_state=fallback["clinical_state"], safety=safety)
+        fallback = _mock_assessment(turns, controller, infer_associated=isinstance(selected_provider, MockProvider))
+        return _result(started=started, provider_name=provider_name, model_id=model_id, action="reply", assistant_text=MODEL_OUTPUT_BLOCKED_TEXT, question_category=None, stop_reason="model_output_blocked", controller=controller, clinical_state=fallback["clinical_state"], safety=safety, pending_questions=_pending_followups(controller, turns))
 
     clinical_state = assessment["clinical_state"]
-    _ground_clinical_state(clinical_state, turns, health_context, controller)
+    newly_answered_followup = _bound_presence_answer(turns[-1], controller["asked_questions"]) and any(
+        turns[-1]["responding_to"]["text"].endswith(asked)
+        and _presence_question_key(asked) == _presence_question_key(question)
+        for question in _pending_followups(controller, turns[:-1])
+        for asked in controller["asked_questions"]
+    )
+    _ground_clinical_state(clinical_state, turns, health_context, controller, assessment["user_intent"])
     _merge_obvious_facts(clinical_state, turns)
+    previous_followups = set(_pending_followups(controller, turns))
+    _remember_followups(controller, assessment["candidate_question"], assessment["question_category"], clinical_state)
+    pending_questions = _pending_followups(controller, turns)
+    risk_assessment = evaluate_reviewed_risk(assessment["risk_candidates"], turns, risk_registry)
+    if risk_assessment["level"] in {"soon_evaluation", "urgent"}:
+        return _result(started=started, provider_name=provider_name, model_id=model_id,
+            action=risk_assessment["level"], assistant_text=risk_assessment["notice"],
+            question_category=None, stop_reason="reviewed_risk_rule", controller={**controller, "last_question_category": None},
+            clinical_state=clinical_state, safety=safety, model_intent=assessment["user_intent"], risk_assessment=risk_assessment,
+            pending_questions=pending_questions)
     latest_normalised = _normalise_text(latest)
     earlier = {_normalise_text(row["text"]) for row in turns[:-1]}
     # Not remembering one detail must not erase separately stated symptoms.
     declined = bool(_DECLINED.search(latest)) and not any(
         _source_excerpt(latest, category) for category in CATEGORIES
     )
-    explicit_finish = bool(_EXPLICIT_FINISH.fullmatch(latest.strip())) or assessment["user_intent"] == "explicit_finish"
+    explicit_finish = not _bound_presence_answer(turns[-1], controller["asked_questions"]) and (
+        bool(_EXPLICIT_FINISH.fullmatch(latest.strip())) or assessment["user_intent"] == "explicit_finish")
     meta_feedback = bool(_META_FEEDBACK.search(latest)) or assessment["user_intent"] == "meta_feedback"
     diagnosis_request = bool(_DIAGNOSIS_REQUEST.search(latest))
     patient_question = assessment["user_intent"] == "patient_question" or diagnosis_request
     correction = bool(_CORRECTION.search(latest)) or assessment["user_intent"] == "correction"
     conversational_question = meta_feedback or patient_question
-    adds_fact = assessment["latest_turn_adds_fact"] and bool(latest_normalised) and latest_normalised not in earlier and not declined and not explicit_finish and not conversational_question
+    adds_fact = (assessment["latest_turn_adds_fact"] and bool(latest_normalised) and latest_normalised not in earlier or newly_answered_followup) and not declined and not explicit_finish and not conversational_question
     controller["no_new_fact_count"] = 0 if conversational_question or adds_fact else min(2, controller["no_new_fact_count"] + 1)
     last_category = controller["last_question_category"]
     if declined and last_category:
@@ -672,6 +1274,17 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         latest, meta_feedback=meta_feedback,
         diagnosis_request=diagnosis_request, correction=correction,
     )
+    candidate_question = _single_candidate_question(
+        assessment["candidate_question"], assessment["question_category"], controller["asked_questions"] + [
+            question for question in controller.get("followup_questions", []) if question not in pending_questions],
+    )
+    # A coarse category can already have one fact while an original candidate
+    # still lacks an answer. Only previously saved items may exceed its old
+    # per-category cap; the overall fatigue/end/safety boundaries still apply.
+    candidate_followup = next((question for question in pending_questions
+                               if _presence_question_key(question) == _presence_question_key(candidate_question)), None)
+    followup_eligible = candidate_followup is not None and (
+        controller["question_counts"]["associated_symptoms"] < 2 or candidate_followup in previous_followups)
     if explicit_finish:
         # Closing a session needs no model-authored recap, which can invent
         # facts even when every structured fact has a valid source.
@@ -684,10 +1297,11 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         # the model may add one useful question only when it explicitly chose it.
         proposed = assessment["question_category"] if assessment["suggested_action"] == "ask" else None
         context_to_verify = [ref for ref in assessment["relevant_context_ids"] if ref not in controller["linked_context_ids"]]
-        eligible = [category for category in CATEGORIES if (clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and category not in controller["closed_categories"] and controller["question_counts"].get(category, 0) < 2]
-        candidate = assessment["candidate_question"]
+        eligible = [category for category in CATEGORIES if ((clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and controller["question_counts"].get(category, 0) < 2 or category == "associated_symptoms" and followup_eligible) and category not in controller["closed_categories"]]
+        candidate = candidate_question
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
-        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions:
+        fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
+        if proposed in eligible and controller["question_count"] < MAX_QUESTIONS and not (fatigue and assessment["question_importance"] != "essential") and candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions:
             next_category = proposed
             assistant_text = _response_text(reply, candidate)
             if _unsafe_reply(assistant_text) or _NON_HEALTH_ACTION.search(assistant_text):
@@ -709,7 +1323,7 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         stop_reason = "two_no_new_fact_turns"
     else:
         context_to_verify = [ref for ref in assessment["relevant_context_ids"] if ref not in controller["linked_context_ids"]]
-        eligible = [category for category in CATEGORIES if (clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and category not in controller["closed_categories"] and controller["question_counts"].get(category, 0) < 2]
+        eligible = [category for category in CATEGORIES if ((clinical_state[category]["status"] == "missing" or category == "relevant_history" and context_to_verify) and controller["question_counts"].get(category, 0) < 2 or category == "associated_symptoms" and followup_eligible) and category not in controller["closed_categories"]]
         proposed = assessment["question_category"] if assessment["suggested_action"] == "ask" else None
         enough = all(clinical_state[item]["status"] in {"known", "declined"} for item in CLOSURE_CATEGORIES) and not context_to_verify
         fatigue = controller["question_count"] >= TYPICAL_QUESTION_LIMIT
@@ -719,9 +1333,9 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         if proposed in eligible and not (fatigue and assessment["question_importance"] != "essential"):
             next_category = proposed
 
-        candidate = assessment["candidate_question"] if proposed == next_category else ""
+        candidate = candidate_question if proposed == next_category else ""
         normalised_questions = {_normalise_text(item) for item in controller["asked_questions"]}
-        candidate_is_valid = bool(candidate and _QUESTION_SCOPE.search(candidate) and _normalise_text(candidate) not in normalised_questions)
+        candidate_is_valid = bool(candidate and _question_in_scope(candidate, proposed, clinical_state) and _easy_single_question(candidate) and _normalise_text(candidate) not in normalised_questions)
         if next_category and candidate_is_valid:
             previous_count = controller["question_counts"].get(next_category, 0)
             assistant_text = _response_text(reply, candidate)
@@ -758,6 +1372,8 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         relevant_context_ids=assessment["relevant_context_ids"],
         unknowns=_ground_notes(assessment["unknowns"], turns, health_context, unknowns=True),
         contradictions=_ground_notes(assessment["contradictions"], turns, health_context),
+        risk_assessment=risk_assessment,
+        pending_questions=pending_questions,
     )
 
 

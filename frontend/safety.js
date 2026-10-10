@@ -8,6 +8,9 @@
   const RULE_VERSION = 'offline-danger-v2';
   const CLINICAL_REVIEW_VERSION = 'offline-review-flags-v1';
   const DANGER_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。不要自行加药、减药或停药。';
+  const SOON_EVALUATION_REMINDER = '您刚才说的情况需要尽快让医生当面评估，请让家属陪同就医。具体需要做哪些检查，由接诊医生判断。';
+  const URGENT_REVIEWED_REMINDER = '您刚才说的情况可能需要紧急处理，请立即联系 120，或由家属陪同前往急诊。';
+  const RISK_CONTRACT_VERSION = 'reviewed-risk-candidates-v1';
   const INTENSIFIER = '(?:(?:突然|一直|仍然|还是|非常|特别|明显|很|有点儿?|有些|持续|十分|极其|越来越)(?:地|的)?){0,2}';
   const rules = [
     ['chest', new RegExp(`胸(?:口|部)?${INTENSIFIER}(?:疼痛|疼|痛)|胸闷`, 'gu')],
@@ -84,6 +87,7 @@
       danger_reminder: matchedRules.length ? DANGER_REMINDER : null,
       matched_rules: matchedRules,
       safety_rule_version: RULE_VERSION,
+      legacy_clinical_review_status: 'active_unvalidated',
       clinical_review_flags: clinicalReviewFlags,
       clinical_review_version: CLINICAL_REVIEW_VERSION,
       clinical_review_status: clinicalReviewFlags.length ? 'candidate_unverified' : 'not_flagged',
@@ -100,5 +104,71 @@
       event.source_review?.confirmed_at && event.source_review.text === event.raw_text);
   }
 
-  return { CLINICAL_REVIEW_VERSION, DANGER_REMINDER, RULE_VERSION, scanDanger, documentNeedsReview };
+  function reviewedRiskSourcesCurrent(assessment, turns) {
+    const current = new Map((turns || []).filter(turn => turn.role === 'elder' && !turn.superseded && !turn.is_mock)
+      .map(turn => [turn.turn_id, turn]));
+    return Array.isArray(assessment?.sources) && assessment.sources.length > 0 && assessment.sources.every(source => {
+      const turn = current.get(source?.turn_id);
+      return turn && Number.isInteger(source.version) && source.version === turn.version
+        && typeof source.quote === 'string' && source.quote === turn.text;
+    });
+  }
+
+  // The backend owns approved pattern matching. This second gate verifies only
+  // its trusted manifest identity, current full-source evidence, and fixed text.
+  // Metadata presence is not proof of clinical validation or model accuracy.
+  function validateReviewedRisk(assessment, manifest, turns) {
+    try {
+      if (!assessment || !manifest || assessment.contract_version !== RISK_CONTRACT_VERSION
+        || manifest.contract_version !== RISK_CONTRACT_VERSION || manifest.status !== 'reviewed_rules_loaded'
+        || assessment.status !== manifest.status || !['synthetic_fixture_only', 'clinical_review_metadata_present'].includes(manifest.clinical_validation)
+        || assessment.clinical_validation !== manifest.clinical_validation
+        || typeof manifest.rule_set_version !== 'string' || !manifest.rule_set_version
+        || assessment.rule_set_version !== manifest.rule_set_version
+        || !/^[a-f0-9]{64}$/.test(manifest.config_sha256 || '') || assessment.config_sha256 !== manifest.config_sha256
+        || !Array.isArray(manifest.rules) || !manifest.rules.length || manifest.rules.length > 50
+        || !['soon_evaluation', 'urgent'].includes(assessment.level)
+        || !Array.isArray(assessment.matched_rules) || !assessment.matched_rules.length || assessment.matched_rules.length > 8
+        || Object.keys(assessment).sort().join(',') !== 'clinical_validation,config_sha256,contract_version,level,matched_rules,notice,rejected_candidates,rule_set_version,sources,status'
+        || !Number.isInteger(assessment.rejected_candidates) || assessment.rejected_candidates < 0
+        || !reviewedRiskSourcesCurrent(assessment, turns)) return null;
+      const approved = new Map();
+      for (const rule of manifest.rules) {
+        if (typeof rule.rule_id !== 'string' || !rule.rule_id || typeof rule.version !== 'string' || !rule.version
+          || !['soon_evaluation', 'urgent'].includes(rule.level)) return null;
+        const key = JSON.stringify([rule.rule_id, rule.version]);
+        if (approved.has(key)) return null;
+        approved.set(key, rule.level);
+      }
+      const sourceKey = source => JSON.stringify([source.turn_id, source.version, source.quote]);
+      const sourceKeys = new Set();
+      for (const source of assessment.sources) {
+        if (Object.keys(source).sort().join(',') !== 'quote,turn_id,version' || sourceKeys.has(sourceKey(source))) return null;
+        sourceKeys.add(sourceKey(source));
+      }
+      const matched = new Set(), evidenceKeys = new Set();
+      let level = 'soon_evaluation';
+      for (const rule of assessment.matched_rules) {
+        const key = JSON.stringify([rule.rule_id, rule.version]);
+        if (Object.keys(rule).sort().join(',') !== 'evidence,level,rule_id,version' || matched.has(key)
+          || approved.get(key) !== rule.level || !Array.isArray(rule.evidence) || !rule.evidence.length || rule.evidence.length > 8) return null;
+        matched.add(key);
+        if (rule.level === 'urgent') level = 'urgent';
+        const ownEvidence = new Set();
+        for (const source of rule.evidence) {
+          if (Object.keys(source).sort().join(',') !== 'quote,turn_id,version'
+            || !sourceKeys.has(sourceKey(source)) || ownEvidence.has(sourceKey(source))) return null;
+          ownEvidence.add(sourceKey(source)); evidenceKeys.add(sourceKey(source));
+        }
+      }
+      const notice = level === 'urgent' ? URGENT_REVIEWED_REMINDER : SOON_EVALUATION_REMINDER;
+      if (level !== assessment.level || assessment.notice !== notice || evidenceKeys.size !== sourceKeys.size) return null;
+      return { ...assessment, notice, sources: assessment.sources.map(source => ({ ...source })),
+        matched_rules: assessment.matched_rules.map(rule => ({ ...rule, evidence: rule.evidence.map(source => ({ ...source })) })) };
+    } catch { return null; }
+  }
+
+  return { CLINICAL_REVIEW_VERSION, DANGER_REMINDER, RULE_VERSION, scanDanger, documentNeedsReview,
+    SOON_EVALUATION_REMINDER, URGENT_REVIEWED_REMINDER, RISK_CONTRACT_VERSION,
+    validateReviewedRisk, reviewedRiskSourcesCurrent };
 });
