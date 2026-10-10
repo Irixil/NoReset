@@ -4,6 +4,8 @@ Only the external model is replaced. These checks prove request isolation and
 source handling, not supplier recall, clinical accuracy, or persistent storage.
 """
 from copy import deepcopy
+import hashlib
+import json
 
 import pytest
 
@@ -211,3 +213,128 @@ def test_http_rejects_ineligible_memory_without_supplier_entry(http_client, chan
     assert response.body["raw_text_preserved_on_device"] is True
     assert response.body["error"].startswith("health_context_")
     assert provider.inputs == []
+
+
+def recorded_recall_failure():
+    """Exact synthetic supplier draft from first.result.json SHA 0c5cb0eb….
+
+    Embedded so public tests do not depend on excluded local evidence files.
+    This is a recorded failure replay, never a new supplier observation.
+    """
+    state = {category: {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
+             for category in conversation.CATEGORIES}
+    state["main_complaint"] = {
+        "status": "known", "summary": "今天咳嗽",
+        "evidence_turn_ids": ["turn_f411631caf994ca6a5be929c8e30a88b"], "context_ids": [],
+    }
+    return {
+        "user_intent": "health_fact", "latest_turn_adds_fact": True,
+        "reply_text": "好的，您今天咳嗽，我会把这件事记下来，方便之后和医生说明。",
+        "suggested_action": "ask", "question_category": "onset_course",
+        "question_importance": "essential", "candidate_question": "这次咳嗽是从什么时候开始的？",
+        "clinical_state": state, "relevant_context_ids": [], "unknowns": [],
+        "contradictions": [], "risk_candidates": [],
+    }
+
+
+def recorded_recall_input():
+    """Original synthetic browser input of the failed first memory request."""
+    rows = [
+        ("context_a73a26f043a543dba2ebe14ca65c01c2", "conditions",
+         "2021年医生曾告诉我有哮喘，这只是我保存的既往陈述。", "historical", "2021-04-03", "244"),
+        ("context_4267b9a2fe3e4dbdb149d3db695e2058", "medications",
+         "2023年曾用过示例药甲，现在已经不用。", "historical", "2023-05-04", "392"),
+        ("context_a7e0c0d995b54c398e12a1d9b42833a3", "allergies",
+         "示例食物乙曾让我起皮疹，原因还不清楚。", "current", None, "542"),
+    ]
+    context = []
+    for context_id, category, text, temporal, occurred, millis in rows:
+        stamp = f"2026-10-10T00:55:45.{millis}Z"
+        context.append(memory(context_id=context_id, subject_id="subject_self", category=category,
+                              text=text, temporal_status=temporal, occurred_on=occurred,
+                              recorded_at=stamp, confirmed_at=stamp, updated_at=stamp))
+    return {
+        "subject_id": "subject_self",
+        "turns": [{"turn_id": "turn_f411631caf994ca6a5be929c8e30a88b",
+                   "text": "我今天咳嗽，想把情况记录下来。", "version": 1,
+                   "responding_to": {"turn_id": "turn_f34c0bf796bc4a5c86a997df219dbd2c",
+                                     "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"}}],
+        "controller": {"asked_categories": ["main_complaint"], "closed_categories": [],
+                       "question_counts": {category: int(category == "main_complaint")
+                                           for category in conversation.CATEGORIES},
+                       "asked_questions": ["您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"],
+                       "question_count": 1, "no_new_fact_count": 0,
+                       "last_question_category": "main_complaint"},
+        "health_context": context,
+    }
+
+
+def test_recorded_real_recall_failure_remains_failure_without_local_memory_copy():
+    draft = recorded_recall_failure()
+    canonical = json.dumps(draft, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(canonical).hexdigest() == "ee29421c8f8d04fe9ef190e72c14aeb72f045b1697176bf3d6886fcb55da9aa7"
+    payload = recorded_recall_input()
+    before = deepcopy(payload)
+
+    class RecordedFailureProvider:
+        def complete_json(self, _system, model_payload):
+            assert model_payload["health_context"] == payload["health_context"]
+            assert model_payload["subject_id"] == "subject_self"
+            return deepcopy(draft)
+
+    result = conversation.conversation_turn(payload, provider=RecordedFailureProvider())
+    assert result["completeness"]["relevant_context_ids"] == []
+    assert result["completeness"]["clinical_state"]["relevant_history"]["status"] == "missing"
+    assert "哮喘" not in result["assistant_text"]
+    assert payload == before
+
+
+def test_actual_model_prompt_requires_related_memory_state_before_next_question():
+    class PromptContractProvider(CapturingProvider):
+        def complete_json(self, system, payload):
+            # Positive obligations are distinct from the old prohibition-only
+            # contract that allowed the recorded empty history response.
+            assert "先审阅本轮已选背景" in system
+            assert "clinical_state.relevant_history" in system
+            assert "不以患者再次说出" in system
+            assert "不因当前只收到一句新主诉" in system
+            assert "没有相关条目时保留 missing 和空引用" in system
+            assert "保留原文中的“不确定”" in system
+            return super().complete_json(system, payload)
+
+    conversation.conversation_turn(request(memory()), provider=PromptContractProvider())
+
+
+def test_recalled_historical_memory_uses_context_source_without_current_turn_repetition():
+    row = memory(category="similar_episodes", text="2014年曾有过相似头部疼痛，几天后缓解。")
+
+    class SourceGroundedProvider(CapturingProvider):
+        def complete_json(self, system, payload):
+            draft = super().complete_json(system, payload)
+            draft["clinical_state"]["relevant_history"] = {
+                "status": "known", "summary": row["text"], "evidence_turn_ids": [],
+                "context_ids": [row["context_id"]],
+            }
+            draft["relevant_context_ids"] = [row["context_id"]]
+            return draft
+
+    provider = SourceGroundedProvider()
+    result = conversation.conversation_turn(request(row), provider=provider)
+    history = result["completeness"]["clinical_state"]["relevant_history"]
+    assert history["context_ids"] == [row["context_id"]]
+    assert history["evidence_turn_ids"] == []
+    assert "2014年" in history["summary"]
+    assert result["completeness"]["relevant_context_ids"] == [row["context_id"]]
+    assert "2014年" not in provider.inputs[0]["turns"][0]["text"]
+    assert provider.inputs[0]["health_context"][0]["temporal_status"] == "historical"
+
+
+def test_provider_cannot_invent_a_recalled_memory_source():
+    class ForgedRecallProvider(CapturingProvider):
+        def complete_json(self, system, payload):
+            draft = super().complete_json(system, payload)
+            draft["relevant_context_ids"] = ["context_forgedunrelated"]
+            return draft
+
+    with pytest.raises(conversation.ConversationError, match="model_evidence_invalid"):
+        conversation.conversation_turn(request(memory()), provider=ForgedRecallProvider())
