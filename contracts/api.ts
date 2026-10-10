@@ -279,6 +279,87 @@ export type ConversationModelTurn = {
   responding_to?: { turn_id: string; text: string };
 };
 
+/** Local encrypted subject separation; this is not an account permission. */
+export type HealthSubject = {
+  subject_id: string;
+  label: string;
+  relationship: "self" | "family";
+  created_at: string;
+};
+
+export type HealthMemoryCategory =
+  | "conditions" | "medications" | "allergies"
+  | "procedures" | "tests" | "similar_episodes";
+
+/** User-confirmed statements remain statements, not verified diagnoses. */
+export type HealthMemoryInput = {
+  category: HealthMemoryCategory;
+  text: string;
+  temporal_status: "current" | "historical" | "uncertain";
+  confirmation_status: "confirmed" | "unconfirmed";
+  confirmed_by: "self" | "family";
+  source_kind: "self_statement" | "family_report" | "document";
+  occurred_on: string | null;
+  remember: boolean;
+};
+
+export type HealthMemoryEntry = Omit<HealthMemoryInput, "temporal_status"> & {
+  context_id: string;
+  subject_id: string;
+  source: "user_confirmed" | "user_unconfirmed";
+  recorded_at: string;
+  confirmed_at: string | null;
+  updated_at: string;
+  temporal_status: HealthMemoryInput["temporal_status"] | null;
+  /** Legacy records have no invented occurrence date or time status. */
+  legacy_entry?: boolean;
+};
+
+export type HealthMemoryProfile = {
+  subject_id: string;
+  version: number;
+  updated_at: string | null;
+  entries: HealthMemoryEntry[];
+};
+
+export type HealthMemoryWriteRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+  entry: HealthMemoryInput;
+};
+
+export type HealthSubjectsResponse = {
+  ok: true;
+  subjects: HealthSubject[];
+  active_subject_id: string;
+  /** The current tab keeps its owner until an explicit re-selection. */
+  observed_subject_id?: string;
+  version: number;
+};
+
+export type DeleteHealthMemoryRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+};
+
+export type HealthMemoryResponse = {
+  ok: true;
+  health_context: HealthMemoryProfile;
+  subject_id?: string;
+};
+
+/** Only today's explicit selection or confirmed remembered entries, <=5. */
+export type ConversationHealthMemoryRequest = {
+  subject_id: string;
+  turns: ConversationModelTurn[];
+  controller: Record<string, unknown>;
+  health_context: Array<Omit<HealthMemoryEntry, "temporal_status"> & {
+    temporal_status?: "current" | "historical";
+  }>;
+};
+
 export type AppSessionResponse =
   | { ok: true; authenticated: false }
   | { ok: true; authenticated: true; csrf_token: string; expires_at: number };

@@ -64,7 +64,7 @@ def run(turns, controller=None, provider=None, health_context=None):
 
 def test_prompt_contract_is_the_clinical_intake_version():
     result = run([turn(1, "我头疼。")])
-    assert result["prompt_version"] == PROMPT_VERSION == "clinical-intake-v8-risk-candidates"
+    assert result["prompt_version"] == PROMPT_VERSION == "clinical-intake-v9-health-memory"
     assert set(result["completeness"]["clinical_state"]) == set(CATEGORIES)
 
 

@@ -18,6 +18,9 @@
   let active = false;
   let pendingLocalOperations = 0;
   let restoringBackup = false;
+  // The patient displayed in this unlocked page stays bound to this realm.
+  // A shared IndexedDB selection changed by another tab cannot retarget a form.
+  let observedSubjectId = null;
   const conversationWrites = new Map();
   const eventWrites = new Map();
   const mediaWrites = new Map();
@@ -39,7 +42,7 @@
   }
   async function saveTrialConversation(conversation, control, extraPuts = [], unchanged = []) {
     const saved = { ...conversation, trial_control: control, version: conversation.version + 1, updated_at: now() };
-    await vault.mutate({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }, { key: TRIAL_VOICE_KEY, value: control }, ...extraPuts], unchanged });
+    await ownedMutation({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }, { key: TRIAL_VOICE_KEY, value: control }, ...extraPuts], unchanged });
     return saved;
   }
 
@@ -59,6 +62,9 @@
   function mediaBinaryKey(mediaId) { return `media-binary:${mediaId}`; }
   function conversationKey(conversationId) { return `conversation:${conversationId}`; }
   const HEALTH_CONTEXT_KEY = 'health-context:current';
+  const HEALTH_SUBJECTS_KEY = 'health-subjects:current';
+  const SELF_SUBJECT_ID = 'subject_self';
+  const HEALTH_CATEGORIES = new Set(['conditions', 'medications', 'allergies', 'procedures', 'tests', 'similar_episodes']);
   const CLINICAL_CATEGORIES = ['main_complaint', 'onset_course', 'symptom_character', 'aggravating_relieving', 'associated_symptoms', 'functional_impact', 'relevant_history', 'prior_actions_results'];
   const REPORT_CATEGORY_LABELS = {
     main_complaint: '主要不适', onset_course: '开始与变化', symptom_character: '感觉与程度',
@@ -161,39 +167,198 @@
   async function listConversations() {
     const values = await vault.list('conversation:');
     const currentContext = await healthContext();
-    return values.filter(item => item?.conversation_id).map(item => conversationWithCurrentReport(item, currentContext)).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    return values.filter(item => item?.conversation_id && subjectOf(item) === currentContext.subject_id)
+      .map(item => conversationWithCurrentReport({ ...item, subject_id: subjectOf(item) }, currentContext)).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   }
-  async function healthContext() {
-    const saved = await vault.get(HEALTH_CONTEXT_KEY);
-    return saved || { version: 0, updated_at: null, entries: [] };
+  function subjectOf(item) { return item?.subject_id || SELF_SUBJECT_ID; }
+  function healthContextKey(subjectId) { return subjectId === SELF_SUBJECT_ID ? HEALTH_CONTEXT_KEY : `health-context:${subjectId}`; }
+  async function healthSubjects() {
+    const saved = await vault.get(HEALTH_SUBJECTS_KEY);
+    if (saved) return saved;
+    const initial = { version: 1, active_subject_id: SELF_SUBJECT_ID,
+      subjects: [{ subject_id: SELF_SUBJECT_ID, label: '本人', relationship: 'self', created_at: now() }] };
+    if (await vault.putIfUnchanged(HEALTH_SUBJECTS_KEY, undefined, initial)) return initial;
+    return vault.get(HEALTH_SUBJECTS_KEY);
+  }
+  async function activeSubjectId(registry = null) {
+    const current = registry || await healthSubjects();
+    if (observedSubjectId === null) observedSubjectId = current.active_subject_id;
+    if (observedSubjectId !== current.active_subject_id) throw new Error('subject_changed');
+    return observedSubjectId;
+  }
+  async function checkSubjectBinding(options = {}, body = {}) {
+    const registry = await healthSubjects(), subjectId = await activeSubjectId(registry);
+    const header = name => typeof options.headers?.get === 'function' ? options.headers.get(name)
+      : Object.entries(options.headers || {}).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+    const headerSubject = header('X-Health-Subject-Id'), headerVersion = header('X-Health-Subject-Version');
+    if (headerSubject != null && headerSubject !== subjectId
+      || Object.prototype.hasOwnProperty.call(body, 'subject_id') && body.subject_id !== subjectId) throw new Error('subject_mismatch');
+    if (headerVersion != null && (!Number.isInteger(Number(headerVersion)) || Number(headerVersion) !== registry.version)
+      || Object.prototype.hasOwnProperty.call(body, 'expected_subject_version')
+        && (!Number.isInteger(body.expected_subject_version) || body.expected_subject_version !== registry.version)) throw new Error('stale_health_subjects');
+    return registry;
+  }
+  async function ownedMutation(changes) {
+    const registry = await healthSubjects();
+    await activeSubjectId(registry);
+    try {
+      return await vault.mutate({ ...changes, unchanged: [...(changes.unchanged || []), { key: HEALTH_SUBJECTS_KEY, value: registry }] });
+    } catch (error) {
+      if (error.message === 'document_changed') {
+        const current = await healthSubjects();
+        if (current.active_subject_id !== observedSubjectId) throw new Error('subject_changed');
+        if (JSON.stringify(current) !== JSON.stringify(registry)) throw new Error('stale_health_subjects');
+      }
+      throw error;
+    }
+  }
+  async function ownedPut(key, value) { return ownedMutation({ puts: [{ key, value }] }); }
+  function legacyHealthEntry(item, subjectId) {
+    return { ...item, subject_id: subjectId, legacy_entry: true,
+      temporal_status: item.temporal_status ?? null, confirmation_status: item.confirmation_status || (item.source === 'user_confirmed' ? 'confirmed' : 'unconfirmed'),
+      confirmed_by: item.confirmed_by || 'self', occurred_on: item.occurred_on || null,
+      recorded_at: item.recorded_at || item.confirmed_at || item.updated_at || null,
+      confirmed_at: item.confirmed_at || null, updated_at: item.updated_at || null,
+      remember: item.remember === true, source_kind: item.source_kind || 'self_statement' };
+  }
+  async function healthContext(subjectId = null) {
+    const observed = await activeSubjectId();
+    if (subjectId && subjectId !== observed) throw new Error('subject_mismatch');
+    const selectedSubject = subjectId || observed;
+    const key = healthContextKey(selectedSubject), saved = await vault.get(key);
+    const result = saved || { version: 0, updated_at: null, entries: [] };
+    return { ...result, subject_id: selectedSubject, entries: (result.entries || []).map(item =>
+      item.subject_id && item.confirmation_status ? item : legacyHealthEntry(item, selectedSubject)) };
+  }
+  function usableHealthEntry(item, subjectId) {
+    return item.subject_id === subjectId && item.confirmation_status === 'confirmed'
+      && item.source === 'user_confirmed' && item.temporal_status !== 'uncertain';
+  }
+  function healthEntryPayload(item) {
+    const { legacy_entry, ...payload } = item;
+    if (legacy_entry && payload.temporal_status == null) delete payload.temporal_status;
+    return payload;
   }
   function normaliseHealthContext(body, previous) {
-    const categories = new Set(['conditions', 'medications', 'allergies', 'procedures', 'tests', 'similar_episodes']);
     const prior = new Map((previous?.entries || []).map(item => [`${item.category}\n${item.text}`, item]));
     const entries = [];
     for (const [category, values] of Object.entries(body?.fields || {})) {
-      if (!categories.has(category)) continue;
+      if (!HEALTH_CATEGORIES.has(category)) continue;
       const lines = (Array.isArray(values) ? values : String(values || '').split(/\n+/)).map(value => String(value || '').trim()).filter(Boolean);
       if (lines.length > 12) throw new Error('health_context_too_many');
       for (const text of lines) {
         if (text.length > 500) throw new Error('health_context_text_too_long');
         const old = prior.get(`${category}\n${text}`);
-        entries.push({ context_id: old?.context_id || id('context'), category, text, source: 'user_confirmed', confirmed_at: old?.confirmed_at || now(), updated_at: now() });
+        entries.push(legacyHealthEntry({ context_id: old?.context_id || id('context'), category, text, source: 'user_confirmed',
+          confirmed_at: old?.confirmed_at || now(), recorded_at: old?.recorded_at || now(), updated_at: now() }, previous.subject_id));
       }
     }
     if (entries.length > 30) throw new Error('health_context_too_many');
-    return { version: (previous?.version || 0) + 1, updated_at: now(), entries };
+    return { version: (previous?.version || 0) + 1, subject_id: previous.subject_id, updated_at: now(), entries };
+  }
+  function memoryEntry(input, subjectId, previous = null) {
+    const fields = ['category', 'text', 'temporal_status', 'confirmation_status', 'confirmed_by', 'occurred_on', 'remember', 'source_kind'];
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !fields.includes(key))
+      || !HEALTH_CATEGORIES.has(input.category) || typeof input.text !== 'string' || !input.text.trim() || input.text.trim().length > 500
+      || !['current', 'historical', 'uncertain'].includes(input.temporal_status)
+      || !['confirmed', 'unconfirmed'].includes(input.confirmation_status) || !['self', 'family'].includes(input.confirmed_by)
+      || !['self_statement', 'family_report', 'document'].includes(input.source_kind) || typeof input.remember !== 'boolean'
+      || !(input.occurred_on === null || validLocalDate(input.occurred_on)
+        && Number.isFinite(Date.parse(`${input.occurred_on}T00:00:00Z`))
+        && new Date(`${input.occurred_on}T00:00:00Z`).toISOString().slice(0, 10) === input.occurred_on
+        && input.occurred_on <= now().slice(0, 10))) {
+      throw new Error('health_memory_invalid');
+    }
+    if (input.remember && (input.confirmation_status !== 'confirmed' || input.temporal_status === 'uncertain')) throw new Error('health_memory_remember_invalid');
+    const time = now(), confirmed = input.confirmation_status === 'confirmed';
+    return { context_id: previous?.context_id || id('context'), subject_id: subjectId, ...input, text: input.text.trim(),
+      source: confirmed ? 'user_confirmed' : 'user_unconfirmed', recorded_at: previous?.recorded_at || time,
+      confirmed_at: confirmed ? time : null, updated_at: time };
+  }
+  async function saveHealthMemory(previous, saved, registry, legacyCompatibility = false) {
+    if (await activeSubjectId() !== previous.subject_id) throw new Error('subject_mismatch');
+    const key = healthContextKey(previous.subject_id), rawPrevious = await vault.get(key);
+    if (Number(rawPrevious?.version || 0) !== previous.version) return false;
+    const puts = [{ key, value: saved }], unchanged = [{ key, value: rawPrevious }, { key: HEALTH_SUBJECTS_KEY, value: registry }];
+    const changed = new Set([...previous.entries, ...saved.entries].filter(item => {
+      const old = previous.entries.find(value => value.context_id === item.context_id);
+      const next = saved.entries.find(value => value.context_id === item.context_id);
+      return JSON.stringify(old) !== JSON.stringify(next);
+    }).map(item => item.context_id));
+    for (const conversation of await vault.list('conversation:')) {
+      if (!conversation?.conversation_id || subjectOf(conversation) !== previous.subject_id) continue;
+      if (!(conversation.selected_context_ids || []).some(value => changed.has(value))
+        && !(conversation.health_context || []).some(item => changed.has(item.context_id))) continue;
+      const selected = (conversation.selected_context_ids || []).filter(value => !changed.has(value));
+      const clean = { ...conversation, subject_id: previous.subject_id, selected_context_ids: selected,
+        health_context: saved.entries.filter(item => selected.includes(item.context_id) && usableHealthEntry(item, previous.subject_id)),
+        health_context_version: saved.version, relevant_health_context: [], completeness: null, analysis_sources: null,
+        controller: legacyCompatibility ? conversation.controller : { ...conversation.controller, pending_followups: [] },
+        version: legacyCompatibility ? conversation.version : conversation.version + 1, updated_at: now() };
+      // Historical assistant nominations retain their immutable source receipt
+      // on the old form's compatibility route. They are explicitly out of the
+      // current scope; current background caches and clinical state are cleared.
+      clean.report = conversation.report ? buildConversationReport(clean,
+        legacyCompatibility ? conversation.report : { ...conversation.report, question_coverage: null }, saved) : null;
+      puts.push({ key: conversationKey(conversation.conversation_id), value: clean });
+      unchanged.push({ key: conversationKey(conversation.conversation_id), value: conversation });
+    }
+    try { await vault.mutate({ puts, unchanged }); return true; }
+    catch (error) { if (error.message === 'document_changed') return false; throw error; }
+  }
+  async function healthMemoryRequest(path, options) {
+    const method = options.method || 'GET', body = parseBody(options), registry = await healthSubjects();
+    if (path === '/api/health-subjects') {
+      if (method === 'GET') {
+        if (observedSubjectId === null) observedSubjectId = registry.active_subject_id;
+        return ok(200, { ok: true, ...registry, observed_subject_id: observedSubjectId });
+      }
+      if (method !== 'POST') return fail(404, 'not_found');
+      await checkSubjectBinding(options, body);
+      if (!Number.isInteger(body.expected_version) || body.expected_version !== registry.version) return fail(409, 'stale_health_subjects');
+      if (typeof body.label !== 'string' || !body.label.trim() || body.label.trim().length > 80 || !['self', 'family'].includes(body.relationship)
+        || registry.subjects.length >= 12) return fail(400, 'health_subject_invalid');
+      const updated = { ...registry, version: registry.version + 1, subjects: [...registry.subjects,
+        { subject_id: id('subject'), label: body.label.trim(), relationship: body.relationship, created_at: now() }] };
+      return await vault.putIfUnchanged(HEALTH_SUBJECTS_KEY, registry, updated)
+        ? ok(201, { ok: true, ...updated, observed_subject_id: observedSubjectId }) : fail(409, 'stale_health_subjects');
+    }
+    if (path === '/api/health-subjects/active' && method === 'POST') {
+      if (!Number.isInteger(body.expected_version) || body.expected_version !== registry.version) return fail(409, 'stale_health_subjects');
+      if (!registry.subjects.some(item => item.subject_id === body.subject_id)) return fail(404, 'health_subject_not_found');
+      if (pendingLocalOperations > 1) return fail(409, 'local_operations_busy');
+      const updated = { ...registry, active_subject_id: body.subject_id, version: registry.version + 1 };
+      if (!await vault.putIfUnchanged(HEALTH_SUBJECTS_KEY, registry, updated)) return fail(409, 'stale_health_subjects');
+      observedSubjectId = updated.active_subject_id;
+      return ok(200, { ok: true, ...updated, observed_subject_id: observedSubjectId });
+    }
+    if (body.subject_id && body.subject_id !== registry.active_subject_id) return fail(403, 'subject_mismatch');
+    const current = await healthContext(registry.active_subject_id);
+    if (method === 'GET' && path === '/api/health-memory') return ok(200, { ok: true, subject_id: current.subject_id, health_context: current });
+    if (!Number.isInteger(body.expected_version) || body.expected_version !== current.version) return fail(409, 'stale_health_memory');
+    const contextId = path.startsWith('/api/health-memory/') ? decodeURIComponent(path.slice('/api/health-memory/'.length)) : null;
+    const previous = current.entries.find(item => item.context_id === contextId);
+    if (contextId && !previous) return fail(404, 'health_memory_not_found');
+    let entries;
+    if (method === 'DELETE' && contextId) entries = current.entries.filter(item => item.context_id !== contextId);
+    else if (method === 'POST' && path === '/api/health-memory' || method === 'PATCH' && contextId) {
+      const entry = memoryEntry(body.entry, current.subject_id, previous);
+      entries = previous ? current.entries.map(item => item.context_id === contextId ? entry : item) : [...current.entries, entry];
+    } else return fail(404, 'not_found');
+    if (entries.length > 30 || [...HEALTH_CATEGORIES].some(category => entries.filter(item => item.category === category).length > 12)) return fail(400, 'health_context_too_many');
+    if (entries.filter(item => item.remember).length > 5) return fail(400, 'health_memory_remember_limit');
+    const saved = { ...current, version: current.version + 1, updated_at: now(), entries };
+    return await saveHealthMemory(current, saved, registry) ? ok(method === 'POST' ? 201 : 200, { ok: true, subject_id: current.subject_id, health_context: saved }) : fail(409, 'stale_health_memory');
   }
   function elderTurns(conversation) { return (conversation.turns || []).filter(turn => turn.role === 'elder' && !turn.superseded && !mockSource(turn)); }
   function analysisSources(conversation, currentContext = null) {
     const selected = [...(conversation.selected_context_ids || [])].sort();
-    const contexts = currentContext ? currentContext.entries.filter(item => selected.includes(item.context_id)) : conversation.health_context || [];
+    const contexts = currentContext ? currentContext.entries.filter(item => selected.includes(item.context_id) && usableHealthEntry(item, subjectOf(conversation))) : conversation.health_context || [];
     return {
       turns: elderTurns(conversation).map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
       selected_context_ids: selected,
       context_version: selected.length ? currentContext?.version ?? conversation.health_context_version ?? null : 0,
-      context: contexts.map(item => ({ context_id: item.context_id, category: item.category, text: item.text,
-        source: item.source, confirmed_at: item.confirmed_at, updated_at: item.updated_at })),
+      context: contexts.map(healthEntryPayload),
     };
   }
   function analysisSourcesCurrent(conversation, currentContext = null) {
@@ -529,8 +694,9 @@
     });
     for (const item of boundAnalysis ? conversation.relevant_health_context || [] : []) {
       bySection.get('background_actions').lines.push({
-        kind: 'context', text: item.text, tags: ['本机已确认背景'],
-        source_context_ids: [item.context_id], source_label: '本人此前确认',
+        kind: 'context', text: item.text, tags: ['用户已确认陈述', item.temporal_status === 'current' ? '当前' : item.temporal_status === 'historical' ? '历史' : '时间状态未核对'],
+        source_context_ids: [item.context_id], source_context: healthEntryPayload(item),
+        source_label: `${item.confirmed_by === 'family' ? '家属' : '本人'}确认 · ${item.source_kind === 'document' ? '资料陈述' : item.source_kind === 'family_report' ? '家属转述' : '本人陈述'} · 发生日期 ${item.occurred_on || '未提供'} · 记录 ${item.recorded_at || '日期未知'} · 非应用诊断`,
       });
       collectedCategories.add('relevant_history');
     }
@@ -697,7 +863,7 @@
   }
   async function saveConversation(conversation) {
     const saved = { ...conversation, version: (conversation.version || 0) + 1, updated_at: now() };
-    await vault.put(conversationKey(saved.conversation_id), saved);
+    await ownedPut(conversationKey(saved.conversation_id), saved);
     return saved;
   }
   async function cleanupTemporaryAudio(mediaId) {
@@ -705,7 +871,7 @@
     return withMediaLock(mediaId, async () => {
       const media = await vault.get(mediaKey(mediaId));
       if (!media || media.trial_control || media.kind !== 'audio' || media.temporary !== true || media.recognition_status !== 'succeeded' || media.recognition?.is_mock || mockSource(media.recognition)) return false;
-      await vault.mutate({ deletes: [mediaBinaryKey(mediaId), mediaKey(mediaId)] });
+      await ownedMutation({ deletes: [mediaBinaryKey(mediaId), mediaKey(mediaId)] });
       return true;
     });
   }
@@ -824,6 +990,8 @@
   }
 
   async function cloudRequest(path, options = {}) {
+    const subjectAllowed = async () => !options.healthSubjectId || options.healthSubjectId === await activeSubjectId();
+    if (!await subjectAllowed()) return fail(403, 'subject_mismatch');
     const voice = path === '/api/ai/conversation-turn' || (path === '/api/ai/media/recognize' && options.body?.get?.('kind') === 'audio');
     const blockedVoice = async () => {
       if (!voice) return null;
@@ -838,17 +1006,19 @@
       return null;
     };
     const blocked = await blockedVoice(); if (blocked) return blocked;
-    const { trialVoiceContinue, ...transportOptions } = options;
+    const { trialVoiceContinue, healthSubjectId, ...transportOptions } = options;
     // Read the current HttpOnly session before each operation; never retain a token
     // in a backup, browser storage or a second UI password flow.
     const csrf = await onlineSession();
     if (!csrf) return fail(401, 'session_unavailable', { retryable: true });
+    if (!await subjectAllowed()) return fail(403, 'subject_mismatch');
     const lateBlocked = await blockedVoice(); if (lateBlocked) return lateBlocked;
     return cloudFetch(path, { ...transportOptions, headers: { ...options.headers, 'X-CSRF-Token': csrf } });
   }
 
   async function readEvent(recordId) {
     const event = await vault.get(eventKey(recordId));
+    if (event && subjectOf(event) !== await activeSubjectId()) return null;
     if (!event || event.source_kind === 'document') return event;
     const seen = new Set([recordId]); let previous = event.supersedes_id;
     while (previous && !seen.has(previous)) {
@@ -868,7 +1038,7 @@
   }
   async function saveHistory(event, action, note = null) {
     const history = historyDocument(event, action, note);
-    await vault.put(history.key, history.value);
+    await ownedPut(history.key, history.value);
   }
   async function eventRevisionGraph() {
     const events = await vault.list('event:');
@@ -942,25 +1112,29 @@
     return collectDeletionPlan(recordIds);
   }
   async function createEvent(body, idempotencyKey) {
+    const subjectId = await activeSubjectId();
+    if (body.subject_id && body.subject_id !== subjectId) return fail(403, 'subject_mismatch');
     if (mockSource(body)) return fail(409, 'media_mock_unavailable');
     if (!body.raw_text?.trim()) return fail(400, 'raw_text_required');
     if (body.raw_text.length > 10000) return fail(400, 'raw_text_too_long');
     if (!SOURCE_KINDS.has(body.source_kind)) return fail(400, 'invalid_source_kind');
     if (idempotencyKey) {
       const replay = await vault.get(`operation:event:${idempotencyKey}`);
-      if (replay) return ok(200, { ok: true, created: false, event: await readEvent(replay.record_id) });
+      if (replay) { const event = await readEvent(replay.record_id); return event ? ok(200, { ok: true, created: false, event }) : fail(403, 'subject_mismatch'); }
     }
-    const relatedRecordIds = Array.isArray(body.related_record_ids) ? [...new Set(body.related_record_ids.filter(value => typeof value === 'string' && value.startsWith('rec_')))].slice(-10) : [];
-    const event = { record_id: id('rec'), raw_text: body.raw_text, source_kind: body.source_kind, actor_name: body.actor_name || '本地用户', occurred_time: body.occurred_time || null, recorded_at: now(), updated_at: now(), state: 'inbox', version: 1, local_safety: safety.scanDanger(body.raw_text), draft: null, related_record_ids: relatedRecordIds,
+    const requestedRelatedIds = Array.isArray(body.related_record_ids) ? [...new Set(body.related_record_ids.filter(value => typeof value === 'string' && value.startsWith('rec_')))].slice(-10) : [];
+    const relatedRecordIds = [];
+    for (const value of requestedRelatedIds) if (await readEvent(value)) relatedRecordIds.push(value);
+    const event = { record_id: id('rec'), subject_id: subjectId, raw_text: body.raw_text, source_kind: body.source_kind, actor_name: body.actor_name || '本地用户', occurred_time: body.occurred_time || null, recorded_at: now(), updated_at: now(), state: 'inbox', version: 1, local_safety: safety.scanDanger(body.raw_text), draft: null, related_record_ids: relatedRecordIds,
       ...(body.source_conversation_id ? { source_conversation_id: body.source_conversation_id } : {}) };
-    await vault.put(eventKey(event.record_id), event); await saveHistory(event, 'created');
-    if (idempotencyKey) await vault.put(`operation:event:${idempotencyKey}`, { record_id: event.record_id });
+    const puts = [{ key: eventKey(event.record_id), value: event }, historyDocument(event, 'created')];
+    if (idempotencyKey) puts.push({ key: `operation:event:${idempotencyKey}`, value: { record_id: event.record_id } });
+    await ownedMutation({ puts });
     return ok(201, { ok: true, created: true, event });
   }
   async function updateEvent(event, action, changes, note = null) {
-    await saveHistory(event, action, note);
     const updated = { ...event, ...changes, version: event.version + 1, updated_at: now() };
-    await vault.put(eventKey(event.record_id), updated); return updated;
+    await ownedMutation({ puts: [historyDocument(event, action, note), { key: eventKey(event.record_id), value: updated }] }); return updated;
   }
 
   async function eventRequest(path, options, locked = false) {
@@ -984,7 +1158,10 @@
     const body = parseBody(options);
     if (path === '/api/events' && method === 'GET') return ok(200, { ok: true, events: await listEvents() });
     if (path === '/api/events' && method === 'POST') return createEvent(body, options?.headers?.['Idempotency-Key']);
-    const recordId = decodeURIComponent(parts[2] || ''); const event = await readEvent(recordId);
+    const recordId = decodeURIComponent(parts[2] || '');
+    const rawEvent = await vault.get(eventKey(recordId));
+    if (rawEvent && subjectOf(rawEvent) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
+    const event = await readEvent(recordId);
     if (!event) return fail(404, 'event_not_found');
     if (parts.length === 3 && method === 'DELETE') {
       if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
@@ -996,7 +1173,7 @@
         if (latest.error === 'conversation_source_changed') return linkedSourceConflict();
         if (latest.error) return fail(latest.error === 'event_not_found' ? 404 : 409, latest.error);
         if (latest.mediaIds.some(mediaId => !plan.mediaIds.includes(mediaId))) return fail(409, 'stale_media_links');
-        await vault.mutate({ deletes: latest.deletes });
+        await ownedMutation({ deletes: latest.deletes });
         return ok(200, { ok: true, deleted: { record_id: recordId, record_count: latest.recordIds.length, local_media_count: latest.mediaIds.length, encrypted_backups_unchanged: true } });
       });
     }
@@ -1015,7 +1192,7 @@
       if (mockSource(event)) return fail(409, 'media_mock_unavailable', { event: { ...event, is_mock: true } });
       const related = (event.related_record_ids || []).map(readEvent);
       const history = (await Promise.all(related)).filter(item => item && !safety.documentNeedsReview(item) && item.state !== 'superseded' && !mockSource(item)).map(item => ({ record_id: item.record_id, raw_text: item.raw_text, source_kind: item.source_kind, source_review: item.source_review, recorded_at: item.recorded_at, occurred_time: item.occurred_time }));
-      const result = await cloudRequest('/api/ai/organize', { method: 'POST', body: JSON.stringify({ record_id: event.record_id, raw_text: event.raw_text, source_kind: event.source_kind, source_review: event.source_review, recorded_at: event.recorded_at, occurred_time: event.occurred_time, history }) });
+      const result = await cloudRequest('/api/ai/organize', { healthSubjectId: subjectOf(event), method: 'POST', body: JSON.stringify({ record_id: event.record_id, raw_text: event.raw_text, source_kind: event.source_kind, source_review: event.source_review, recorded_at: event.recorded_at, occurred_time: event.occurred_time, history }) });
       return withEventLock(recordId, async () => {
         const latest = await readEvent(recordId);
         if (!latest || latest.version !== event.version) return fail(409, 'stale_version', { event: latest });
@@ -1073,7 +1250,7 @@
         updated.report = buildConversationReport(updated, conversation.report);
         puts.push({ key: conversationKey(conversation.conversation_id), value: updated });
       }
-      await vault.mutate({ puts });
+      await ownedMutation({ puts });
       return ok(201, { ok: true, event: replacement });
     }
     return fail(404, 'not_found');
@@ -1081,9 +1258,12 @@
 
   async function createConversation(localDate) {
     if (!validLocalDate(localDate)) return fail(400, 'local_date_invalid');
+    const registry = await healthSubjects(), subjectId = await activeSubjectId(registry), context = await healthContext(subjectId);
+    const remembered = context.entries.filter(item => item.remember && usableHealthEntry(item, registry.active_subject_id)).slice(0, 5);
     const createdAt = now();
     const conversation = {
       conversation_id: id('conversation'),
+      subject_id: registry.active_subject_id,
       local_date: localDate,
       last_local_date: localDate,
       created_at: createdAt,
@@ -1098,20 +1278,22 @@
       controller: openingConversationController(),
       active_episode_start_turn_id: null,
       completeness: null,
-      report: null, health_context: [], selected_context_ids: [],
+      report: null, health_context: remembered, selected_context_ids: remembered.map(item => item.context_id), health_context_version: context.version,
     };
-    await vault.put(conversationKey(conversation.conversation_id), conversation);
+    await ownedMutation({ puts: [{ key: conversationKey(conversation.conversation_id), value: conversation }], unchanged: [{ key: HEALTH_SUBJECTS_KEY, value: registry }] });
     return ok(201, { ok: true, conversation });
   }
 
   async function conversationModelPayload(conversation) {
     const allElderTurns = elderTurns(conversation).slice(-40);
-    const currentContext = await healthContext();
+    if (subjectOf(conversation) !== await activeSubjectId()) throw new Error('subject_mismatch');
+    const currentContext = await healthContext(subjectOf(conversation));
     const selected = new Set(conversation.selected_context_ids || []);
-    const context = currentContext.entries.filter(item => selected.has(item.context_id)).slice(0, 5);
+    const context = currentContext.entries.filter(item => selected.has(item.context_id) && usableHealthEntry(item, subjectOf(conversation))).slice(0, 5);
     conversation.health_context = context;
     conversation.health_context_version = currentContext.version;
     return {
+      subject_id: subjectOf(conversation),
       turns: allElderTurns.map(turn => {
         const index = conversation.turns.findIndex(item => item.turn_id === turn.turn_id);
         const previous = conversation.turns[index - 1];
@@ -1120,7 +1302,7 @@
         return { turn_id: turn.turn_id, text: turn.text, version: turn.version, ...(question && !mockSource(question) ? { responding_to: question } : {}) };
       }),
       controller: conversation.controller,
-      health_context: context.map(({ context_id, category, text, source, confirmed_at, updated_at }) => ({ context_id, category, text, source, confirmed_at, updated_at })),
+      health_context: context.map(healthEntryPayload),
     };
   }
 
@@ -1128,7 +1310,7 @@
     const sendingVersion = conversation.version;
     const sendingSources = JSON.stringify(analysisSources(conversation));
     let storedConversation = await vault.get(conversationKey(conversation.conversation_id));
-    let currentContext = await healthContext();
+    let currentContext = await healthContext(subjectOf(conversation));
     const sourceUnchanged = latest => latest && latest.version === sendingVersion
       && JSON.stringify(analysisSources(latest, currentContext)) === sendingSources;
     if (!storedConversation) throw new Error('conversation_not_found');
@@ -1148,7 +1330,7 @@
       // trusted manifest, never approval fields authored by the model itself.
       const config = await cloudFetch('/api/app/config', {}, 8000);
       storedConversation = await vault.get(conversationKey(conversation.conversation_id));
-      currentContext = await healthContext();
+      currentContext = await healthContext(subjectOf(conversation));
       if (!storedConversation) throw new Error('conversation_not_found');
       if (!sourceUnchanged(storedConversation)) return { conversation: storedConversation, applied: false };
       conversation = { ...excludeMockFacts(storedConversation), health_context: sendingContext, health_context_version: sendingContextVersion };
@@ -1183,7 +1365,14 @@
     const current = invalidateChangedAnalysis(next, currentContext);
     current.report = buildConversationReport(current, conversation.report);
     const saved = { ...current, version: conversation.version + 1, updated_at: now() };
-    const contextGuard = conversation.selected_context_ids?.length ? [{ key: HEALTH_CONTEXT_KEY, value: currentContext }] : [];
+    const registry = await healthSubjects();
+    if (registry.active_subject_id !== subjectOf(conversation)) return { conversation: storedConversation, applied: false };
+    const contextGuard = [{ key: HEALTH_SUBJECTS_KEY, value: registry }];
+    if (conversation.selected_context_ids?.length) {
+      const rawContext = await vault.get(healthContextKey(subjectOf(conversation)));
+      if (Number(rawContext?.version || 0) !== currentContext.version) return { conversation: storedConversation, applied: false };
+      contextGuard.push({ key: healthContextKey(subjectOf(conversation)), value: rawContext });
+    }
     if (await vault.putIfUnchanged(conversationKey(conversation.conversation_id), storedConversation, saved, contextGuard)) {
       return { conversation: saved, applied: true };
     }
@@ -1200,7 +1389,7 @@
         provider: 'LocalDangerRule', stop_reason: 'urgent_rule',
         controller: { ...conversation.controller, last_question_category: null } });
     }
-    return cloudRequest('/api/ai/conversation-turn', { method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)), ...(trialContinue ? { trialVoiceContinue: { ...conversation.trial_control, conversation_version: conversation.version } } : {}) });
+    return cloudRequest('/api/ai/conversation-turn', { healthSubjectId: subjectOf(conversation), method: 'POST', body: JSON.stringify(await conversationModelPayload(conversation)), ...(trialContinue ? { trialVoiceContinue: { ...conversation.trial_control, conversation_version: conversation.version } } : {}) });
   }
 
   async function conversationRequest(path, options, locked = false, sourceLocked = false, backgroundInactive = false) {
@@ -1211,6 +1400,7 @@
       return withConversationLock(parts[2], () => conversationRequest(path, options, true));
     }
     const body = parseBody(options);
+    if (body.subject_id && body.subject_id !== await activeSubjectId()) return fail(403, 'subject_mismatch');
     if (!sourceLocked && method === 'POST' && parts[3] === 'turns' && parts.length === 4 && body.record_id) {
       // Existing-source linking participates in archive correction/deletion
       // locks so a new conversation cannot acquire a source midway through it.
@@ -1245,6 +1435,7 @@
     }
     const conversationId = decodeURIComponent(parts[2] || '');
     const storedConversation = await vault.get(conversationKey(conversationId));
+    if (storedConversation && subjectOf(storedConversation) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
     let conversation = excludeMockFacts(storedConversation);
     if (!conversation) return fail(404, 'conversation_not_found');
     if (parts.length === 3 && method === 'DELETE') {
@@ -1270,7 +1461,7 @@
             if (latestComponent.recordIds.some(id => !lockedRecords.has(id))) return { retryRecords: latestComponent.recordIds };
             const latestPlan = await collectDeletionPlan(latestComponent.recordIds, conversationId);
             if (latestPlan.mediaIds.some(id => !lockedMedia.has(id))) return { retryMedia: latestPlan.mediaIds };
-            await vault.mutate({ deletes: latestPlan.deletes });
+            await ownedMutation({ deletes: latestPlan.deletes });
             return { ok: true, plan: latestPlan };
           });
         });
@@ -1295,7 +1486,7 @@
       const ids = body.context_ids;
       const current = await healthContext();
       if (!Array.isArray(ids) || ids.length > 5 || new Set(ids).size !== ids.length
-        || ids.some(value => typeof value !== 'string' || !current.entries.some(item => item.context_id === value))) {
+        || ids.some(value => typeof value !== 'string' || !current.entries.some(item => item.context_id === value && usableHealthEntry(item, subjectOf(conversation))))) {
         return fail(400, 'context_selection_invalid');
       }
       return (async () => {
@@ -1331,7 +1522,7 @@
       if (!appended.applied) return ok(202, { ok: true, conversation: latest, result_discarded: true, trial_control: latest.trial_control });
       latest = await saveTrialConversation(latest, { ...control, state: latest.last_ai_metadata?.ai_failed ? 'stopped' : 'completed' }, [], [{ key: conversationKey(conversationId), value: latest }, { key: TRIAL_VOICE_KEY, value: continuingControl }]);
       const media = await vault.get(mediaKey(control.media_id));
-      if (media) await vault.put(mediaKey(control.media_id), { ...media, trial_control: latest.trial_control });
+      if (media) await ownedPut(mediaKey(control.media_id), { ...media, trial_control: latest.trial_control });
       return ok(latest.trial_control.state === 'completed' ? 200 : 202, { ok: true, conversation: latest, ai_failed: latest.trial_control.state === 'stopped', trial_control: latest.trial_control });
     }
     if (parts[3] === 'resume-assistant' && method === 'POST') {
@@ -1356,9 +1547,11 @@
       const replay = await vault.get(`operation:conversation-turn:${operationKey}`);
       if (replay) {
         const saved = await vault.get(conversationKey(replay.conversation_id));
+        if (saved && subjectOf(saved) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
         return ok(200, { ok: true, created: false, conversation: saved, turn_id: replay.turn_id });
       }
       const sourceMedia = body.media_id ? await vault.get(mediaKey(body.media_id)) : null;
+      if (sourceMedia && subjectOf(sourceMedia) !== subjectOf(conversation)) return fail(403, 'subject_mismatch');
       let controlled = sourceMedia?.trial_control;
       const trial = await trialVoiceState();
       const controlledText = !controlled && conversation.trial_control && !body.media_id && !body.record_id
@@ -1381,7 +1574,7 @@
       if (body.record_id && !event) return fail(409, 'conversation_source_invalid');
       if (event && (!['elder', 'audio_transcript'].includes(event.source_kind) || event.raw_text !== text || event.state === 'superseded')) return fail(409, 'conversation_source_invalid');
       if (!event) {
-        const created = await createEvent({ raw_text: text, source_kind: body.source_kind === 'audio_transcript' ? 'audio_transcript' : 'elder', actor_name: '老人', related_record_ids: elderTurns(conversation).map(turn => turn.record_id).filter(Boolean).slice(-10) }, `conversation-event:${operationKey}`);
+        const created = await createEvent({ subject_id: subjectOf(conversation), raw_text: text, source_kind: body.source_kind === 'audio_transcript' ? 'audio_transcript' : 'elder', actor_name: '老人', related_record_ids: elderTurns(conversation).map(turn => turn.record_id).filter(Boolean).slice(-10) }, `conversation-event:${operationKey}`);
         if (!created.r.ok) return created;
         event = created.j.event;
       }
@@ -1415,7 +1608,7 @@
           throw error;
         }
       } else conversation = await saveConversation(withUser);
-      if (!controlled) await vault.put(operation.key, operation.value);
+      if (!controlled) await ownedPut(operation.key, operation.value);
       if (controlled) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id, trial_control: conversation.trial_control });
       // A recognition already in flight can complete after an explicit pause.
       // Save its source and report, then wait for the user to return for a reply.
@@ -1477,7 +1670,7 @@
         if (trialControl) puts.push({ key: TRIAL_VOICE_KEY, value: saved.trial_control });
         // Both representations and the history commit together, including when
         // IndexedDB runs out of space or the page closes during a correction.
-        await vault.mutate({ puts, ...(trialControl ? { unchanged: [{ key: conversationKey(conversationId), value: storedConversation }, { key: TRIAL_VOICE_KEY, value: trialGlobal }] } : {}) });
+        await ownedMutation({ puts, ...(trialControl ? { unchanged: [{ key: conversationKey(conversationId), value: storedConversation }, { key: TRIAL_VOICE_KEY, value: trialGlobal }] } : {}) });
         return ok(200, { conversation: saved });
       };
       const persisted = current.record_id ? await withEventLock(current.record_id, persistCorrection) : await persistCorrection();
@@ -1539,7 +1732,7 @@
     }
     return { ...media };
   }
-  async function mediaList() { return (await vault.list('media:')).filter(item => item?.media_id).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)); }
+  async function mediaList() { const subjectId = await activeSubjectId(); return (await vault.list('media:')).filter(item => item?.media_id && subjectOf(item) === subjectId).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)); }
   function mediaCapabilities() { return { enabled: true, disabled_reason: null, max_total_bytes: MAX_MEDIA_BYTES, max_part_bytes: 2 * 1024 * 1024, max_parts: 12, audio_content_types: MEDIA_TYPES.audio, image_content_types: MEDIA_TYPES.image, multipart_upload: true, resumable_parts: true }; }
   async function mediaRequest(path, options) {
     const method = options?.method || 'GET'; const parts = path.split('/').filter(Boolean);
@@ -1552,29 +1745,35 @@
       const requestedConversationId = String(form.get('conversation_id') || '');
       const conversationId = /^conversation_[A-Za-z0-9_-]{8,100}$/.test(requestedConversationId) ? requestedConversationId : null;
       const createUpload = async () => {
-        if (conversationId && !(await vault.get(conversationKey(conversationId)))) return fail(404, 'conversation_not_found');
-        if(operationKey){const replay=await vault.get(`operation:media-upload:${operationKey}`);if(replay){const existing=await vault.get(`upload:${replay.upload_id}`);if(existing)return ok(200,{ok:true,created:false,upload:existing});}}
+        const subjectId = await activeSubjectId(), owner = conversationId ? await vault.get(conversationKey(conversationId)) : null;
+        if (conversationId && !owner) return fail(404, 'conversation_not_found');
+        if (owner && subjectOf(owner) !== subjectId) return fail(403, 'subject_mismatch');
+        if(operationKey){const replay=await vault.get(`operation:media-upload:${operationKey}`);if(replay){const existing=await vault.get(`upload:${replay.upload_id}`);if(existing)return subjectOf(existing) === subjectId ? ok(200,{ok:true,created:false,upload:existing}) : fail(403,'subject_mismatch');}}
         const uploadId = id('upload'); const mediaId = id('media');
-        const upload = { upload_id: uploadId, media_id: mediaId, kind, content_type: type, total_parts: totalParts, expected_size: Number(form.get('expected_size')), expected_sha256: form.get('expected_sha256'), original_filename: form.get('original_filename') || 'media', temporary: form.get('temporary') === 'true', conversation_id: conversationId, created_at: now() };
-        await vault.put(`upload:${uploadId}`, upload);if(operationKey)await vault.put(`operation:media-upload:${operationKey}`,{upload_id:uploadId,media_id:mediaId});return ok(201, { ok: true, created: true, upload });
+        const upload = { upload_id: uploadId, subject_id: subjectId, media_id: mediaId, kind, content_type: type, total_parts: totalParts, expected_size: Number(form.get('expected_size')), expected_sha256: form.get('expected_sha256'), original_filename: form.get('original_filename') || 'media', temporary: form.get('temporary') === 'true', conversation_id: conversationId, created_at: now() };
+        const puts = [{ key: `upload:${uploadId}`, value: upload }];
+        if(operationKey) puts.push({ key: `operation:media-upload:${operationKey}`, value: { upload_id:uploadId,media_id:mediaId } });
+        await ownedMutation({ puts }); return ok(201, { ok: true, created: true, upload });
       };
       return conversationId ? withConversationLock(conversationId, createUpload) : createUpload();
     }
     if (parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'uploads' && parts[4] === 'parts' && method === 'POST') {
       const upload = await vault.get(`upload:${parts[3]}`); if (!upload) return fail(404, 'upload_not_found');
+      if (subjectOf(upload) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
       const index = Number(parts[5]); const file = parseBody(options).get('file');
       if (!Number.isInteger(index) || index < 0 || index >= upload.total_parts || !file) return fail(400, 'invalid_part');
       const savePart = async () => {
         const current = await vault.get(`upload:${parts[3]}`); if (!current) return fail(404, 'upload_not_found');
         if (current.conversation_id && !(await vault.get(conversationKey(current.conversation_id)))) return fail(404, 'conversation_not_found');
         if (!Number.isInteger(index) || index < 0 || index >= current.total_parts || !file) return fail(400, 'invalid_part');
-        await vault.putBinary(`upload-part:${current.upload_id}:${String(index).padStart(3, '0')}`, file, { index, size: file.size });
+        await ownedMutation({ puts: [{ key: `upload-part:${current.upload_id}:${String(index).padStart(3, '0')}`, format: 'binary', value: file, metadata: { index, size: file.size } }] });
         return ok(201, { ok: true, created: true, part: { index, size: file.size } });
       };
       return upload.conversation_id ? withConversationLock(upload.conversation_id, savePart) : savePart();
     }
     if (parts[0] === 'api' && parts[1] === 'media' && parts[2] === 'uploads' && parts[4] === 'complete' && method === 'POST') {
       const upload = await vault.get(`upload:${parts[3]}`); if (!upload) return fail(404, 'upload_not_found');
+      if (subjectOf(upload) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
       const completeUpload = async () => {
         const current = await vault.get(`upload:${parts[3]}`); if (!current) return fail(404, 'upload_not_found');
         if (current.conversation_id && !(await vault.get(conversationKey(current.conversation_id)))) return fail(404, 'conversation_not_found');
@@ -1586,8 +1785,8 @@
         const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(value => value.toString(16).padStart(2, '0')).join('');
         if (current.expected_sha256 && digest !== current.expected_sha256) return fail(422, 'integrity_mismatch');
-        const media = { media_id: current.media_id, kind: current.kind, content_type: current.content_type, original_filename: current.original_filename, size, sha256: digest, temporary: current.temporary === true, conversation_id: current.conversation_id || null, created_at: now(), updated_at: now(), save_status: 'saved', recognition_status: 'not_started', link_status: 'not_linked', version: 1, recognition: null, event_link: null, local_safety: null };
-        await vault.mutate({ puts: [{ key: mediaBinaryKey(media.media_id), format: 'binary', value: bytes.buffer,
+        const media = { media_id: current.media_id, subject_id: subjectOf(current), kind: current.kind, content_type: current.content_type, original_filename: current.original_filename, size, sha256: digest, temporary: current.temporary === true, conversation_id: current.conversation_id || null, created_at: now(), updated_at: now(), save_status: 'saved', recognition_status: 'not_started', link_status: 'not_linked', version: 1, recognition: null, event_link: null, local_safety: null };
+        await ownedMutation({ puts: [{ key: mediaBinaryKey(media.media_id), format: 'binary', value: bytes.buffer,
           metadata: { content_type: media.content_type, filename: media.original_filename } }, { key: mediaKey(media.media_id), value: media }],
         deletes: [`upload:${current.upload_id}`, ...Array.from({ length: current.total_parts }, (_, index) => `upload-part:${current.upload_id}:${String(index).padStart(3, '0')}`)] });
         return ok(201, { ok: true, created: true, media: mediaPublic(media) });
@@ -1595,7 +1794,8 @@
       return upload.conversation_id ? withConversationLock(upload.conversation_id, completeUpload) : completeUpload();
     }
     const mediaId = parts[2]; let media = await vault.get(mediaKey(mediaId));
-    if(!media&&parts.length===3&&method==='GET'){const upload=(await vault.list('upload:')).find(item=>item.media_id===mediaId);if(upload)return ok(200,{ok:true,media:{media_id:mediaId,kind:upload.kind,content_type:upload.content_type,original_filename:upload.original_filename,save_status:'uploading',recognition_status:'not_started',link_status:'not_linked',version:0}})}
+    if (media && subjectOf(media) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
+    if(!media&&parts.length===3&&method==='GET'){const upload=(await vault.list('upload:')).find(item=>item.media_id===mediaId);if(upload)return subjectOf(upload) === await activeSubjectId() ? ok(200,{ok:true,media:{media_id:mediaId,subject_id:subjectOf(upload),kind:upload.kind,content_type:upload.content_type,original_filename:upload.original_filename,save_status:'uploading',recognition_status:'not_started',link_status:'not_linked',version:0}}) : fail(403,'subject_mismatch');}
     if (!media) return fail(404, 'media_not_found');
     if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, media: mediaPublic(media) });
     if (parts[3] === 'recognize' && method === 'POST') {
@@ -1613,7 +1813,7 @@
         }
         const processing = { ...current, conversation_version_at_start: sourceConversation?.version ?? null,
           recognition_status: 'processing', version: current.version + 1, updated_at: now(), recognition: null };
-        await vault.put(mediaKey(mediaId), processing);
+        await ownedPut(mediaKey(mediaId), processing);
         processRecognition(processing);
         return ok(202, { ok: true, action: 'started', media: mediaPublic(processing) });
       }));
@@ -1629,9 +1829,10 @@
         if (current.recognition?.is_mock || mockSource(current.recognition)) return fail(409, 'media_mock_unavailable');
         if (current.recognition_status !== 'succeeded' || !current.recognition?.text) return fail(409, 'recognition_not_succeeded');
         if (current.event_link?.record_id) return ok(200, { ok: true, event_created: false, media: mediaPublic(current) });
-        const created = await createEvent({ raw_text: current.recognition.text, source_kind: current.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户' }, `media-link:${mediaId}`);
+        const created = await createEvent({ subject_id: subjectOf(current), raw_text: current.recognition.text, source_kind: current.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户' }, `media-link:${mediaId}`);
+        if (!created.r.ok) return created;
         const linked = { ...current, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', version: current.version + 1, updated_at: now(), local_safety: created.j.event.local_safety };
-        await vault.put(mediaKey(mediaId), linked); return ok(201, { ok: true, event_created: true, media: mediaPublic(linked), event: created.j.event });
+        await ownedPut(mediaKey(mediaId), linked); return ok(201, { ok: true, event_created: true, media: mediaPublic(linked), event: created.j.event });
       });
     }
     return fail(404, 'not_found');
@@ -1644,10 +1845,10 @@
       const original = await vault.get(mediaBinaryKey(media.media_id));
       if (!original?.bytes) throw Object.assign(new Error('original_unavailable'), { code: 'original_unavailable' });
       const form = new FormData(); form.append('kind', media.kind); form.append('content_type', media.content_type); form.append('attempt_id', id('attempt')); form.append('file', new Blob([original.bytes], { type: media.content_type }), media.original_filename);
-      const result = await cloudRequest('/api/ai/media/recognize', { method: 'POST', body: form });
+      const result = await cloudRequest('/api/ai/media/recognize', { healthSubjectId: subjectOf(media), method: 'POST', body: form });
       const trial = media.kind === 'audio' ? trialMarker(result.j) : null;
       recognitionTrial = trial;
-      if (trial) await vault.put(TRIAL_VOICE_KEY, { ...trial, media_id: media.media_id, conversation_id: media.conversation_id });
+      if (trial) await ownedPut(TRIAL_VOICE_KEY, { ...trial, media_id: media.media_id, conversation_id: media.conversation_id });
       if (!result.r.ok) throw Object.assign(new Error(result.j.error || 'recognition_failed'), { code: result.j.error, retryable: result.j.retryable === true, trial_control: trial });
       if (result.j.recognition?.is_mock || mockSource(result.j.recognition)) throw Object.assign(new Error('media_mock_unavailable'), { code: 'media_mock_unavailable', retryable: true });
       if (!result.j.recognition?.text?.trim()) throw Object.assign(new Error('recognition_empty'), { code: 'recognition_empty', retryable: true });
@@ -1659,11 +1860,11 @@
           conversation = await vault.get(conversationKey(media.conversation_id));
           if (!conversation) return;
         }
-        const created = await createEvent({ raw_text: result.j.recognition.text, source_kind: media.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户',
+        const created = await createEvent({ subject_id: subjectOf(media), raw_text: result.j.recognition.text, source_kind: media.kind === 'audio' ? 'audio_transcript' : 'document', actor_name: '本地用户',
           ...(media.temporary === true && media.conversation_id ? { source_conversation_id: media.conversation_id } : {}) }, `media-real-link:${media.media_id}`);
         if (!created.r.ok) throw Object.assign(new Error(created.j.error), { code: created.j.error });
         let updated = { ...current, ...(trial ? { trial_control: trial } : {}), recognition_status: 'succeeded', recognition: result.j.recognition, local_safety: created.j.event.local_safety, event_link: { record_id: created.j.event.record_id }, record_id: created.j.event.record_id, link_status: 'linked', link_pending_reason: media.temporary === true && media.conversation_id ? 'conversation_link_pending' : null, conversation_link_error: null, version: current.version + 1, updated_at: now() };
-        await vault.put(mediaKey(media.media_id), updated);
+        await ownedPut(mediaKey(media.media_id), updated);
         if (updated.temporary === true && updated.conversation_id) {
           // Only a pause/finish after this attempt started defers the reply.
           // A new recording made after returning to a paused conversation still
@@ -1682,18 +1883,19 @@
             updated = { ...updated, conversation_turn_id: linked.j.turn_id, version: updated.version + 1, updated_at: now() };
           } else updated = { ...updated, conversation_link_error: linked.j.error || 'conversation_link_failed' };
           updated = { ...updated, link_pending_reason: null, updated_at: now() };
-          await vault.put(mediaKey(media.media_id), updated);
+          await ownedPut(mediaKey(media.media_id), updated);
           if (backgroundInactive && linked.r.ok && linked.j.turn_id && updated.kind === 'audio') {
             // The media lock is already held. Apply the same successful,
             // temporary, non-trial cleanup without trying to acquire it again.
-            await vault.mutate({ deletes: [mediaBinaryKey(updated.media_id), mediaKey(updated.media_id)] });
+            await ownedMutation({ deletes: [mediaBinaryKey(updated.media_id), mediaKey(updated.media_id)] });
           }
         }
       });
     } catch (error) {
       if (recognitionTrial) error.trial_control = { ...recognitionTrial, state: 'stopped' };
+      if (['subject_changed', 'subject_mismatch', 'stale_health_subjects'].includes(error.message)) return;
       if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
-        active = false; initialisePromise = null;
+        active = false; initialisePromise = null; observedSubjectId = null;
         return;
       }
       await withRecognitionLocks(media, async () => {
@@ -1705,8 +1907,8 @@
           : error.code === 'media_mock_unavailable' ? '语音或照片识别尚未接通，原件已保存在本机；接通真实服务后可重试。'
           : retryable ? '识别没有完成，原件已保存在本机，可以重试。' : '识别没有完成，原件已保存在本机。';
         const updated = { ...current, ...(error.trial_control ? { trial_control: { ...error.trial_control, state: 'stopped' } } : {}), recognition_status: 'failed', recognition: { error_message: message, error: { code: error.code || 'recognition_failed', retryable }, retryable }, version: current.version + 1, updated_at: now() };
-        await vault.put(mediaKey(media.media_id), updated);
-        if (error.trial_control) await vault.put(TRIAL_VOICE_KEY, { ...error.trial_control, state: 'stopped', media_id: media.media_id, conversation_id: media.conversation_id });
+        await ownedPut(mediaKey(media.media_id), updated);
+        if (error.trial_control) await ownedPut(TRIAL_VOICE_KEY, { ...error.trial_control, state: 'stopped', media_id: media.media_id, conversation_id: media.conversation_id });
       });
     } finally { pendingLocalOperations -= 1; }
   }
@@ -1717,18 +1919,46 @@
   }
 
   async function request(path, options = {}) {
+    try {
+      await initialise();
+      if (path === '/api/health-subjects' || path === '/api/health-subjects/active') return await requestInternal(path, options);
+      const body = parseBody(options);
+      await checkSubjectBinding(options, body);
+      const result = await requestInternal(path, options);
+      // Reads and delayed replies also stay owned by the displayed patient.
+      // The inner CAS guards prevent changed registry state from committing
+      // a memory mutation; this check prevents stale results reaching the UI.
+      await checkSubjectBinding(options, body);
+      return result;
+    } catch (error) {
+      if (['subject_changed', 'stale_health_subjects'].includes(error.message)) return fail(409, error.message);
+      if (error.message === 'subject_mismatch') return fail(403, error.message);
+      if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
+        active = false; initialisePromise = null; observedSubjectId = null;
+        return fail(409, error.message);
+      }
+      return fail(400, error.message || 'local_request_failed');
+    }
+  }
+
+  async function requestInternal(path, options = {}) {
     let counted = false;
     try {
       await initialise();
       if (restoringBackup) return fail(409, 'vault_restore_in_progress');
       pendingLocalOperations += 1; counted = true;
+      if (path.startsWith('/api/health-subjects') || path.startsWith('/api/health-memory')) return await healthMemoryRequest(path, options);
       if (path === '/api/health-context' && (options.method || 'GET') === 'GET') {
-        return ok(200, { ok: true, health_context: await healthContext() });
+        const context = await healthContext();
+        return ok(200, { ok: true, subject_id: context.subject_id, health_context: { ...context, entries: context.entries.filter(item => usableHealthEntry(item, context.subject_id)) } });
       }
       if (path === '/api/health-context' && (options.method || 'GET') === 'POST') {
-        const saved = normaliseHealthContext(parseBody(options), await healthContext());
-        await vault.put(HEALTH_CONTEXT_KEY, saved);
-        return ok(200, { ok: true, health_context: saved });
+        const body = parseBody(options), registry = await healthSubjects(), current = await healthContext(registry.active_subject_id);
+        if (body.subject_id && body.subject_id !== current.subject_id) return fail(403, 'subject_mismatch');
+        if (current.entries.some(item => !item.legacy_entry)) return fail(409, 'health_context_requires_memory_editor');
+        if (body.expected_version !== undefined && body.expected_version !== current.version) return fail(409, 'stale_health_memory');
+        const saved = normaliseHealthContext(body, current);
+        return await saveHealthMemory(current, saved, registry, true) ? ok(200, { ok: true, subject_id: current.subject_id, health_context: saved }) : fail(409, 'stale_health_memory');
       }
       if (path === '/api/handoffs' && (options.method || 'GET') === 'POST') {
         const body=parseBody(options),start=body.start_date?Date.parse(`${body.start_date}T00:00:00`):null,end=body.end_date?Date.parse(`${body.end_date}T23:59:59.999`):null;
@@ -1768,9 +1998,11 @@
       if (path.startsWith('/api/media')) return await mediaRequest(path, options);
       return fail(404, 'not_found');
     } catch (error) {
+      if (['subject_changed', 'stale_health_subjects'].includes(error.message)) return fail(409, error.message);
+      if (error.message === 'subject_mismatch') return fail(403, error.message);
       if (error.message === 'document_changed') return fail(409, 'trial_source_changed');
       if (['vault_changed_requires_unlock', 'vault_locked'].includes(error.message)) {
-        active = false; initialisePromise = null;
+        active = false; initialisePromise = null; observedSubjectId = null;
         return fail(409, error.message);
       }
       return fail(400, error.message || 'local_request_failed');
@@ -1778,7 +2010,10 @@
   }
 
   async function originalObjectUrl(mediaId) {
-    await initialise(); const original = await vault.get(mediaBinaryKey(mediaId)); if (!original) throw new Error('原件不存在');
+    await initialise(); const owner = await vault.get(mediaKey(mediaId));
+    if (subjectOf(owner) !== await activeSubjectId()) throw new Error('subject_mismatch');
+    const original = await vault.get(mediaBinaryKey(mediaId)); if (!original) throw new Error('原件不存在');
+    await activeSubjectId();
     return URL.createObjectURL(new Blob([original.bytes], { type: original.metadata.content_type || 'application/octet-stream' }));
   }
 
@@ -1807,7 +2042,7 @@
     // must finish before replacement, and new operations cannot start midway.
     if (restoringBackup || pendingLocalOperations) throw new Error('local_operations_busy');
     restoringBackup = true;
-    try { return await vault.restoreArchive(preview.archive, passphrase); }
+    try { const restored = await vault.restoreArchive(preview.archive, passphrase); observedSubjectId = null; return restored; }
     finally { restoringBackup = false; }
   }
 
@@ -1817,7 +2052,7 @@
     if (typeof description !== 'string' || !description.trim() || description.length > 2000) throw new Error('feedback_invalid');
     const feedback = { feedback_id: id('feedback'), description: description.trim(), page: String(page || location.hash || 'home').slice(0, 120), occurred_at: now(), includes_health_content: false, status: 'saved_on_device' };
     pendingLocalOperations += 1;
-    try { await vault.put(`feedback:${feedback.feedback_id}`, feedback); return feedback; }
+    try { await ownedPut(`feedback:${feedback.feedback_id}`, feedback); return feedback; }
     finally { pendingLocalOperations -= 1; }
   }
 
@@ -1830,7 +2065,7 @@
     get active() { return active; },
     downloadBackup,
     initialise,
-    lock() { vault.lock(); active = false; initialisePromise = null; },
+    lock() { vault.lock(); active = false; initialisePromise = null; observedSubjectId = null; },
     originalObjectUrl,
     onlineStatus,
     previewBackup,

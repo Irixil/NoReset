@@ -12,6 +12,7 @@ import re
 import time
 import unicodedata
 import uuid
+from datetime import date, datetime, timezone
 from typing import Any
 
 try:
@@ -22,7 +23,7 @@ except ImportError:
     from safety import DANGER_REMINDER, scan_danger, load_reviewed_risk_rules, evaluate_reviewed_risk, RISK_CONTRACT_VERSION
 
 
-PROMPT_VERSION = "clinical-intake-v8-risk-candidates"
+PROMPT_VERSION = "clinical-intake-v9-health-memory"
 CATEGORIES = (
     "main_complaint", "onset_course", "symptom_character",
     "aggravating_relieving", "associated_symptoms", "functional_impact",
@@ -87,10 +88,15 @@ SYSTEM_PROMPT = """你是“NoReset”的健康对话助手，负责理解患者
 - unknowns 和 contradictions 的每项结构为 {"text":"……","evidence_turn_ids":[],"context_ids":[]} 且至少有一个来源；
 - summary、unknowns、contradictions 都必须是客观事实表达，不得包含推测或建议。known summary 尽量简短；unknowns.text 应对应来源中明确表达“不知道/不记得/不想说”的原话，不能把信息缺口改写成患者事实。"""
 SYSTEM_PROMPT += """\n风险合同 reviewed-risk-candidates-v1：新增 risk_candidates 数组。只从程序提供的 approved_risk_rules 选择编号和版本；目录为空时必须返回 []。每项严格为 {"rule_id":"目录编号","rule_version":"目录版本","evidence":[{"turn_id":"真实患者回合编号","version":1,"quote":"该版本回合完整原话"}]}，最多8项。证据必须是当前患者回合全文与当前version，不能剪裁否定或历史词，不能引用助手问题，也不能只引用health_context。缺省version为1。模型不得输出等级、提醒、诊断或检查建议，最终判断和固定文案由本地审核规则决定。"""
+SYSTEM_PROMPT += """\n长期背景合同 health-memory-v1：health_context 是用户为本轮明确选择的必要背景，不是经过医生核实的诊断。subject_id（如有）限定本次记录所属人，不能引用或推测其他家庭成员的资料。source=user_confirmed 只说明用户确认了这条陈述；confirmed_by=self/family 和 source_kind=self_statement/family_report/document 分别保留本人、家属或资料陈述的来源，不代表本人或医生证实医学结论。记忆不能从模型回复中生成。
+仅使用与最新话语确实相关的 context_id。recorded_at、confirmed_at、updated_at 是记录、确认与更新的时间，occurred_on 是用户提供的发生日期或 null；不要把记录时间当作发病日期，不补猜缺失日期。四字段旧记录没有这些元数据时，明确按元数据不全的旧背景理解，不推定其身份、日期、确认者或当前状态。
+temporal_status=current/historical 区分当前与历史；历史用药、已经不用的药和既往症状不得改写成当前正在用药或当前症状。remember 只控制下次新对话自动沿用，false 的条目仍可能是用户本轮明确选择的背景。即使整条陈述已确认，也必须保留原文中的“不确定”“不记得”“可能”等局部不确定性，不把它们升级成肯定病史或过敏诊断。当前原话纠正既往背景时，保留时间和来源区别；不能用旧背景覆盖新纠正，冲突仍待用户核实。"""
 PROMPT_SHA256 = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 
 _TURN_ID = re.compile(r"^turn_[A-Za-z0-9_-]{8,100}$")
 _CONTEXT_ID = re.compile(r"^context_[A-Za-z0-9_-]{8,100}$")
+_SUBJECT_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_CONTEXT_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$")
 _DECLINED = re.compile(r"不知道|不清楚|不记得|记不清|想不起来|不想说|不方便说|说不上来")
 _EXPLICIT_UNKNOWN = _DECLINED
 _EXPLICIT_FINISH = re.compile(r"^(?:没有了?|没了|就这些|就这样|先这样|不说了|结束吧?|可以了)[。！! ]*$")
@@ -211,22 +217,79 @@ def _clean_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return turns
 
 
-def _clean_health_context(payload: dict[str, Any]) -> list[dict[str, str]]:
+def _context_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not _CONTEXT_TIMESTAMP.fullmatch(value):
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid") from None
+    if stamp.utcoffset() is None or stamp > datetime.now(timezone.utc):
+        raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+    return stamp
+
+
+def _clean_health_context(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    subject = payload.get("subject_id")
+    if "subject_id" in payload and (not isinstance(subject, str) or not _SUBJECT_ID.fullmatch(subject)):
+        raise ConversationError("health_context_subject_invalid", "health_context_subject_invalid")
     rows = payload.get("health_context", [])
     if not isinstance(rows, list) or len(rows) > 30:
-        raise ConversationError("health_context_invalid")
+        raise ConversationError("health_context_invalid", "health_context_invalid")
     result = []
     for row in rows:
         if not isinstance(row, dict):
-            raise ConversationError("health_context_invalid")
+            raise ConversationError("health_context_invalid", "health_context_invalid")
         context_id, category, text = row.get("context_id"), row.get("category"), row.get("text")
         if not isinstance(context_id, str) or not _CONTEXT_ID.fullmatch(context_id):
-            raise ConversationError("health_context_id_invalid")
-        if category not in _CONTEXT_CATEGORIES or not isinstance(text, str) or not text.strip() or len(text) > 500:
-            raise ConversationError("health_context_invalid")
-        result.append({"context_id": context_id, "category": category, "text": text.strip(), "source": "user_confirmed"})
+            raise ConversationError("health_context_id_invalid", "health_context_id_invalid")
+        if not isinstance(category, str) or category not in _CONTEXT_CATEGORIES or not isinstance(text, str) or not text.strip() or len(text) > 500:
+            raise ConversationError("health_context_invalid", "health_context_invalid")
+        # Confirmation is asserted by the local user's explicit action. It must
+        # never be manufactured from an arbitrary source or a revoked entry.
+        if row.get("source") != "user_confirmed":
+            raise ConversationError("health_context_source_invalid", "health_context_source_invalid")
+        if ("confirmation_status" in row and row["confirmation_status"] != "confirmed"
+                or "confirmed" in row and row["confirmed"] is not True
+                or "revoked" in row and row["revoked"] is not False
+                or "status" in row and row["status"] not in ("active", "confirmed")):
+            raise ConversationError("health_context_unconfirmed", "health_context_unconfirmed")
+        if "temporal_status" in row and row["temporal_status"] not in ("current", "historical"):
+            raise ConversationError("health_context_temporal_invalid", "health_context_temporal_invalid")
+        row_subject = row.get("subject_id")
+        if ("subject_id" in row and (not isinstance(row_subject, str) or not _SUBJECT_ID.fullmatch(row_subject))):
+            raise ConversationError("health_context_subject_invalid", "health_context_subject_invalid")
+        if (subject is not None or "subject_id" in row) and row_subject != subject:
+            raise ConversationError("health_context_subject_mismatch", "health_context_subject_mismatch")
+        if "confirmed_by" in row and row["confirmed_by"] not in ("self", "family"):
+            raise ConversationError("health_context_confirmation_invalid", "health_context_confirmation_invalid")
+        if "source_kind" in row and row["source_kind"] not in ("self_statement", "family_report", "document"):
+            raise ConversationError("health_context_source_invalid", "health_context_source_invalid")
+        if "remember" in row and type(row["remember"]) is not bool:
+            raise ConversationError("health_context_remember_invalid", "health_context_remember_invalid")
+        stamps = {key: _context_timestamp(row[key]) for key in ("recorded_at", "confirmed_at", "updated_at") if key in row}
+        if ("updated_at" in stamps and any(stamp > stamps["updated_at"] for key, stamp in stamps.items() if key != "updated_at")):
+            raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+        if "occurred_on" in row and row["occurred_on"] is not None:
+            value = row["occurred_on"]
+            if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+            try:
+                occurred = date.fromisoformat(value)
+            except ValueError:
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid") from None
+            if occurred > datetime.now(timezone.utc).date():
+                raise ConversationError("health_context_date_invalid", "health_context_date_invalid")
+        clean = {"context_id": context_id, "category": category, "text": text.strip(), "source": row["source"]}
+        # Keep valid supplied metadata exactly; missing legacy metadata remains
+        # absent instead of receiving invented dates, identity or status.
+        for key in ("subject_id", "recorded_at", "confirmed_at", "updated_at", "temporal_status",
+                    "confirmation_status", "confirmed_by", "occurred_on", "remember", "source_kind"):
+            if key in row:
+                clean[key] = row[key]
+        result.append(clean)
     if len({row["context_id"] for row in result}) != len(result):
-        raise ConversationError("health_context_id_duplicate")
+        raise ConversationError("health_context_id_duplicate", "health_context_id_duplicate")
     return result
 
 
@@ -1148,8 +1211,11 @@ def conversation_turn(payload: dict[str, Any], provider=None) -> dict[str, Any]:
         draft = _mock_assessment(turns, controller)
         model_id = "mock-clinical-intake-v1"
     else:
-        draft = selected_provider.complete_json(SYSTEM_PROMPT, {"turns": turns, "health_context": health_context, "controller": controller,
-            "approved_risk_rules": [{key: rule[key] for key in ("rule_id", "version", "description")} for rule in risk_registry["rules"]]})
+        model_payload = {"turns": turns, "health_context": health_context, "controller": controller,
+            "approved_risk_rules": [{key: rule[key] for key in ("rule_id", "version", "description")} for rule in risk_registry["rules"]]}
+        if "subject_id" in payload:
+            model_payload["subject_id"] = payload["subject_id"]
+        draft = selected_provider.complete_json(SYSTEM_PROMPT, model_payload)
         model_id = getattr(getattr(selected_provider, "c", None), "model", None) or "unknown"
     provider_name = type(selected_provider).__name__
     try:

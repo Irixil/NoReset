@@ -274,3 +274,29 @@ link_status:        not_linked | pending | linked | link_failed
 - 版本冲突 `409` 时重新 GET 详情，让用户选择重载或修订，不能覆盖别人新版本。
 
 完整 TypeScript 类型在 `contracts/api.ts`。Schema 只约束 AI 草稿；`local_safety` 是后端外层安全字段。
+
+## 本机长期健康记忆（2026-10-10）
+
+以下接口由 `HealthLocal.request` 在浏览器加密仓库执行，适用于 `local_first`。它们不写后端 SQLite、不创建云账号，不是公网身份鉴权。独立使用者应使用各自浏览器资料库和口令；家庭成员在拥有者同一资料库内按 `subject_id` 分开记录。原资料归 `subject_self`（本人），不根据病史文字猜所属人。
+
+| 接口 | 请求 | 结果 |
+|---|---|---|
+| `GET /api/health-subjects` | 无 | `subjects, active_subject_id, observed_subject_id, version` |
+| `POST /api/health-subjects` | `label, relationship: self\|family, expected_version` | 创建本机所属人 |
+| `POST /api/health-subjects/active` | `subject_id, expected_version` | 切换当前记录所属人 |
+| `GET /api/health-memory` | 无 | 当前人的 `health_context: {subject_id,version,updated_at,entries}` |
+| `POST /api/health-memory` | `subject_id, expected_subject_version, expected_version, entry` | 新增一条必要背景 |
+| `PATCH /api/health-memory/{context_id}` | `subject_id, expected_subject_version, expected_version, entry` | 纠正该条背景 |
+| `DELETE /api/health-memory/{context_id}` | `subject_id, expected_subject_version, expected_version` | 从当前资料库删除该条背景 |
+
+`entry` 包含 `category, text, temporal_status, confirmation_status, confirmed_by, source_kind, occurred_on, remember`。分类沿用疾病/长期问题、用药、过敏、手术外伤、已有资料、相似经历六类。`temporal_status` 为 `current|historical|uncertain`，`confirmation_status` 为 `confirmed|unconfirmed`；确认者为 `self|family`，来源为 `self_statement|family_report|document`。发生日可为空，不得以保存时间代替，未来日期在保存前拒绝。保存生成编号、所属人、真实记录/更新时间和确认时间；未确认的 `confirmed_at` 为 `null`。这是对用户陈述的确认，不是医生诊断认证。
+
+新版页面每次本地读写附 `X-Health-Subject-Id` 和 `X-Health-Subject-Version`，记忆及旧字段写入另带显示的 `subject_id, expected_subject_version`。每个已解锁页面保持自己的所属人观察值，另一页切换不会让旧页面跟着读取或写入新人的资料。`GET /api/health-subjects` 的 `observed_subject_id` 标明本页观察值；遇到跨页切换返回 `409 subject_changed` 或 `403 subject_mismatch`，页面保留未保存输入，要求明确重新选择。读取登记表本身不等于确认新身份。
+
+`remember=true` 只允许已确认、时间状态明确的条目，同一人最多五项。用户作出此选择后，新对话沿用这些背景；界面显示发送范围，仍可逐段取消或手工选择其他已确认条目。取消沿用或撤销、纠正、删除时清理旧选择和背景缓存，使旧分析失效。撤销确认的资料不发送给模型。旧字段编辑器不自动将资料选为记忆；存在新版逐条记忆时，拒绝旧全量覆盖以避免误删。
+
+写入使用资料版本和加密仓库原子比较，冲突返回 `409 stale_health_memory` 或 `409 stale_health_subjects`；调用方保留输入，重新读取后再处理。另一所属人的记录访问返回 `403 subject_mismatch`；跨所属人的编号不能加入本轮背景或关联原话。不存在返回 `404 health_subject_not_found|health_memory_not_found`。非法记忆字段、确认条件或超过五项分别返回 `400 health_memory_invalid|health_memory_remember_invalid|health_memory_remember_limit`。
+
+实际联网 `POST /api/ai/conversation-turn` 携带 `subject_id` 和精简 `health_context`（前端最多五项）。后端保留来源、记录/确认/发生日期、当前或历史状态、确认者和所属人；显式未确认、撤销、时间不确定或所属人不符的条目在供应商入口前拒绝。背景错误为 `health_context_source_invalid|unconfirmed|temporal_invalid|subject_invalid|subject_mismatch|confirmation_invalid|remember_invalid|date_invalid`（每项均有 `health_context_` 前缀）。`remember=false` 只表示不自动沿用，仍允许用户为今天明确选择已确认背景。兼容旧四字段背景，但不补造缺失日期、身份或当前状态；具有 `subject_id` 的新请求不能混入身份未知的旧行。
+
+模型只引用与本次话语相关的条目，不把过去停用药物写成正在用药，也不把用户确认的自述写成正式诊断。模型回应、真实供应商召回、病例持久化和加密备份分别验收。

@@ -31,6 +31,9 @@ SERVICES = {
 URLS = {'asr': 'https://aihubmix.com/gemini/v1beta/models/gemini-2.5-flash-lite:generateContent',
         'llm': 'https://api.deepseek.com/chat/completions'}
 STOP_BUFFER_UNITS = 9657600  # Keep one largest reviewed request estimate unused.
+NATIVE_ROOT_SCHEMA = 'noreset-standalone-cumulative-binding-v1'
+NATIVE_ROOT_SQL = ('CREATE TABLE native_roots (receipt_id TEXT PRIMARY KEY, root_id TEXT NOT NULL UNIQUE, '
+                   'state_path TEXT NOT NULL UNIQUE, record_json TEXT NOT NULL)')
 
 
 class TrialBudgetError(RuntimeError):
@@ -375,15 +378,153 @@ def allocation_status(descriptor, *, receipt_id, slot, kind, source_sha256, requ
         raise TrialBudgetError() from None
 
 
-def register_batch(descriptor, *, receipt):
+def _row_seal(db, descriptor, baseline=None):
+    """Seal immutable prefixes; future allocations are not historical rewrites."""
+    fields = {'schema_version', 'authorization_sha256', 'batch_count', 'allocation_count',
+              'reserved_units', 'unknown_allocation_ids', 'rows_sha256'}
+    if baseline is not None and (not isinstance(baseline, dict) or set(baseline) != fields
+            or baseline['schema_version'] != 'noreset-cumulative-row-seal-v1'
+            or baseline['authorization_sha256'] != descriptor['authorization_sha256']
+            or any(type(baseline[k]) is not int or baseline[k] < 0
+                   for k in ('batch_count', 'allocation_count', 'reserved_units'))):
+        _deny()
+    batches = db.execute('SELECT rowid,* FROM batches ORDER BY rowid').fetchall()
+    allocations = db.execute('SELECT * FROM allocations ORDER BY id').fetchall()
+    if baseline is not None:
+        if len(batches) < baseline['batch_count'] or len(allocations) < baseline['allocation_count']:
+            _deny()
+        batches, allocations = batches[:baseline['batch_count']], allocations[:baseline['allocation_count']]
+    if ([r[0] for r in batches] != list(range(1, len(batches)+1))
+            or [r[0] for r in allocations] != list(range(1, len(allocations)+1))):
+        _deny()
+    schemas = db.execute("SELECT type,name,sql FROM sqlite_master WHERE name!='native_roots' "
+        "AND name NOT LIKE 'sqlite_autoindex_native_roots_%' ORDER BY name").fetchall()
+    rows = {'metadata': db.execute('SELECT * FROM metadata').fetchall(),
+            'schemas': schemas, 'batches': batches, 'allocations': allocations}
+    return {'schema_version': 'noreset-cumulative-row-seal-v1',
+            'authorization_sha256': descriptor['authorization_sha256'],
+            'batch_count': len(batches), 'allocation_count': len(allocations),
+            'reserved_units': sum(r[6] for r in allocations),
+            'unknown_allocation_ids': [r[0] for r in allocations if r[8] is None],
+            'rows_sha256': hashlib.sha256(_encode(rows).encode()).hexdigest()}
+
+
+def cumulative_row_seal(descriptor, *, baseline=None):
+    """Read-only exact historical rows, including unknown usage and closure."""
+    try:
+        with closing(_connect(descriptor, readonly=True)[0]) as db, db:
+            db.execute('BEGIN')
+            return _row_seal(db, descriptor, baseline)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        raise TrialBudgetError() from None
+
+
+def native_root_binding(descriptor, *, receipt_id, required=True, include_scope=False):
+    """Read an exclusive native identity held by the original cumulative DB."""
+    try:
+        with closing(_connect(descriptor, readonly=True)[0]) as db, db:
+            db.execute('BEGIN')
+            schema = db.execute("SELECT sql FROM sqlite_master WHERE name='native_roots'").fetchone()
+            if schema is None and not required:
+                return None
+            if schema != (NATIVE_ROOT_SQL,):
+                _deny()
+            row = db.execute('SELECT record_json FROM native_roots WHERE receipt_id=?', (receipt_id,)).fetchone()
+            if row is None and not required:
+                return None
+            if row is None:
+                _deny()
+            binding = json.loads(row[0], object_pairs_hook=_unique)
+            if not include_scope:
+                return binding
+            scope = db.execute('SELECT registered_json,status,closure_reason FROM batches WHERE receipt_id=?',
+                               (receipt_id,)).fetchone()
+            if scope is None:
+                _deny()
+            return {'binding': binding, 'receipt': json.loads(scope[0], object_pairs_hook=_unique),
+                    'status': scope[1], 'closure_reason': scope[2],
+                    'allocations': db.execute('SELECT slot,kind,source_sha256,request_sha256,reserved_units,observation_json '
+                                             'FROM allocations WHERE receipt_id=? ORDER BY slot', (receipt_id,)).fetchall()}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        raise TrialBudgetError() from None
+
+
+def _guard_native_budget(db, descriptor, receipt_id, receipt=None):
+    """Recheck frozen prefixes in the same transaction that spends or closes."""
+    schema = db.execute("SELECT sql FROM sqlite_master WHERE name='native_roots'").fetchone()
+    if schema is None:
+        return
+    if schema != (NATIVE_ROOT_SQL,):
+        _deny()
+    row = db.execute('SELECT record_json FROM native_roots WHERE receipt_id=?', (receipt_id,)).fetchone()
+    if row is None:
+        return  # Historical batches keep their existing public behavior.
+    binding = json.loads(row[0], object_pairs_hook=_unique)
+    if _row_seal(db, descriptor, binding['budget_baseline']) != binding['budget_baseline']:
+        _deny()
+    state = _path(binding['state_path'])
+    info = state.stat()
+    if (info.st_dev != binding['state_device'] or info.st_ino != binding['state_inode']
+            or info.st_nlink != 1):
+        _deny()
+    scope = db.execute('SELECT registered_json FROM batches WHERE receipt_id=?', (receipt_id,)).fetchone()
+    if scope is None:
+        _deny()
+    approved = json.loads(scope[0], object_pairs_hook=_unique)
+    if receipt is not None and receipt != approved:
+        _deny()
+    profile = approved['profiles']['llm']
+    allocations = db.execute('SELECT slot,kind,source_sha256,request_sha256,reserved_units FROM allocations '
+                             'WHERE receipt_id=? ORDER BY slot', (receipt_id,)).fetchall()
+    if len(allocations) > len(approved['request_sequence']):
+        _deny()
+    for slot, allocation in enumerate(allocations):
+        if allocation != (slot, 'llm', profile['source_sha256'][slot], profile['request_sha256'][slot],
+                           _units(profile['billing']['estimated_usd'])):
+            _deny()
+
+
+def register_batch(descriptor, *, receipt, expected_previous_seal=None, native_binding=None):
     """Trusted local registration of one bounded approved receipt, not a send."""
     try:
         with closing(_connect(descriptor)[0]) as db, db:
             db.execute('BEGIN IMMEDIATE')
             authority, _ = _authority(descriptor)
             binding, planned = _receipt_binding(descriptor, receipt, authority)
+            if (native_binding is None) != (expected_previous_seal is None):
+                _deny()
+            if native_binding is not None:
+                fields = {'schema_version', 'receipt_id', 'root_id', 'manifest_path', 'manifest_sha256',
+                          'receipt_sha256', 'state_path', 'state_device', 'state_inode', 'state_identity',
+                          'budget_baseline'}
+                if (not isinstance(native_binding, dict) or set(native_binding) != fields
+                        or native_binding['schema_version'] != NATIVE_ROOT_SCHEMA
+                        or native_binding['receipt_id'] != receipt['receipt_id']
+                        or native_binding['budget_baseline'] != expected_previous_seal
+                        or _row_seal(db, descriptor) != expected_previous_seal
+                        or any(r[0] != 'closed' for r in db.execute('SELECT status FROM batches'))
+                        or set(receipt['profiles']) != {'llm'}
+                        or not 1 <= len(receipt['request_sequence']) <= 2
+                        or receipt['total_requests'] != len(receipt['request_sequence'])
+                        or any(not HASH.fullmatch(str(native_binding[k]))
+                               for k in ('root_id', 'manifest_sha256', 'receipt_sha256'))
+                        or not re.fullmatch(r'[a-f0-9]{32}', str(native_binding['state_identity']))
+                        or any(type(native_binding[k]) is not int or native_binding[k] <= 0
+                               for k in ('state_device', 'state_inode'))):
+                    _deny()
+                for key in ('state_path', 'manifest_path'):
+                    _path(native_binding[key])
+                # Dedicated roots never replay a previous allocated tuple, even
+                # when a closed known request could otherwise be explicitly rerun.
+                for source, wire in zip(receipt['profiles']['llm']['source_sha256'],
+                                        receipt['profiles']['llm']['request_sha256']):
+                    if db.execute('SELECT 1 FROM allocations WHERE kind=? AND source_sha256=? AND request_sha256=?',
+                                  ('llm', source, wire)).fetchone() is not None:
+                        _deny('trial_cumulative_unknown_replay')
             previous = db.execute('SELECT binding_sha256,status FROM batches WHERE receipt_id=?', (receipt['receipt_id'],)).fetchone()
             if previous is not None:
+                if native_binding is not None:
+                    _deny()
                 if previous != (binding, 'active'):
                     _deny()
                 return budget_snapshot(descriptor)
@@ -391,6 +532,14 @@ def register_batch(descriptor, *, receipt):
                 _deny('trial_cumulative_batch_active')
             if _occupied(db) + planned + STOP_BUFFER_UNITS > _units(authority['total_estimated_usd']):
                 _deny('trial_cumulative_budget_exhausted')
+            if native_binding is not None:
+                schema = db.execute("SELECT sql FROM sqlite_master WHERE name='native_roots'").fetchone()
+                if schema is None:
+                    db.execute(NATIVE_ROOT_SQL)
+                elif schema != (NATIVE_ROOT_SQL,):
+                    _deny()
+                db.execute('INSERT INTO native_roots VALUES (?,?,?,?)',
+                    (receipt['receipt_id'], native_binding['root_id'], native_binding['state_path'], _encode(native_binding)))
             db.execute('INSERT INTO batches VALUES (?,?,?,\'active\',NULL)',
                        (receipt['receipt_id'], binding, _encode(receipt)))
         return budget_snapshot(descriptor)
@@ -409,6 +558,7 @@ def reserve_estimate(descriptor, *, receipt, slot, kind, source_sha256, request_
         db, authority = _connect(descriptor)
         with closing(db), db:
             db.execute('BEGIN IMMEDIATE')
+            _guard_native_budget(db, descriptor, receipt['receipt_id'], receipt)
             binding, _ = _receipt_binding(descriptor, receipt, authority)
             registered = db.execute('SELECT binding_sha256,status FROM batches WHERE receipt_id=?', (receipt['receipt_id'],)).fetchone()
             rows = db.execute('SELECT slot,kind FROM allocations WHERE receipt_id=? ORDER BY slot', (receipt['receipt_id'],)).fetchall()
@@ -456,6 +606,7 @@ def mark_observed(descriptor, *, receipt_id, slot, kind, source_sha256, request_
             _deny()
         with closing(_connect(descriptor)[0]) as db, db:
             db.execute('BEGIN IMMEDIATE')
+            _guard_native_budget(db, descriptor, receipt_id)
             row = db.execute('''SELECT a.kind,a.source_sha256,a.request_sha256,a.observation_json,b.registered_json
                 FROM allocations a JOIN batches b ON b.receipt_id=a.receipt_id
                 WHERE a.receipt_id=? AND a.slot=?''', (receipt_id, slot)).fetchone()
@@ -490,6 +641,7 @@ def close_batch(descriptor, *, receipt_id, reason):
     try:
         with closing(_connect(descriptor)[0]) as db, db:
             db.execute('BEGIN IMMEDIATE')
+            _guard_native_budget(db, descriptor, receipt_id)
             previous = db.execute('SELECT status,closure_reason FROM batches WHERE receipt_id=?', (receipt_id,)).fetchone()
             if previous is None or previous[0] == 'closed' and previous[1] != reason:
                 _deny()

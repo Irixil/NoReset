@@ -7,6 +7,9 @@ let cancelPendingMicrophone = null;
 let silenceAudioContext = null, silenceAnalyser = null, silenceFrameId = null, silenceStartedAt = 0, speechDetected = false;
 let reportReturnFocus = null, reportInertTargets = [], contextReturnFocus = null, contextInertTargets = [];
 let healthContextEntries = [], contextDraftSelection = new Set(), contextPickerLoading = false, contextPickerLoadError = false, contextPickerRequestId = 0, contextSelectionSaving = false, voiceStatusCheckId = 0;
+let healthMemoryEntries = [], healthMemoryVersion = 0, healthMemoryEditingId = null, healthMemoryBusy = false;
+let healthSubjects = [], healthSubjectsVersion = 0, activeHealthSubjectId = 'subject_self', healthSubjectUiEpoch = 0, healthSubjectSwitchBusy = false;
+let healthSubjectLoaded = false, healthSubjectChanged = false;
 const handoffSelection=new Set(),knownHandoffEvents=new Set();
 const DEMO_KEY = 'elder_demo_events_v1';
 const PHOTO_KEY = 'elder_demo_photos_v1';
@@ -40,7 +43,7 @@ function showView(id){
   });
   window.scrollTo({top:0,behavior:reducedMotion()?'auto':'smooth'});
   const activeView=views.find(v=>v.id===id);activeView?.querySelector?.('h1')?.focus?.({preventScroll:true});
-  if(id==='recordsView')loadEvents();if(id==='homeView')renderHome();if(id==='settingsView'){refreshStorageStatus();void loadHealthContext()}if(id==='voiceView'){void loadConversation();void refreshVoiceOnlineStatus()}if(['photoCaptureView','archiveView'].includes(id)&&typeof refreshMediaOnlineStatus==='function')void refreshMediaOnlineStatus();return true
+  if(id==='recordsView')loadEvents();if(id==='homeView')renderHome();if(id==='settingsView'){refreshStorageStatus();void loadHealthMemory()}if(id==='voiceView'){void loadConversation();void refreshVoiceOnlineStatus()}if(['photoCaptureView','archiveView'].includes(id)&&typeof refreshMediaOnlineStatus==='function')void refreshMediaOnlineStatus();return true
 }
 document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{
   // Media entry buttons are disabled after capability discovery when the
@@ -101,7 +104,12 @@ async function refreshVoiceOnlineStatus(){
 }
 async function api(path,opt={},retried=false){
   if(opt.method==='POST'&&/^\/api\/conversations\/[^/]+\/(?:pause|finish)$/.test(path)&&typeof releaseOriginalsIn==='function')releaseOriginalsIn($('voiceConversationTurns'));
-  if(localMode)return globalThis.HealthLocal.request(path,opt);
+  if(localMode){
+    const headers={...(opt.headers||{}),'X-Health-Subject-Id':activeHealthSubjectId,'X-Health-Subject-Version':String(healthSubjectsVersion)};
+    const result=await globalThis.HealthLocal.request(path,{...opt,headers});
+    if(['subject_changed','subject_mismatch'].includes(result?.j?.error)&&typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();
+    return result;
+  }
   const h={...(opt.body instanceof FormData ? {} : {'Content-Type':'application/json'}),...(opt.headers||{})};
   if(token)h['X-Session-Token']=token;
   try {
@@ -227,7 +235,9 @@ function renderList(){
 function applyRecordFilters(event){event?.preventDefault();renderList();const box=$('eventsList');box?.focus?.({preventScroll:true});box?.scrollIntoView?.({behavior:'smooth',block:'start'})}
 function clearRecordFilters(){const form=$('recordFilters');if(form?.reset)form.reset();else for(const id of ['filterKeyword','filterKind','filterState','filterStart','filterEnd'])$(id).value='';renderList();$('filterKeyword')?.focus?.()}
 async function loadEvents(){
+  const subjectEpoch=typeof healthSubjectUiEpoch==='number'?healthSubjectUiEpoch:0;
   const [{r,j},conversationResult]=await Promise.all([api('/api/events'),api('/api/conversations')]);
+  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch)return false;
   if(r.ok){demoMode=false;events=j.events||[];conversations=conversationResult.r.ok?conversationResult.j.conversations||[]:[];setModeLabel();renderList();renderHome();renderArchive();return true;}
   demoMode=true;setModeLabel();
   const message='<div class="load-error" role="status"><b>记录暂时无法读取</b><span>请恢复连接后重试；已保存内容不会删除。</span><button class="outline" type="button" data-retry-events>重新读取</button></div>';
@@ -239,6 +249,7 @@ function setVoiceStatus(text,tone=''){
   status.textContent=text;status.className='conversation-status'+(tone?' '+tone:'');
 }
 function setVoiceComposerEnabled(enabled){
+  if(typeof healthSubjectChanged!=='undefined'&&healthSubjectChanged)enabled=false;
   if(activeConversation?.trial_control&&activeConversation.trial_control.state!=='completed')enabled=false;
   const input=$('voiceTextInput'),send=$('voiceTextSend');
   if(send)send.textContent=activeConversation?.trial_control?'保存原话':'发送';
@@ -370,11 +381,13 @@ function reportFactHtml(line,index){
   return `<article class="report-fact report-fact-${kind}" data-report-line="${index+1}"><div class="report-fact-head">${tags?`<div class="report-fact-tags">${tags}</div>`:''}${source}</div>${content}${evidence}</article>`;
 }
 function syncConversation(conversation,{speak=true}={}){
+  if(typeof activeHealthSubjectId!=='undefined'&&conversation?.subject_id&&conversation.subject_id!==activeHealthSubjectId){if(typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();return false}
   if(conversation?.trial_control&&conversation.trial_control.state!=='completed')voicePermissionGeneration++;
   if(pendingMediaRetry&&pendingMediaRetry.conversation_id!==conversation?.conversation_id)pendingMediaRetry=null;
   activeConversation=conversation;conversationEditingTurnId=null;pendingConversationTurn=null;
   document.querySelector?.('.conversation-shell')?.classList.remove('awaiting-choice');
   renderVoiceConversation();renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(true);
+  if(typeof updateHealthSubjectLabels==='function')updateHealthSubjectLabels();
   const last=[...(conversation?.turns||[])].reverse().find(turn=>turn.role==='assistant'&&!turn.superseded);
   if(speak&&last&&!isMockContent(last)&&last.turn_id!==lastSpokenTurnId)speakAssistant(last);
 }
@@ -424,7 +437,7 @@ function updateHealthContextButton(){
   button.disabled=!activeConversation?.conversation_id;
   button.textContent=count?`已选 ${count} 项相关资料（可选）`:'带上相关资料（可选）';
 }
-const HEALTH_CONTEXT_CATEGORY_LABELS={conditions:'疾病或长期问题',medications:'正在使用的药物',allergies:'过敏情况',procedures:'手术、住院或受伤经历',tests:'已有检查或测量',similar_episodes:'以前类似情况'};
+const HEALTH_CONTEXT_CATEGORY_LABELS={conditions:'疾病或长期问题',medications:'药物使用记录',allergies:'过敏情况',procedures:'手术、住院或受伤经历',tests:'已有检查或测量',similar_episodes:'以前类似情况'};
 function setContextDialogBackgroundInert(inert){
   const panel=$('healthContextPickerPanel');if(!panel)return;
   if(inert){
@@ -455,7 +468,8 @@ function renderHealthContextPicker(){
   }
   list.innerHTML=healthContextEntries.map(item=>{
     const id=escapeHtml(item.context_id||''),checked=contextDraftSelection.has(item.context_id)?' checked':'';
-    return `<label class="health-context-choice"><input type="checkbox" data-context-id="${id}"${checked}><span><b>${escapeHtml(HEALTH_CONTEXT_CATEGORY_LABELS[item.category]||'已确认情况')}</b><span>${escapeHtml(item.text||'')}</span></span></label>`;
+    const timeLabel=item.temporal_status==='current'?'目前仍适用':item.temporal_status==='historical'?'过去的情况':item.temporal_status==='uncertain'?'不确定 · 待核实':item.legacy_entry?'时间状态未核对':'';
+    return `<label class="health-context-choice"><input type="checkbox" data-context-id="${id}"${checked}><span><b>${escapeHtml(HEALTH_CONTEXT_CATEGORY_LABELS[item.category]||'已确认情况')}${timeLabel?` · ${escapeHtml(timeLabel)}`:''}</b><span>${escapeHtml(item.text||'')}</span></span></label>`;
   }).join('');
   list.querySelectorAll('[data-context-id]').forEach(input=>input.addEventListener('change',()=>{
     const accepted=changeContextPickerSelection(input.dataset.contextId,input.checked);
@@ -618,6 +632,7 @@ async function startSeparateConversation(){
   finally{conversationLoading=false;if(button)button.disabled=false}
 }
 async function loadConversation(){
+  if(typeof healthSubjectSwitchBusy!=='undefined'&&healthSubjectSwitchBusy)return;
   if(conversationLoading)return;conversationLoading=true;setVoiceComposerEnabled(false);
   try{
     const x=await api(`/api/conversations/current?local_date=${encodeURIComponent(localDateValue())}`);
@@ -646,6 +661,7 @@ async function pauseConversation(){
   try{const x=await api(`/api/conversations/${encodeURIComponent(activeConversation.conversation_id)}/pause`,{method:'POST',body:'{}'});if(x.r.ok&&x.j.conversation)activeConversation=x.j.conversation}catch{}
 }
 async function submitConversationText(text,extra={}){
+  if(typeof healthSubjectSwitchBusy!=='undefined'&&healthSubjectSwitchBusy)return false;
   if(saveBusy||!activeConversation?.conversation_id)return false;
   const clean=String(text||'').trim();if(!clean){setVoiceStatus('请先说或写下想记录的内容。','error');return false}
   if((extra.source_kind==='audio_transcript'||extra.media_id)&&mockText(clean)){setVoiceStatus(mockWarning,'error');return false}
@@ -930,6 +946,193 @@ if(document.body)for(const id of ['healthContextPickerPanel','conversationReport
 setVoiceComposerEnabled(true);
 async function refreshStorageStatus(){if(!localMode||!$('storageStatus'))return;try{const s=await HealthLocal.storageStatus(),used=(s.usage/1024/1024).toFixed(1),quota=s.quota?`${(s.quota/1024/1024).toFixed(0)} MB`:'未知';$('storageStatus').textContent=`已使用约 ${used} MB / 可用额度 ${quota}。${s.persisted?'浏览器已批准持久存储。':'浏览器尚未批准持久存储，请定期下载备份。'}`}catch{$('storageStatus').textContent='无法读取本机存储额度，请定期下载加密备份。'}}
 const HEALTH_CONTEXT_FIELDS={conditions:'healthConditions',medications:'healthMedications',allergies:'healthAllergies',procedures:'healthProcedures',tests:'healthTests',similar_episodes:'healthSimilarEpisodes'};
+function healthSubjectLabel(subjectId=activeHealthSubjectId){return healthSubjects.find(subject=>subject.subject_id===subjectId)?.label||(subjectId==='subject_self'?'本人':'所属人待读取')}
+const HEALTH_MEMORY_TEMPORAL_LABELS={current:'目前仍适用',historical:'过去的情况',uncertain:'不确定 · 待核实'};
+const HEALTH_MEMORY_SOURCE_LABELS={self_statement:'本人陈述',family_report:'家属转述',document:'已有资料'};
+const HEALTH_MEMORY_FORM_FIELDS=['healthMemoryCategory','healthMemoryText','healthMemoryTemporalStatus','healthMemorySourceKind','healthMemoryOccurredOn','healthMemoryConfirmedBy','healthMemoryConfirmed','healthMemoryRemember'];
+function updateHealthSubjectLabels(){
+  const label=$('voiceSubjectLabel');if(label)label.textContent=`当前记录：${healthSubjectLabel(activeConversation?.subject_id||activeHealthSubjectId)}`;
+}
+function renderHealthSubjects(){
+  const select=$('healthSubjectSelect');if(select){select.innerHTML=healthSubjects.map(subject=>`<option value="${escapeHtml(subject.subject_id)}">${escapeHtml(subject.label)}${subject.relationship==='family'?'（家属）':''}</option>`).join('');select.value=activeHealthSubjectId;select.disabled=healthMemoryBusy||healthSubjectSwitchBusy}
+  updateHealthSubjectLabels();
+}
+function markHealthSubjectChanged(){
+  healthSubjectChanged=true;
+  const message='另一页面已切换所属人；本页输入仍保留。请先重新选择当前所属人，再继续保存或对话。';
+  if($('healthSubjectStatus'))$('healthSubjectStatus').textContent=message;
+  const notice=$('healthSubjectConflictNotice');if(notice){notice.textContent=message;notice.classList.remove('hidden')}
+  $('reselectHealthSubjectBtn')?.classList.remove('hidden');
+  healthMemoryStatus(message,'error');setVoiceComposerEnabled(false);setHealthMemoryBusy(healthMemoryBusy);
+}
+function clearHealthSubjectChangedNotice(){
+  healthSubjectChanged=false;$('healthSubjectConflictNotice')?.classList.add('hidden');$('reselectHealthSubjectBtn')?.classList.add('hidden');
+}
+async function loadHealthSubjects(){
+  if(!localMode)return false;
+  const epoch=healthSubjectUiEpoch,x=await api('/api/health-subjects');if(epoch!==healthSubjectUiEpoch)return false;
+  if(!x.r.ok){if($('healthSubjectStatus'))$('healthSubjectStatus').textContent='所属人暂时无法读取；请重试。';return false}
+  const actual=x.j.active_subject_id||'subject_self',observed=x.j.observed_subject_id;
+  healthSubjects=Array.isArray(x.j.subjects)?x.j.subjects:[];healthSubjectsVersion=x.j.version;
+  if(healthSubjectLoaded&&(actual!==activeHealthSubjectId||observed&&observed!==activeHealthSubjectId)){markHealthSubjectChanged();renderHealthSubjects();return false}
+  if(!healthSubjectLoaded){const unsaved=$('healthMemoryText')?.value.trim()||$('voiceTextInput')?.value.trim();healthSubjectLoaded=true;if(unsaved&&actual!==activeHealthSubjectId){markHealthSubjectChanged();renderHealthSubjects();return false}activeHealthSubjectId=observed||actual;if(activeHealthSubjectId!==actual){markHealthSubjectChanged();renderHealthSubjects();return false}}
+  renderHealthSubjects();return true;
+}
+function healthMemoryFormEntry(){
+  const confirmed=$('healthMemoryConfirmed')?.checked===true,temporal=$('healthMemoryTemporalStatus')?.value||'uncertain';
+  return {category:$('healthMemoryCategory')?.value||'conditions',text:$('healthMemoryText')?.value||'',temporal_status:temporal,source_kind:$('healthMemorySourceKind')?.value||'self_statement',occurred_on:$('healthMemoryOccurredOn')?.value||null,confirmation_status:confirmed?'confirmed':'unconfirmed',confirmed_by:$('healthMemoryConfirmedBy')?.value||'self',remember:$('healthMemoryRemember')?.checked===true&&confirmed&&['current','historical'].includes(temporal)};
+}
+function updateHealthMemoryRememberEligibility(){
+  const remember=$('healthMemoryRemember');if(!remember)return;
+  const allowed=$('healthMemoryConfirmed')?.checked===true&&['current','historical'].includes($('healthMemoryTemporalStatus')?.value);
+  remember.disabled=healthMemoryBusy||!allowed;if(!allowed)remember.checked=false;
+}
+function resetHealthMemoryForm(){
+  healthMemoryEditingId=null;
+  const defaults={healthMemoryCategory:'conditions',healthMemoryText:'',healthMemoryTemporalStatus:'uncertain',healthMemorySourceKind:'self_statement',healthMemoryOccurredOn:'',healthMemoryConfirmedBy:'self'};
+  for(const [id,value] of Object.entries(defaults))if($(id))$(id).value=value;
+  for(const id of ['healthMemoryConfirmed','healthMemoryRemember'])if($(id))$(id).checked=false;
+  if($('healthMemoryFormTitle'))$('healthMemoryFormTitle').textContent='添加一项健康背景';
+  if($('saveHealthMemoryBtn'))$('saveHealthMemoryBtn').textContent='保存这一项';
+  updateHealthMemoryRememberEligibility();
+}
+function healthMemoryStatus(message,tone=''){
+  const status=$('healthMemoryStatus');if(status){status.textContent=message;status.className='status align-left'+(tone?' '+tone:'')}
+}
+function setHealthMemoryBusy(busy){
+  healthMemoryBusy=busy;
+  for(const id of ['saveHealthMemoryBtn','cancelHealthMemoryEditBtn','addHealthSubjectBtn','healthSubjectSelect'])if($(id))$(id).disabled=busy||healthSubjectSwitchBusy||healthSubjectChanged&&['saveHealthMemoryBtn','addHealthSubjectBtn'].includes(id);
+  if($('reselectHealthSubjectBtn'))$('reselectHealthSubjectBtn').disabled=busy||healthSubjectSwitchBusy;
+  $('healthMemoryList')?.querySelectorAll('button').forEach(button=>button.disabled=busy||healthSubjectSwitchBusy||healthSubjectChanged||button.dataset.memoryIneligible==='true');
+  updateHealthMemoryRememberEligibility();
+}
+function renderHealthMemory(){
+  const list=$('healthMemoryList');if(!list)return;
+  if(!healthMemoryEntries.length){list.innerHTML=`<p class="muted">${escapeHtml(healthSubjectLabel())}还没有保存健康背景；可以先空着。</p>`;return}
+  list.innerHTML=healthMemoryEntries.map(entry=>{
+    const id=escapeHtml(entry.context_id),confirmed=entry.confirmation_status==='confirmed',eligible=confirmed&&['current','historical'].includes(entry.temporal_status),temporal=HEALTH_MEMORY_TEMPORAL_LABELS[entry.temporal_status]||'时间状态未核对';
+    const category=entry.category==='medications'?'药物使用记录':HEALTH_CONTEXT_CATEGORY_LABELS[entry.category]||'健康背景';
+    const recorded=entry.recorded_at?dateText(entry.recorded_at):'未知',updated=entry.updated_at?dateText(entry.updated_at):'未知',confirmedAt=entry.confirmed_at?dateText(entry.confirmed_at):'未确认';
+    return `<article class="health-memory-item" data-health-memory-id="${id}"><div class="badges"><span class="badge">${escapeHtml(category)}</span><span class="badge${confirmed?'':' warn'}">${confirmed?'原文已核对':'尚未核对'}</span><span class="badge">${escapeHtml(temporal)}</span>${entry.remember?'<span class="badge">以后对话记住</span>':''}</div><p class="health-memory-text">${escapeHtml(entry.text||'')}</p><dl class="health-memory-provenance"><div><dt>所属人</dt><dd>${escapeHtml(healthSubjectLabel(entry.subject_id||activeHealthSubjectId))}</dd></div><div><dt>原文来源</dt><dd>${escapeHtml(HEALTH_MEMORY_SOURCE_LABELS[entry.source_kind]||'来源未核对')}</dd></div><div><dt>记录时间</dt><dd>${escapeHtml(recorded)}</dd></div><div><dt>更新时间</dt><dd>${escapeHtml(updated)}</dd></div><div><dt>情况日期</dt><dd>${escapeHtml(entry.occurred_on||'未填写')}</dd></div><div><dt>核对人 / 时间</dt><dd>${confirmed?escapeHtml((entry.confirmed_by==='family'?'家属':'本人')+' / '+confirmedAt):'未确认'}</dd></div></dl><div class="health-memory-actions"><button class="outline" type="button" data-health-memory-edit="${id}">更正</button><button class="outline" type="button" data-health-memory-remember="${id}"${eligible?'':' disabled data-memory-ineligible="true"'}>${entry.remember?'停止自动记住':'以后记住'}</button><button class="outline" type="button" data-health-memory-revoke="${id}"${confirmed?'':' disabled data-memory-ineligible="true"'}>取消记忆与确认</button><button class="danger-button" type="button" data-health-memory-delete="${id}">删除</button></div></article>`;
+  }).join('');
+  list.querySelectorAll('[data-health-memory-edit]').forEach(button=>button.onclick=()=>editHealthMemoryEntry(button.dataset.healthMemoryEdit));
+  for(const action of ['remember','revoke','delete'])list.querySelectorAll(`[data-health-memory-${action}]`).forEach(button=>button.onclick=()=>void mutateHealthMemoryEntry(button.dataset[`healthMemory${action[0].toUpperCase()+action.slice(1)}`],action));
+  setHealthMemoryBusy(healthMemoryBusy);
+}
+async function loadHealthMemory({preserveStatus=false}={}){
+  if(!localMode||!$('healthMemoryList'))return false;
+  if(!preserveStatus)healthMemoryStatus('正在读取本机长期记忆…');
+  if(!await loadHealthSubjects())return false;
+  const epoch=healthSubjectUiEpoch,x=await api('/api/health-memory');if(epoch!==healthSubjectUiEpoch)return false;
+  if(!x.r.ok){healthMemoryStatus('长期记忆暂时无法读取；输入和原有资料不会删除。','error');return false}
+  if(x.j.health_context?.subject_id&&x.j.health_context.subject_id!==activeHealthSubjectId){healthMemoryStatus('所属人已变化，请重新读取资料。','error');return false}
+  healthMemoryEntries=Array.isArray(x.j.health_context?.entries)?x.j.health_context.entries:[];healthMemoryVersion=x.j.health_context?.version;
+  renderHealthMemory();await loadHealthContext();
+  if(!preserveStatus)healthMemoryStatus(`当前为${healthSubjectLabel()}保存 ${healthMemoryEntries.length} 项背景，${healthMemoryEntries.filter(entry=>entry.remember).length} 项将在新对话沿用。`);
+  return true;
+}
+function editHealthMemoryEntry(contextId){
+  if(healthMemoryBusy)return false;
+  const entry=healthMemoryEntries.find(item=>item.context_id===contextId);if(!entry)return false;
+  healthMemoryEditingId=contextId;
+  const values={healthMemoryCategory:entry.category,healthMemoryText:entry.text,healthMemoryTemporalStatus:entry.temporal_status||'uncertain',healthMemorySourceKind:entry.source_kind||'self_statement',healthMemoryOccurredOn:entry.occurred_on||'',healthMemoryConfirmedBy:entry.confirmed_by||'self'};
+  for(const [id,value] of Object.entries(values))if($(id))$(id).value=value;
+  // A correction needs a fresh, explicit confirmation of the changed wording.
+  if($('healthMemoryConfirmed'))$('healthMemoryConfirmed').checked=false;if($('healthMemoryRemember'))$('healthMemoryRemember').checked=false;
+  if($('healthMemoryFormTitle'))$('healthMemoryFormTitle').textContent='更正这项健康背景';if($('saveHealthMemoryBtn'))$('saveHealthMemoryBtn').textContent='保存更正';
+  updateHealthMemoryRememberEligibility();$('healthMemoryText')?.focus?.();return true;
+}
+function healthMemoryFailureMessage(error){
+  if(error==='subject_changed'||error==='subject_mismatch')return '另一页面已切换所属人；这次没有保存，输入仍保留。请重新选择当前所属人后再继续。';
+  if(error==='stale_health_memory'||error==='stale_health_subjects')return '资料已在另一页面更新，已重新读取；你正在填写的内容仍保留，请核对后重试。';
+  if(error==='health_memory_remember_limit')return '保存没有完成：最多记住 5 项，请先取消一项自动记忆。输入仍保留。';
+  if(error==='health_memory_remember_invalid')return '只有已核对且时间状态明确的资料才能记住。输入仍保留。';
+  if(error==='local_operations_busy')return '还有记录正在保存或识别，请等完成后重试。';
+  return '保存没有完成；请检查原文、日期和状态，输入仍保留，可以重试。';
+}
+async function refreshConversationAfterHealthMemoryChange(){
+  clearRecordPanels();closeConversationReport();contextPickerRequestId++;healthContextEntries=[];contextDraftSelection.clear();closeHealthContextPicker();
+  if(activeConversation?.conversation_id){
+    const id=activeConversation.conversation_id,epoch=healthSubjectUiEpoch;
+    // Remove cached analysis immediately, then fetch the store's rebuilt report.
+    activeConversation=null;renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(false);
+    const x=await api(`/api/conversations/${encodeURIComponent(id)}`);if(epoch!==healthSubjectUiEpoch)return;
+    if(x.r.ok&&x.j.conversation)syncConversation(x.j.conversation,{speak:false});else{renderVoiceConversation();setVoiceStatus('背景已更新；当前对话暂时无法读取，请重新进入。','error')}
+  }
+  await loadEvents();
+}
+async function saveHealthMemory(event){
+  event?.preventDefault();if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const entry=healthMemoryFormEntry();if(!entry.text.trim()){healthMemoryStatus('请先填写要保留的原文。','error');$('healthMemoryText')?.focus?.();return false}
+  if(entry.occurred_on&&entry.occurred_on>new Date().toISOString().slice(0,10)){healthMemoryStatus('情况日期不能晚于今天；输入仍保留，请更正日期。','error');$('healthMemoryOccurredOn')?.focus?.();return false}
+  const editingId=healthMemoryEditingId,epoch=healthSubjectUiEpoch;
+  setHealthMemoryBusy(true);healthMemoryStatus('正在加密保存这一项…');
+  try{
+    const path=editingId?`/api/health-memory/${encodeURIComponent(editingId)}`:'/api/health-memory';
+    const x=await api(path,{method:editingId?'PATCH':'POST',body:JSON.stringify({subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion,expected_version:healthMemoryVersion,entry})});if(epoch!==healthSubjectUiEpoch)return false;
+    if(!x.r.ok){if(['subject_changed','subject_mismatch'].includes(x.j.error)){markHealthSubjectChanged();await loadHealthSubjects()}else if(x.r.status===409)await loadHealthMemory({preserveStatus:true});healthMemoryStatus(healthMemoryFailureMessage(x.j.error),'error');return false}
+    resetHealthMemoryForm();await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange();healthMemoryStatus('已保存；新对话按最新记忆使用，当前报告也已更新。');return true;
+  }catch{healthMemoryStatus('保存没有完成；输入仍保留，可以重试。','error');return false}
+  finally{setHealthMemoryBusy(false)}
+}
+async function mutateHealthMemoryEntry(contextId,action){
+  if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const entry=healthMemoryEntries.find(item=>item.context_id===contextId);if(!entry)return false;
+  if(action==='delete'&&!confirm('删除这项长期背景？以后新对话不会再使用它；既有原始对话仍保留。'))return false;
+  const epoch=healthSubjectUiEpoch,changes=action==='revoke'?{confirmation_status:'unconfirmed',remember:false}:{remember:!entry.remember};
+  const updated={category:entry.category,text:entry.text,temporal_status:entry.temporal_status||'uncertain',source_kind:entry.source_kind||'self_statement',occurred_on:entry.occurred_on||null,confirmed_by:entry.confirmed_by||'self',confirmation_status:entry.confirmation_status,remember:entry.remember,...changes};
+  setHealthMemoryBusy(true);
+  try{
+    const x=await api(`/api/health-memory/${encodeURIComponent(contextId)}`,{method:action==='delete'?'DELETE':'PATCH',body:JSON.stringify({subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion,expected_version:healthMemoryVersion,...(action==='delete'?{}:{entry:updated})})});if(epoch!==healthSubjectUiEpoch)return false;
+    if(!x.r.ok){if(['subject_changed','subject_mismatch'].includes(x.j.error)){markHealthSubjectChanged();await loadHealthSubjects()}else if(x.r.status===409)await loadHealthMemory({preserveStatus:true});healthMemoryStatus(healthMemoryFailureMessage(x.j.error),'error');return false}
+    if(action==='delete'&&healthMemoryEditingId===contextId)resetHealthMemoryForm();
+    await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange();healthMemoryStatus(action==='delete'?'已删除；以后新对话不再使用这项背景。':action==='revoke'?'已取消确认和记忆；这项背景不会发送给联网 AI。':updated.remember?'以后新对话会带上这项已确认背景。':'已停止自动记住；之后仍可在对话中手动选择。');return true;
+  }catch{healthMemoryStatus('操作没有完成；原有资料和填写内容仍保留，请重试。','error');return false}
+  finally{setHealthMemoryBusy(false)}
+}
+function clearHealthSubjectDisplays(){
+  healthSubjectUiEpoch++;detailRequestSerial++;contextPickerRequestId++;voicePermissionGeneration++;
+  activeConversation=null;current=null;events=[];conversations=[];conversationEditingTurnId=null;pendingConversationTurn=null;pendingMediaRetry=null;lastSpokenTurnId=null;
+  healthMemoryEntries=[];healthMemoryVersion=0;healthContextEntries=[];contextDraftSelection.clear();handoffSelection.clear();knownHandoffEvents.clear();
+  globalThis.speechSynthesis?.cancel?.();closeConversationReport();closeHealthContextPicker();clearRecordPanels();
+  if(typeof releaseOriginalsIn==='function')for(const id of ['archivePhotos','photoPreview','voiceConversationTurns'])releaseOriginalsIn($(id));
+  if(typeof mediaItems!=='undefined')mediaItems=[];if(typeof selectedPhoto!=='undefined')selectedPhoto=null;if(typeof pendingRecordingBlob!=='undefined')pendingRecordingBlob=null;
+  for(const id of ['archivePhotos','photoPreview','homeRecent','eventsList','archiveEvents'])if($(id))$(id).innerHTML='';
+  for(const id of ['voiceTextInput','photoInput','audioUploadInput'])if($(id))$(id).value='';
+  $('savePhotoBtn')?.classList.add('hidden');$('photoPreview')?.classList.add('hidden');$('conversationResumeChoice')?.classList.add('hidden');
+  resetHealthMemoryForm();renderVoiceConversation();renderConversationReport();updateHealthContextButton();setVoiceComposerEnabled(false);
+}
+async function activateHealthSubject(subjectId){
+  if(subjectId===activeHealthSubjectId&&!healthSubjectChanged)return true;
+  const reselectSame=subjectId===activeHealthSubjectId&&healthSubjectChanged;
+  const status=$('healthSubjectStatus'),select=$('healthSubjectSelect');
+  const busy=healthMemoryBusy||saveBusy||conversationLoading||mediaRecorder?.state==='recording'||voicePermissionPending||voiceUploadPending||typeof uploadBusy!=='undefined'&&uploadBusy||typeof recognitionBusy!=='undefined'&&recognitionBusy.size;
+  if(busy){if(select)select.value=activeHealthSubjectId;if(status)status.textContent='请等当前保存、录音或识别完成，再切换所属人。';return false}
+  if(!reselectSame&&($('voiceTextInput')?.value.trim()||$('healthMemoryText')?.value.trim()||typeof selectedPhoto!=='undefined'&&selectedPhoto)){if(select)select.value=activeHealthSubjectId;if(status)status.textContent='还有未保存的输入；请先保存或清空，再切换所属人。';return false}
+  const preservedDraft=reselectSame?{editingId:healthMemoryEditingId,fields:HEALTH_MEMORY_FORM_FIELDS.map(id=>({id,value:$(id)?.value,checked:$(id)?.checked})),legacyFields:typeof HEALTH_CONTEXT_FIELDS!=='undefined'?Object.values(HEALTH_CONTEXT_FIELDS).map(id=>({id,value:$(id)?.value})):[],voiceText:$('voiceTextInput')?.value||''}:null;
+  healthSubjectSwitchBusy=true;setHealthMemoryBusy(true);setVoiceComposerEnabled(false);
+  try{
+    await pauseConversation();
+    const x=await api('/api/health-subjects/active',{method:'POST',body:JSON.stringify({subject_id:subjectId,expected_version:healthSubjectsVersion})});
+    if(!x.r.ok){if(select)select.value=activeHealthSubjectId;if(x.r.status===409)await loadHealthSubjects();if(status)status.textContent=healthMemoryFailureMessage(x.j.error);return false}
+    clearHealthSubjectDisplays();activeHealthSubjectId=x.j.active_subject_id||subjectId;healthSubjectsVersion=x.j.version||healthSubjectsVersion;healthSubjectLoaded=true;clearHealthSubjectChangedNotice();
+    if(preservedDraft){healthMemoryEditingId=preservedDraft.editingId;for(const field of preservedDraft.fields){const input=$(field.id);if(input){input.value=field.value;input.checked=field.checked}}if($('voiceTextInput'))$('voiceTextInput').value=preservedDraft.voiceText;if(healthMemoryEditingId){$('healthMemoryFormTitle').textContent='更正这项健康背景';$('saveHealthMemoryBtn').textContent='保存更正'}updateHealthMemoryRememberEligibility()}
+    await loadHealthMemory();if(preservedDraft)for(const field of preservedDraft.legacyFields)if($(field.id))$(field.id).value=field.value;await loadEvents();if(typeof loadMedia==='function')await loadMedia();updateHealthSubjectLabels();if(status)status.textContent=reselectSame?`已重新选择${healthSubjectLabel()}；未保存的输入仍保留，可以继续核对。`:`已切换为${healthSubjectLabel()}；下一段对话将单独记录。`;return true;
+  }finally{healthSubjectSwitchBusy=false;setHealthMemoryBusy(false);if(activeConversation)setVoiceComposerEnabled(true)}
+}
+async function createHealthSubject(){
+  if(healthMemoryBusy||healthSubjectSwitchBusy)return false;
+  if(healthSubjectChanged){markHealthSubjectChanged();return false}
+  const input=$('newHealthSubjectLabel'),status=$('healthSubjectStatus'),label=input?.value.trim();if(!label){if(status)status.textContent='请填写一个家属称呼，不需要身份证号或其他详细资料。';input?.focus?.();return false}
+  setHealthMemoryBusy(true);
+  try{
+    const x=await api('/api/health-subjects',{method:'POST',body:JSON.stringify({label,relationship:'family',expected_version:healthSubjectsVersion})});
+    if(!x.r.ok){if(x.r.status===409)await loadHealthSubjects();if(status)status.textContent=healthMemoryFailureMessage(x.j.error);return false}
+    input.value='';await loadHealthSubjects();if(status)status.textContent='家属称呼已保存；请在上方选择后为其记录。';return true;
+  }finally{setHealthMemoryBusy(false)}
+}
 async function loadHealthContext(){
   if(!localMode||!$('healthContextStatus'))return;
   const controls=[...Object.values(HEALTH_CONTEXT_FIELDS).map(id=>$(id)),$('saveHealthContextBtn')].filter(Boolean);
@@ -940,24 +1143,35 @@ async function loadHealthContext(){
     if(!x.r.ok){status.textContent='健康背景暂时无法读取，原有内容不会删除。';return}
     const entries=x.j.health_context?.entries||[];
     for(const [category,id] of Object.entries(HEALTH_CONTEXT_FIELDS)){const input=$(id);if(input)input.value=entries.filter(item=>item.category===category).map(item=>item.text).join('\n')}
-    status.textContent=entries.length?`已在本机保存 ${entries.length} 项确认背景。不会自动发送；请在每段对话中自行选择。`:'还没有保存健康背景；可以先空着。';
-  }finally{controls.forEach(control=>control.disabled=false);}
+    status.textContent=entries.length?`有 ${entries.length} 项背景可在对话中手动选择。日期和长期记忆请在上方逐项管理。`:'还没有可手动选择的健康背景；可以先空着。';
+  }finally{const protectedEntries=typeof healthMemoryEntries!=='undefined'&&healthMemoryEntries.some(entry=>entry.legacy_entry!==true);controls.forEach(control=>control.disabled=protectedEntries);if(protectedEntries)status.textContent='已启用逐项管理；请在上方更正资料，原有入口停止整体替换。';}
 }
 async function saveHealthContext(){
   const button=$('saveHealthContextBtn'),status=$('healthContextStatus');if(!button||!status)return;
+  if(typeof healthSubjectChanged!=='undefined'&&healthSubjectChanged){if(typeof markHealthSubjectChanged==='function')markHealthSubjectChanged();status.textContent='另一页面已切换所属人；输入仍保留，请重新选择后再保存。';return false}
+  if(typeof healthMemoryEntries!=='undefined'&&healthMemoryEntries.some(entry=>entry.legacy_entry!==true)){status.textContent='请在上方逐项更正资料，避免整体替换丢失长期记忆。';return false}
   const fields=Object.fromEntries(Object.entries(HEALTH_CONTEXT_FIELDS).map(([category,id])=>[category,$(id)?.value||'']));
   button.disabled=true;button.textContent='保存中…';status.textContent='正在加密保存在本机…';
-  const x=await api('/api/health-context',{method:'POST',body:JSON.stringify({fields})});
+  const x=await api('/api/health-context',{method:'POST',body:JSON.stringify({fields,...(typeof activeHealthSubjectId!=='undefined'?{subject_id:activeHealthSubjectId,expected_subject_version:healthSubjectsVersion}:{})})});
   button.disabled=false;button.textContent='保存健康背景';
   const error=x.j?.error;
-  status.textContent=x.r.ok?`已加密保存在本机，共 ${x.j.health_context?.entries?.length||0} 项。不会自动发送；每段对话可单独选择。`:error==='health_context_too_many'?'保存没有完成：每类最多 12 项，总共最多 30 项；每项最多 500 字。输入仍保留，请删减后重试。':error==='health_context_text_too_long'?'保存没有完成：每项最多 500 字。输入仍保留，请缩短后重试。':'保存没有完成，输入仍保留，可以重试。';
+  if(['subject_changed','subject_mismatch'].includes(error)&&typeof markHealthSubjectChanged==='function'){markHealthSubjectChanged();await loadHealthSubjects()}
+  status.textContent=x.r.ok?`已加密保存在本机，共 ${x.j.health_context?.entries?.length||0} 项。不会自动发送；每段对话可单独选择。`:['subject_changed','subject_mismatch'].includes(error)?'另一页面已切换所属人；这次没有保存，输入仍保留，请重新选择后继续。':error==='health_context_requires_memory_editor'?'已有逐项管理资料；请使用上方更正入口。输入仍保留。':error==='health_context_too_many'?'保存没有完成：每类最多 12 项，总共最多 30 项；每项最多 500 字。输入仍保留，请删减后重试。':error==='health_context_text_too_long'?'保存没有完成：每项最多 500 字。输入仍保留，请缩短后重试。':'保存没有完成，输入仍保留，可以重试。';
+  if(x.r.ok&&$('healthMemoryList')){await loadHealthMemory({preserveStatus:true});await refreshConversationAfterHealthMemoryChange()}
 }
-async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);status.textContent='恢复完成，正在重新读取记录。';await loadEvents();return true}catch(error){status.textContent=['local_operations_busy','vault_restore_in_progress'].includes(error.message)?'还有记录正在保存、回复或识别，请等完成后再恢复。当前资料未被替换。':['vault_changed_requires_unlock','vault_locked'].includes(error.message)?'这份资料库已在其他页面恢复，请刷新并重新解锁后再操作。':'备份无法验证或已损坏，当前数据未被覆盖。';return false}}
+async function restoreEncryptedBackup(file,status){const passphrase=prompt('输入这份备份的恢复口令。口令只在当前设备验证，不会上传。');if(!passphrase){status.textContent='已取消恢复，当前数据未改变。';return false}try{const preview=await HealthLocal.previewBackup(file,passphrase);if(!confirm(`备份中有 ${preview.eventCount} 条记录、${preview.mediaCount} 份原件，导出时间 ${preview.exportedAt||'未知'}。恢复将替换当前设备的数据，是否继续？`)){status.textContent='已取消，当前数据未改变。';return false}await HealthLocal.restoreBackup(preview,passphrase);if(typeof clearHealthSubjectDisplays==='function')clearHealthSubjectDisplays();status.textContent='恢复完成，正在重新读取记录。';if(typeof loadHealthMemory==='function')await loadHealthMemory();await loadEvents();return true}catch(error){status.textContent=['local_operations_busy','vault_restore_in_progress'].includes(error.message)?'还有记录正在保存、回复或识别，请等完成后再恢复。当前资料未被替换。':['vault_changed_requires_unlock','vault_locked'].includes(error.message)?'这份资料库已在其他页面恢复，请刷新并重新解锁后再操作。':'备份无法验证或已损坏，当前数据未被覆盖。';return false}}
 if($('downloadBackupBtn'))$('downloadBackupBtn').onclick=async()=>{const s=$('backupStatus');try{await HealthLocal.downloadBackup();s.textContent='加密备份已生成，请确认浏览器的下载位置。'}catch{s.textContent='备份生成失败，本机数据未改变。'}};
 if($('restoreBackupInput'))$('restoreBackupInput').onchange=async e=>{const file=e.target.files?.[0],s=$('backupStatus');e.target.value='';if(file)await restoreEncryptedBackup(file,s)};
 if($('lockVaultBtn'))$('lockVaultBtn').onclick=()=>{HealthLocal.lock();location.reload()};
 if($('saveFeedbackBtn'))$('saveFeedbackBtn').onclick=async()=>{const text=$('feedbackText').value,s=$('feedbackStatus');try{await HealthLocal.saveFeedback(text,document.querySelector('.view.active')?.id);$('feedbackText').value='';s.textContent='内测问题已加密保存在本机，未附带健康原文。'}catch{s.textContent='请先写下问题描述（不要粘贴密钥）。'}};
 if($('saveHealthContextBtn'))$('saveHealthContextBtn').onclick=saveHealthContext;
+if($('healthMemoryForm'))$('healthMemoryForm').onsubmit=saveHealthMemory;
+if($('cancelHealthMemoryEditBtn'))$('cancelHealthMemoryEditBtn').onclick=resetHealthMemoryForm;
+for(const id of ['healthMemoryConfirmed','healthMemoryTemporalStatus'])if($(id))$(id).onchange=updateHealthMemoryRememberEligibility;
+if($('healthSubjectSelect'))$('healthSubjectSelect').onchange=event=>void activateHealthSubject(event.target.value);
+if($('addHealthSubjectBtn'))$('addHealthSubjectBtn').onclick=createHealthSubject;
+if($('reselectHealthSubjectBtn'))$('reselectHealthSubjectBtn').onclick=async()=>{await loadHealthSubjects();await activateHealthSubject(activeHealthSubjectId)};
+if($('healthMemoryOccurredOn'))$('healthMemoryOccurredOn').max=new Date().toISOString().slice(0,10);
 const today=$('todayLabel');if(today)today.textContent=new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
-health().then(loadEvents);
+health().then(async()=>{if(localMode)await loadHealthSubjects();await loadEvents()});
 if(typeof navigator!=='undefined'&&'serviceWorker'in navigator&&['https:','http:'].includes(location.protocol))navigator.serviceWorker.register('/service-worker.js?build=report-conversion-20261009-1',{updateViaCache:'none'}).then(registration=>registration.update()).catch(()=>{});

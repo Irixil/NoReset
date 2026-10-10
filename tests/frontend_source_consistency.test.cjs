@@ -184,13 +184,13 @@ test('recognition linking and archive deletion/correction do not invert event an
   await h.api.vault.put(`media:${media.media_id}`, media);
   await h.api.vault.putBinary(`media-binary:${media.media_id}`, new Uint8Array([1, 2, 3]).buffer);
   h.responses.set('/api/ai/media/recognize', { recognition: { text: '纯虚构：昨天左膝酸痛', is_mock: false } });
-  const entered = deferred(), release = deferred(), put = h.api.vault.put.bind(h.api.vault);
+  const entered = deferred(), release = deferred(), mutate = h.api.vault.mutate.bind(h.api.vault);
   let blocked = false;
-  h.api.vault.put = async (key, value) => {
-    if (!blocked && key === `media:${media.media_id}` && value.recognition_status === 'succeeded') {
+  h.api.vault.mutate = async operation => {
+    if (!blocked && operation.puts?.some(row => row.key === `media:${media.media_id}` && row.value?.recognition_status === 'succeeded')) {
       blocked = true; entered.resolve(); await release.promise;
     }
-    return put(key, value);
+    return mutate(operation);
   };
   const started = await h.request(`/api/media/${media.media_id}/recognize`, {});
   assert.equal(started.r.status, 202);
@@ -218,5 +218,5 @@ test('recognition linking and archive deletion/correction do not invert event an
     assert.ok(h.calls.some(call => call.path === '/api/ai/conversation-turn'));
     assert.ok(h.calls.filter(call => call.path === '/api/ai/conversation-turn').every(call => !call.body.includes('source_conversation_id')),
       'the local ownership marker is not included in cloud model payloads');
-  } finally { release.resolve(); h.api.vault.put = put; }
+  } finally { release.resolve(); h.api.vault.mutate = mutate; }
 });

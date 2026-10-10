@@ -13,9 +13,14 @@ import base64
 import io
 import ipaddress
 import json
+import contextvars
+import os
 import re
 import socket
 import sqlite3
+import stat
+import uuid
+from contextlib import contextmanager
 import wave
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
@@ -36,6 +41,9 @@ SCHEMA_RISK_SEQUENCE = 'noreset-synthetic-trial-informed-risk-v2'
 RISK_SCHEMAS = {SCHEMA_RISK, SCHEMA_RISK_SEQUENCE}
 APPEND_SCHEMAS = {SCHEMA_V3, *RISK_SCHEMAS}
 USD_UNITS = Decimal('1000000000')  # Integer nano-USD, never a float ledger.
+STANDALONE_SCHEMA = 'noreset-standalone-cumulative-root-v1'
+STANDALONE_SQL = 'CREATE TABLE standalone_root (record_json TEXT NOT NULL)'
+_STANDALONE_SCOPE = contextvars.ContextVar('noreset_standalone_scope', default=None)
 
 
 class TrialGateError(RuntimeError):
@@ -275,6 +283,293 @@ def initialize_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
         raise TrialGateError() from None
 
 
+def _root_file(value, limit=262144):
+    path = Path(value)
+    if (not path.is_absolute() or path != path.resolve() or path.is_symlink()
+            or not path.is_relative_to(ROOT.resolve()) or any(part.startswith('.') for part in path.relative_to(ROOT).parts)):
+        _deny()
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= limit:
+        _deny()
+    raw = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        _deny()
+    return raw
+
+
+def _canonical_state_path(value):
+    # Preserve caller spelling before SQLite resolves symlinks. A new native
+    # identity may only be entered through its canonical registered path.
+    path = Path(value)
+    if not path.is_absolute() or path != path.resolve() or path.is_symlink():
+        _deny()
+    return path
+
+
+def _standalone_manifest(path, digest, receipt, receipt_digest):
+    raw = _root_file(path)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        _deny()
+    doc = json.loads(raw, object_pairs_hook=_unique_object)
+    fields = {'schema_version', 'status', 'authorization_source', 'approval_ref', 'synthetic_only',
+              'purpose', 'contract_sha256', 'receipt_path', 'receipt_sha256', 'state_path',
+              'cumulative_budget', 'budget_baseline', 'candidate_source_sha256', 'historical_reference',
+              'request_pairs'}
+    if (not isinstance(doc, dict) or set(doc) != fields or doc['schema_version'] != STANDALONE_SCHEMA
+            or doc['status'] != 'approved' or doc['authorization_source'] != 'explicit_owner_approval'
+            or doc['approval_ref'] != receipt['approval_ref'] or doc['synthetic_only'] is not True
+            or doc['purpose'] != 'long_term_health_memory' or not HASH.fullmatch(str(doc['contract_sha256']))
+            or doc['receipt_sha256'] != receipt_digest or doc['cumulative_budget'] != receipt.get('cumulative_budget')
+            or receipt['schema_version'] != SCHEMA_RISK_SEQUENCE or set(receipt['profiles']) != {'llm'}
+            or receipt['request_sequence'] not in (['llm'], ['llm', 'llm'])
+            or receipt['total_requests'] != len(receipt['request_sequence'])
+            or receipt['previous_receipt_sha256'] != receipt['cumulative_budget']['authorization_sha256']):
+        _deny()
+    if hashlib.sha256(_root_file(doc['receipt_path'], 65536)).hexdigest() != receipt_digest:
+        _deny()
+    source_map = doc['candidate_source_sha256']
+    if not isinstance(source_map, dict) or not source_map or len(source_map) > 256:
+        _deny()
+    for name, expected in source_map.items():
+        if (not isinstance(name, str) or Path(name).is_absolute() or '..' in Path(name).parts
+                or name.split('/')[0] in {'runtime', '.env', '.git', '.dz'} or not HASH.fullmatch(str(expected))):
+            _deny()
+        if hashlib.sha256(_root_file(str(ROOT / name), 10 * 1024 * 1024)).hexdigest() != expected:
+            _deny()
+    # This proof seals old native history by reference. Its actual ledger is
+    # only stat'ed; neither its contents nor its integrity are re-certified.
+    historical = doc['historical_reference']
+    if (not isinstance(historical, dict) or set(historical) != {'audit_path', 'audit_sha256', 'reference_only'}
+            or historical['reference_only'] is not True):
+        _deny()
+    audit_raw = _root_file(historical['audit_path'], 2 * 1024 * 1024)
+    if hashlib.sha256(audit_raw).hexdigest() != historical['audit_sha256']:
+        _deny()
+    audit = json.loads(audit_raw, object_pairs_hook=_unique_object)
+    native, baseline = audit['current_native'], doc['budget_baseline']
+    native_path = Path(native['ledger_path'])
+    if (not native_path.is_absolute() or native_path != native_path.resolve()
+            or not native_path.is_relative_to(ROOT) or native_path.is_symlink()):
+        _deny()
+    native_stat = native_path.stat()
+    if ({'bytes': native_stat.st_size, 'mtime_ns': native_stat.st_mtime_ns,
+         'inode': native_stat.st_ino, 'device': native_stat.st_dev} != native['ledger_stat']
+            or native_stat.st_nlink != 1 or not stat.S_ISREG(native_stat.st_mode)
+            or any(Path(str(native_path)+suffix).exists() for suffix in ('-wal', '-shm', '-journal'))
+            or native['closed_reason'] not in {'owner_stop', 'business_validation_failed', 'transport_failed',
+                                              'response_invalid', 'usage_unverified_or_over_bound'}
+            or hashlib.sha256(_root_file(native['receipt_path'], 65536)).hexdigest() != native['receipt_sha256']
+            or audit['cumulative_budget']['same_original_descriptor'] != receipt['cumulative_budget']
+            or _decimal(audit['cumulative_budget']['planning_hold_usd']) * USD_UNITS != baseline['reserved_units']
+            or audit['actual_counts']['budget_batch_records'] != baseline['batch_count']
+            or audit['actual_counts']['originalUSD1_allocation_attempts'] != baseline['allocation_count']
+            or audit['actual_counts']['all_budget_batches_closed'] is not True):
+        _deny()
+    old_tuples = {(r['kind'], r['source_sha256'], r['request_sha256'])
+                  for r in native['full_row_projections']['attempts']}
+    pairs = doc['request_pairs']
+    profile = receipt['profiles']['llm']
+    if (not isinstance(pairs, list) or len(pairs) != len(receipt['request_sequence'])
+            or len(profile['source_sha256']) != len(pairs) or len(profile['request_sha256']) != len(pairs)):
+        _deny()
+    for index, pair in enumerate(pairs):
+        if not isinstance(pair, dict) or set(pair) != {'model_payload_path', 'model_payload_sha256', 'source_sha256',
+                                                      'wire_path', 'request_sha256'}:
+            _deny()
+        payload_raw, wire = _root_file(pair['model_payload_path'], 65536), _root_file(pair['wire_path'], 24000)
+        payload = json.loads(payload_raw, object_pairs_hook=_unique_object)
+        serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        if (hashlib.sha256(payload_raw).hexdigest() != pair['model_payload_sha256']
+                or hashlib.sha256(serialized.encode()).hexdigest() != pair['source_sha256']
+                or hashlib.sha256(wire).hexdigest() != pair['request_sha256']
+                or pair['source_sha256'] != profile['source_sha256'][index]
+                or pair['request_sha256'] != profile['request_sha256'][index]
+                or ('llm', pair['source_sha256'], pair['request_sha256']) in old_tuples):
+            _deny()
+        _wire_limits_v3('llm', wire, profile['max_output_tokens'], 0, profile['model'])
+        body = json.loads(wire, object_pairs_hook=_unique_object)
+        fields = {'turns', 'health_context', 'controller', 'approved_risk_rules'}
+        if (set(payload) not in (fields, fields | {'subject_id'})
+                or not isinstance(body.get('messages'), list) or len(body['messages']) != 2
+                or body['messages'][0].get('role') != 'system'
+                or body['messages'][1] != {'role': 'user', 'content': serialized}):
+            _deny()
+        from .conversation import SYSTEM_PROMPT, _clean_health_context, ConversationError
+        if 'subject_id' in payload:
+            try:
+                if _clean_health_context(payload) != payload['health_context']:
+                    _deny()
+            except ConversationError:
+                _deny()
+        if body['messages'][0] != {'role': 'system', 'content': SYSTEM_PROMPT}:
+            _deny()
+    return doc
+
+
+def _standalone_context(connection, receipt=None, *, strict=True):
+    """Canonical root identity and old budget rows guard every local action."""
+    from . import trial_budget
+    values = connection.execute('SELECT receipt_json,receipt_sha256,budget_sha256 FROM metadata').fetchall()
+    if len(values) != 1:
+        _deny()
+    stored, _ = _parse_receipt(values[0][0].encode(), historical=True)
+    digest = values[0][1]
+    receipt = receipt or stored
+    if 'cumulative_budget' not in stored:
+        if _table_exists(connection, 'standalone_root'):
+            _deny()
+        return None
+    binding = trial_budget.native_root_binding(stored['cumulative_budget'], receipt_id=stored['receipt_id'], required=False)
+    if binding is None:
+        if _table_exists(connection, 'standalone_root'):
+            _deny()
+        return None
+    if (connection.execute("SELECT sql FROM sqlite_master WHERE name='standalone_root'").fetchone() != (STANDALONE_SQL,)
+            or connection.execute('SELECT record_json FROM standalone_root').fetchall() != [(_snapshot(binding),)]
+            or receipt != stored or digest != binding['receipt_sha256'] or values[0][2] != _budget_digest(stored)):
+        _deny()
+    snapshot = _snapshot(stored)
+    if connection.execute('SELECT * FROM authorization_snapshots').fetchall() != [
+            (digest, stored['receipt_id'], None, snapshot, hashlib.sha256(snapshot.encode()).hexdigest())]:
+        _deny()
+    ids = [row[0] for row in connection.execute('SELECT id FROM attempts ORDER BY id')]
+    if (ids != list(range(1, len(ids)+1)) or connection.execute(
+            'SELECT attempt_id,receipt_sha256 FROM attempt_authorizations ORDER BY attempt_id').fetchall() !=
+            [(ident, digest) for ident in ids]):
+        _deny()
+    state = Path(connection.execute('PRAGMA database_list').fetchone()[2])
+    current = state.stat()
+    if (str(state) != binding['state_path'] or state != state.resolve() or state.is_symlink()
+            or current.st_dev != binding['state_device'] or current.st_ino != binding['state_inode']
+            or current.st_nlink != 1 or not stat.S_ISREG(current.st_mode)):
+        _deny()
+    doc = _standalone_manifest(binding['manifest_path'], binding['manifest_sha256'], stored, digest)
+    if (doc['state_path'] != str(state) or doc['budget_baseline'] != binding['budget_baseline']
+            or trial_budget.cumulative_row_seal(stored['cumulative_budget'], baseline=doc['budget_baseline']) != doc['budget_baseline']):
+        _deny()
+    scope = trial_budget.native_root_binding(stored['cumulative_budget'], receipt_id=stored['receipt_id'], include_scope=True)
+    if scope['receipt'] != stored:
+        _deny()
+    attempts = connection.execute('SELECT kind,source_sha256,request_sha256 FROM attempts ORDER BY id').fetchall()
+    allocations = scope['allocations']
+    if (len(allocations) > len(attempts) + (0 if strict else 1) or len(allocations) < len(attempts)
+            or [r[0] for r in allocations] != list(range(len(allocations)))
+            or [tuple(r[1:4]) for r in allocations[:len(attempts)]] != attempts
+            or len(allocations) > len(stored['request_sequence'])
+            or len(allocations) > len(attempts) and allocations[-1][5] is not None):
+        _deny()
+    profile = stored['profiles']['llm']
+    for slot, row in enumerate(allocations):
+        if (tuple(row[1:4]) != ('llm', profile['source_sha256'][slot], profile['request_sha256'][slot])
+                or row[4] != int(_decimal(profile['billing']['estimated_usd']) * USD_UNITS)):
+            _deny()
+        if slot >= len(attempts):
+            continue  # One cumulative-only orphan can be contained, never sent.
+        usage_row = connection.execute('SELECT id,usage_json FROM attempts ORDER BY id').fetchall()[slot]
+        usage = json.loads(usage_row[1]) if usage_row[1] is not None else None
+        observation = json.loads(row[5]) if row[5] is not None else None
+        if usage and usage.get('verified') is True:
+            metadata = (connection.execute('SELECT metadata_json FROM transport_metadata WHERE attempt_id=?',
+                                           (usage_row[0],)).fetchone()
+                        if _table_exists(connection, 'transport_metadata') else None)
+            expected = {key: usage[key] for key in ('returned_model', 'prompt_tokens', 'completion_tokens', 'reasoning_tokens')}
+            expected.update(response_sha256=json.loads(metadata[0]).get('response_sha256') if metadata else None,
+                            supplier_final_cost_usd=None, reservation_released=False)
+            if observation != expected and (strict or observation is not None):
+                _deny()
+        elif observation is not None:
+            _deny()
+    return binding
+
+
+def initialize_standalone_trial(*, receipt_path, state_path, manifest_path, manifest_sha256):
+    """Trusted finite root, original cumulative budget; old native is a reference.
+
+    No initial five-call authority or old native attempt totals are manufactured.
+    A failed setup remains sealed and cannot be reinitialized or refunded.
+    """
+    from . import trial_budget
+    created, registered, binding = False, False, None
+    target = Path(state_path)
+    try:
+        receipt_raw = _root_file(str(receipt_path), 65536)
+        receipt, digest = _parse_receipt(receipt_raw)
+        doc = _standalone_manifest(str(manifest_path), manifest_sha256, receipt, digest)
+        if (str(target) != doc['state_path'] or str(Path(receipt_path)) != doc['receipt_path']
+                or not target.is_absolute() or target != target.resolve() or target.exists()
+                or not target.is_relative_to(CONTINUATION_CLAIM_ROOT.resolve())):
+            _deny()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd); created = True
+        info = target.stat()
+        binding = {'schema_version': trial_budget.NATIVE_ROOT_SCHEMA, 'receipt_id': receipt['receipt_id'],
+            'root_id': hashlib.sha256(_snapshot({'budget': receipt['cumulative_budget']['authorization_sha256'],
+                                                'receipt_id': receipt['receipt_id']}).encode()).hexdigest(),
+            'manifest_path': str(manifest_path), 'manifest_sha256': manifest_sha256, 'receipt_sha256': digest,
+            'state_path': str(target), 'state_device': info.st_dev, 'state_inode': info.st_ino,
+            'state_identity': uuid.uuid4().hex, 'budget_baseline': doc['budget_baseline']}
+        with sqlite3.connect(target) as connection:
+            connection.execute('CREATE TABLE metadata (receipt_sha256 TEXT NOT NULL, budget_sha256 TEXT NOT NULL, receipt_json TEXT NOT NULL, frozen_reason TEXT)')
+            connection.execute('INSERT INTO metadata VALUES (?,?,?,?)',
+                (digest, _budget_digest(receipt), _snapshot(receipt), 'standalone_setup_pending'))
+            connection.execute('CREATE TABLE attempts (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, request_sha256 TEXT NOT NULL, source_sha256 TEXT NOT NULL, wire_bytes INTEGER NOT NULL, output_limit INTEGER NOT NULL, thinking_limit INTEGER NOT NULL, input_bound INTEGER NOT NULL, generated_bound INTEGER NOT NULL, reserved_nano_usd INTEGER NOT NULL, pricing_json TEXT NOT NULL, usage_json TEXT)')
+            _authority_tables(connection); _save_authority(connection, digest, receipt, None)
+            connection.execute(STANDALONE_SQL)
+            connection.execute('INSERT INTO standalone_root VALUES (?)', (_snapshot(binding),))
+        trial_budget.register_batch(receipt['cumulative_budget'], receipt=receipt,
+            expected_previous_seal=doc['budget_baseline'], native_binding=binding)
+        registered = True
+        with sqlite3.connect(target) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            _standalone_context(connection, receipt)
+            if connection.execute('UPDATE metadata SET frozen_reason=NULL WHERE receipt_sha256=? AND frozen_reason=?',
+                                  (digest, 'standalone_setup_pending')).rowcount != 1:
+                _deny()
+        result = validate_trial_authorization(receipt_path=receipt_path, state_path=state_path)
+        return {k: result[k] for k in ('receipt_sha256', 'remaining_requests', 'cost_bound_known', 'cumulative_budget_status')} | {
+            'state_path': str(target), 'native_history_revalidated': False, 'native_counts_scope': 'this_finite_batch_only'}
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError, KeyError, AttributeError, InvalidOperation):
+        # register_batch commits before returning its read-only summary. A
+        # failed summary can therefore precede the local registered flag.
+        registered = False
+        if created and binding is not None:
+            try:
+                registered = trial_budget.native_root_binding(receipt['cumulative_budget'],
+                    receipt_id=receipt['receipt_id'], required=False) == binding
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+                pass
+        if created:
+            try:
+                with sqlite3.connect(target) as connection:
+                    connection.execute("UPDATE metadata SET frozen_reason=CASE WHEN frozen_reason IS NULL OR frozen_reason='standalone_setup_pending' THEN 'standalone_setup_failed' ELSE frozen_reason END")
+            except sqlite3.Error:
+                pass
+        if registered:
+            trial_budget.close_batch(receipt['cumulative_budget'], receipt_id=receipt['receipt_id'], reason='standalone_setup_failed')
+        raise TrialGateError() from None
+
+
+@contextmanager
+def standalone_trial_scope(*, receipt_path, state_path):
+    """Explicit local routing to an already valid root; never grants authority."""
+    if _STANDALONE_SCOPE.get() is not None:
+        _deny()
+    validate_trial_authorization(receipt_path=receipt_path, state_path=state_path)
+    with sqlite3.connect(_canonical_state_path(state_path).as_uri()+'?mode=ro', uri=True) as db:
+        if _standalone_context(db) is None:
+            _deny()
+    scope = {'paths': (Path(receipt_path), Path(state_path)), 'active': True}
+    token = _STANDALONE_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        scope['active'] = False  # Also revoke copied/child contexts on exit.
+        _STANDALONE_SCOPE.reset(token)
+
+
 def amend_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
     """Explicit local approval of derived synthetic hashes; never called by HTTP.
 
@@ -286,7 +581,7 @@ def amend_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
         receipt, digest = _receipt(receipt_path)
         if receipt['schema_version'] in APPEND_SCHEMAS:
             return _amend_v3(receipt, digest, state_path)
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             rows = connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json FROM metadata').fetchall()
             if len(rows) != 1:
@@ -379,7 +674,7 @@ class TrialGate:
                     or type(thinking_tokens) is not int or not 0 <= thinking_tokens <= profile['max_thinking_tokens']):
                 _deny()
             # mode=rw refuses missing files. A lost counter must never restart at 0.
-            with sqlite3.connect(self.state_path.resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+            with sqlite3.connect(_canonical_state_path(self.state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
                 connection.execute('BEGIN IMMEDIATE')
                 if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt))]:
                     _deny()
@@ -397,15 +692,32 @@ class TrialGate:
                 # Commit before network. Failure, timeout and automatic follow-on
                 # requests consume the same durable allowance without refunds.
             return attempt_id
+        except TrialGateError:
+            _contain_standalone(self)
+            raise
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+            _contain_standalone(self)
             raise TrialGateError() from None
+
+
+def _contain_standalone(meter):
+    # A cumulative-only orphan reservation is retained and the owned scope is
+    # conservatively closed. Invalid/copied identities cannot close the owner.
+    try:
+        with sqlite3.connect(_canonical_state_path(meter.state_path).as_uri()+'?mode=ro', uri=True) as db:
+            binding = _standalone_context(db, strict=False)
+        if binding is not None:
+            close_trial_scope(receipt_path=meter.receipt_path, state_path=meter.state_path,
+                              reason_code='business_validation_failed')
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError, KeyError):
+        pass
 
 
 def validate_trial_authorization(*, receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
     """Read-only preflight before any credential/config loading."""
     try:
         receipt, digest = _receipt(receipt_path)
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=ro', uri=True) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=ro', uri=True) as connection:
             if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt), None)]:
                 _deny()
             counts, occupied = _history(connection, receipt)
@@ -437,7 +749,7 @@ def validate_trial_authorization(*, receipt_path=RECEIPT_PATH, state_path=STATE_
 def trial_journal(*, state_path=STATE_PATH):
     """Non-secret audit metadata only; never raw prompts, media or keys."""
     try:
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=ro', uri=True) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=ro', uri=True) as connection:
             closed = _closed_context(connection)
             connection.row_factory = sqlite3.Row
             rows = connection.execute('SELECT * FROM attempts ORDER BY id').fetchall()
@@ -469,7 +781,7 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
         if type(attempt_id) is not int or attempt_id <= 0:
             _deny()
         frozen = False
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             closed = _closed_context(connection)
             if closed and attempt_id <= closed.get('protected_through_attempt_id', closed['failed_attempt_id']):
@@ -533,7 +845,7 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
                         source_sha256=source_sha, request_sha256=wire_sha, returned_model=returned_model,
                         usage=usage, response_sha256=transport_metadata['response_sha256'])
         if frozen:
-            with sqlite3.connect(Path(state_path)) as connection:
+            with sqlite3.connect(_canonical_state_path(state_path)) as connection:
                 reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
             _close_cumulative_budget(current_receipt, reason)
             _deny()  # Raise after the freeze transaction has committed.
@@ -542,7 +854,7 @@ def report_usage(attempt_id, returned_model, usage, *, state_path=STATE_PATH, tr
                 from . import trial_budget
                 trial_budget.mark_observed(current_receipt['cumulative_budget'], **observation)
             except (ImportError, OSError, RuntimeError, ValueError, AttributeError):
-                with sqlite3.connect(Path(state_path)) as connection:
+                with sqlite3.connect(_canonical_state_path(state_path)) as connection:
                     connection.execute("UPDATE metadata SET frozen_reason=COALESCE(frozen_reason,'usage_unverified')")
                     reason = connection.execute('SELECT frozen_reason FROM metadata').fetchone()[0]
                 _close_cumulative_budget(current_receipt, reason)
@@ -703,6 +1015,7 @@ def _save_authority(connection, digest, receipt, previous):
 
 
 def _authority_history(connection, head):
+    standalone = _standalone_context(connection)
     values = connection.execute('SELECT receipt_sha256,receipt_id,previous_sha256,receipt_json,snapshot_sha256 FROM authorization_snapshots').fetchall()
     authorities = {}
     for sha, receipt_id, previous, raw, snapshot_sha in values:
@@ -736,7 +1049,9 @@ def _authority_history(connection, head):
                     _deny()
             elif _budget_digest(receipt) != _budget_digest(old):
                 _deny()
-        elif receipt['schema_version'] != SCHEMA:
+        elif receipt['schema_version'] != SCHEMA and not (
+                standalone is not None and receipt['schema_version'] == SCHEMA_RISK_SEQUENCE
+                and head == standalone['receipt_sha256']):
             _deny()
         head = previous
     if seen != set(authorities):
@@ -820,8 +1135,10 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
         receipt, digest = _receipt(receipt_path)
         if receipt['schema_version'] not in APPEND_SCHEMAS:
             _deny()
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
+            if _standalone_context(connection, strict=False) is not None:
+                _deny()
             rows = connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall()
             if len(rows) != 1 or rows[0][3] is not None:
                 _deny()
@@ -857,8 +1174,10 @@ def append_trial(receipt_path=RECEIPT_PATH, state_path=STATE_PATH):
 
 
 def _amend_v3(receipt, digest, state_path):
-    with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+    with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
         connection.execute('BEGIN IMMEDIATE')
+        if _standalone_context(connection, strict=False) is not None:
+            _deny()
         rows = connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall()
         if len(rows) != 1 or rows[0][3] is not None:
             _deny()
@@ -920,7 +1239,7 @@ def _reserve_v3(meter, receipt, digest, **args):
     if risk and kind == 'asr':
         _risk_audio(wire, args['source_sha256'])
     pricing, cost = _profile_quote(receipt, kind)
-    with sqlite3.connect(meter.state_path.resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+    with sqlite3.connect(_canonical_state_path(meter.state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
         connection.execute('BEGIN IMMEDIATE')
         if connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall() != [(digest, _budget_digest(receipt), _snapshot(receipt), None)]:
             _deny()
@@ -1013,7 +1332,7 @@ def confirm_trial_review(attempt_id, approval_ref, *, state_path=STATE_PATH):
     try:
         if type(attempt_id) is not int or not isinstance(approval_ref, str) or not approval_ref.strip() or len(approval_ref.encode()) > 4096:
             _deny()
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT receipt_json,frozen_reason FROM metadata').fetchall()
             if len(row) != 1 or row[0][1] is not None:
@@ -1065,7 +1384,7 @@ def stop_trial(attempt_id, reason_code, *, state_path=STATE_PATH):
                 'owner_stop', 'business_validation_failed', 'transport_failed',
                 'response_too_large', 'response_invalid', 'usage_unverified'}:
             _deny()
-        with sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri() + '?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             closed = _closed_context(connection)
             if closed and attempt_id <= closed.get('protected_through_attempt_id', closed['failed_attempt_id']):
@@ -1104,7 +1423,7 @@ def close_trial_scope(receipt_path=RECEIPT_PATH, state_path=STATE_PATH, reason_c
                 'owner_stop', 'business_validation_failed', 'transport_failed',
                 'response_too_large', 'response_invalid', 'usage_unverified'}:
             _deny()
-        with sqlite3.connect(Path(state_path).resolve().as_uri()+'?mode=rw', uri=True, timeout=10) as connection:
+        with sqlite3.connect(_canonical_state_path(state_path).as_uri()+'?mode=rw', uri=True, timeout=10) as connection:
             connection.execute('BEGIN IMMEDIATE')
             rows = connection.execute('SELECT receipt_sha256,budget_sha256,receipt_json,frozen_reason FROM metadata').fetchall()
             if len(rows) != 1 or rows[0][:3] != (digest, _budget_digest(receipt), _snapshot(receipt)):
@@ -1450,6 +1769,8 @@ def _closed_context(connection, receipt=None, *, _validation_path=None, _depth=0
     """Only an exact inherited failed row gets an exception; preserve all totals."""
     if _depth > 16:
         _deny()
+    if _standalone_context(connection, receipt, strict=False) is not None:
+        return None
     if _table_exists(connection, 'scope_successors'):
         return _successor_context(connection, receipt, _validation_path=_validation_path, _depth=_depth)
     exists, metadata_exists = _table_exists(connection, 'closed_origin'), _table_exists(connection, 'closed_metadata')
@@ -1594,7 +1915,10 @@ def authorize_request(request):
                 _deny()
             if body.get('reasoning_effort') not in {None, 'none'} or body.get('thinking') not in (None, {'type': 'disabled'}):
                 _deny()
-        meter = TrialGate()
+        scope = _STANDALONE_SCOPE.get()
+        if scope is not None and scope['active'] is not True:
+            _deny()
+        meter = TrialGate(*scope['paths']) if scope is not None else TrialGate()
         attempt_id = meter.reserve(kind=kind, provider=profile['provider'], model=profile['model'], url=request.full_url,
             wire=request.data, source_sha256=profile['source_sha256'], output_tokens=output, thinking_tokens=thinking)
         request._noreset_trial_attempt_id = attempt_id

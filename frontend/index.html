@@ -58,10 +58,11 @@
         <aside class="trust-strip" aria-label="记录说明"><svg aria-hidden="true"><use href="#i-check"/></svg><span><b>原话一直保留</b>，整理结果需要你自己核对。</span></aside>
       </section>
 
+      <p id="healthSubjectConflictNotice" class="health-subject-conflict hidden" role="alert"></p>
       <section id="voiceView" class="view subview voice-conversation-view" aria-labelledby="voiceTitle" aria-hidden="true">
         <header class="conversation-top">
           <button class="back-btn" type="button" data-view="homeView" aria-label="返回首页"><svg aria-hidden="true"><use href="#i-back"/></svg><span>返回</span></button>
-          <div><h1 id="voiceTitle" tabindex="-1">和小零聊聊</h1><p id="voiceConnectionLabel">退出也会自动留下报告</p></div>
+          <div><h1 id="voiceTitle" tabindex="-1">和小零聊聊</h1><p id="voiceConnectionLabel">退出也会自动留下报告</p><p id="voiceSubjectLabel" class="conversation-subject-label">当前记录：本人</p></div>
           <button id="openConversationReportBtn" class="conversation-report-button" type="button" disabled>报告</button>
         </header>
         <div class="conversation-shell">
@@ -173,9 +174,34 @@
         <button class="back-btn" type="button" data-view="homeView"><svg aria-hidden="true"><use href="#i-back"/></svg> 返回首页</button>
         <div class="records-head"><h1 id="settingsTitle" tabindex="-1">数据与内测设置</h1></div>
         <div class="settings-grid">
+          <section class="settings-card health-memory-card" aria-labelledby="healthMemoryTitle">
+            <div class="settings-card-head"><div><span class="settings-kicker">长期健康记忆</span><h2 id="healthMemoryTitle">以后聊，也记得清楚</h2></div><span class="local-only-badge">本机加密</span></div>
+            <p>只留下你主动填写的必要背景。不同的人分开记；其他使用者请使用独立浏览器资料库和自己的恢复口令。</p>
+            <div class="health-subject-controls">
+              <label for="healthSubjectSelect">现在为谁记录？</label><select id="healthSubjectSelect"><option value="subject_self">本人</option></select>
+              <label for="newHealthSubjectLabel">添加家属（只需称呼）</label><div class="health-subject-add"><input id="newHealthSubjectLabel" maxlength="40" placeholder="例如：妈妈"><button id="addHealthSubjectBtn" class="outline" type="button">添加家属</button></div>
+            </div>
+            <p id="healthSubjectStatus" class="status align-left" role="status" aria-live="polite"></p>
+            <button id="reselectHealthSubjectBtn" class="outline hidden" type="button">重新选择本页所属人</button>
+            <p class="memory-sharing-note">只有你确认并勾选“以后对话记住”的资料，才会自动带入这个人的新对话，最多 5 项。使用联网 AI 时，这些资料会随后续发言发送；可以在对话中取消本次选择，或在这里取消记忆。</p>
+            <div id="healthMemoryList" class="health-memory-list"><p class="muted">正在读取长期记忆…</p></div>
+            <form id="healthMemoryForm" class="health-memory-form" aria-labelledby="healthMemoryFormTitle">
+              <h3 id="healthMemoryFormTitle" tabindex="-1">添加一项健康背景</h3>
+              <label for="healthMemoryCategory">资料类型</label><select id="healthMemoryCategory"><option value="conditions">疾病或长期问题</option><option value="medications">药物使用记录</option><option value="allergies">过敏记录</option><option value="procedures">手术、住院或受伤经历</option><option value="tests">已有检查或测量</option><option value="similar_episodes">以前类似情况</option></select>
+              <label for="healthMemoryText">你希望保留的原文</label><textarea id="healthMemoryText" rows="3" maxlength="500" placeholder="只写必要背景；不确定的内容可以留待核实" required></textarea>
+              <label for="healthMemoryTemporalStatus">这项情况的时间状态</label><select id="healthMemoryTemporalStatus"><option value="uncertain">不确定，待核实</option><option value="current">目前仍适用</option><option value="historical">过去的情况</option></select>
+              <label for="healthMemoryOccurredOn">发生或记录所述情况的日期（可留空）</label><input id="healthMemoryOccurredOn" type="date">
+              <label for="healthMemorySourceKind">原文来自哪里？</label><select id="healthMemorySourceKind"><option value="self_statement">本人陈述</option><option value="family_report">家属转述</option><option value="document">已有资料</option></select>
+              <label for="healthMemoryConfirmedBy">由谁核对？</label><select id="healthMemoryConfirmedBy"><option value="self">本人</option><option value="family">家属</option></select>
+              <label class="memory-checkbox"><input id="healthMemoryConfirmed" type="checkbox"><span>我已核对这项原文。核对不代表 AI 做出诊断。</span></label>
+              <label class="memory-checkbox"><input id="healthMemoryRemember" type="checkbox" disabled><span>以后对话记住（仅限已核对、时间状态明确的资料）</span></label>
+              <div class="health-memory-form-actions"><button id="saveHealthMemoryBtn" class="primary" type="submit">保存这一项</button><button id="cancelHealthMemoryEditBtn" class="outline" type="button">清空 / 取消更正</button></div>
+            </form>
+            <p id="healthMemoryStatus" class="status align-left" role="status" aria-live="polite"></p>
+          </section>
           <section class="settings-card health-context-card">
-            <div class="settings-card-head"><div><span class="settings-kicker">问诊背景</span><h2>让小零了解已经确认的情况</h2></div><span class="local-only-badge">仅存本机</span></div>
-            <p>每行写一项，确认过的再填。保存后不会自动发送；每段对话都由你选择是否带上，最多 5 项。勾选的内容会在后续发言整理时发送给联网 AI，直到取消选择。</p>
+            <div class="settings-card-head"><div><span class="settings-kicker">原有健康背景</span><h2>原有背景填写入口</h2></div><span class="local-only-badge">仅存本机</span></div>
+            <p>保留原有每行一项的填写方式，供旧资料手动带入对话。这里不会设置长期记忆，也不补写日期和时间状态。开始逐项管理后，请使用上方入口更正，避免整体替换丢失资料。</p>
             <div class="health-context-grid">
               <label>已经确认的疾病或长期问题<textarea id="healthConditions" rows="3" placeholder="例如：医生曾确认的长期问题，一行一项"></textarea></label>
               <label>正在使用的药物<textarea id="healthMedications" rows="3" placeholder="药名和已知用法，一行一项；不要在这里自行改药"></textarea></label>

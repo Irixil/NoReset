@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.conversation import CATEGORIES, _source_excerpt, conversation_turn
+from backend.conversation import CATEGORIES, SYSTEM_PROMPT, _source_excerpt, conversation_turn
 from scripts.run_text_trial import digest, encoded, prepare_job
 
 
@@ -25,17 +25,27 @@ class RecordedProvider:
 
 
 def recorded(job_id, *, whole_result=False):
-    fixture = json.loads(FIXTURE.read_text(encoding='utf-8'))
+    frozen_bytes = FIXTURE.read_bytes()
+    assert digest(frozen_bytes) == 'bb5253cb4fa42eb14a2c36cf63411b5f8934a619f1031cee844db60ad404a262'
+    fixture = json.loads(frozen_bytes)
     assert fixture['synthetic_only'] is True
     record = next(row for row in fixture['records'] if row['job_id'] == job_id)
     before = deepcopy(record)
     prepared = prepare_job(record)
-    assert prepared['profile'] == record['profile']
+    # The historical supplier reply stays frozen. Replaying it under the new
+    # memory prompt is an offline source regression, not a new same-wire call.
+    wire_fields = {'request_sha256', 'wire_bytes'}
+    assert {k: v for k, v in prepared['profile'].items() if k not in wire_fields} == {
+        k: v for k, v in record['profile'].items() if k not in wire_fields}
+    assert prepared['wire_body']['messages'][0]['content'] == SYSTEM_PROMPT
+    assert prepared['profile']['request_sha256'] != record['profile']['request_sha256']
+    assert digest(encoded(prepared['wire_body'])) == prepared['profile']['request_sha256']
     provider = RecordedProvider(record['draft'], prepared['model_payload'])
     result = conversation_turn(deepcopy(record['native_input']), provider)
     assert provider.calls == 1  # In-memory replay, not HTTP or a second paid call.
     assert digest(encoded(prepared['model_payload'])) == prepared['profile']['source_sha256']
     assert record == before
+    assert FIXTURE.read_bytes() == frozen_bytes
     return result if whole_result else result['completeness']['clinical_state']
 
 
