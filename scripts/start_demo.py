@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
-    parser = argparse.ArgumentParser(description="病历不归零：加载 .env 并启动同源前后端；默认使用真实接口。")
+    parser = argparse.ArgumentParser(description="NoReset：加载 .env 并启动同源前后端；默认使用真实接口。")
     parser.add_argument("--offline", action="store_true", help="显式使用文字及 ASR/OCR Mock，仅用于离线回归")
     parser.add_argument("--check-config", action="store_true", help="只检查本地配置，不连接供应商、不启动服务")
     args = parser.parse_args(argv)

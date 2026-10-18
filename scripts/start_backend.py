@@ -1,4 +1,4 @@
-"""只启动病历不归零后端 API。"""
+"""只启动NoReset后端 API。"""
 
 from scripts.start_app import main
 

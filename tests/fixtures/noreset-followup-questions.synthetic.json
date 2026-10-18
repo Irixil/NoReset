@@ -1,0 +1,153 @@
+{
+  "synthetic_only": true,
+  "origin": "Saved actual A16 first model draft; followup responses in tests are synthetic stubs, never new provider calls.",
+  "actual_first_source_sha256": "7a6d93da77dd3eb46330aaae6428ea76a2a5291fb0d7588b364b8496008550fd",
+  "input": {
+    "turns": [
+      {
+        "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+        "text": "我咳嗽两天了，晚上明显些。",
+        "version": 1,
+        "responding_to": {
+          "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+          "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"
+        }
+      },
+      {
+        "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+        "text": "我刚才说错了，不是两天，是三天。",
+        "version": 1,
+        "responding_to": {
+          "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+          "text": "您说的咳嗽两天、晚上更明显，我记下了。"
+        }
+      },
+      {
+        "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+        "text": "大多是干咳，偶尔有一点白痰。",
+        "version": 1,
+        "responding_to": {
+          "turn_id": "turn_9b0c45209d4a4b389bfe28a2f675283f",
+          "text": "好的，我把咳嗽的时间改成三天，不是两天。 咳嗽的时候有痰吗，还是干咳？"
+        }
+      }
+    ],
+    "health_context": [
+      {
+        "context_id": "context_synthetic_historypriority_pair20261009",
+        "category": "similar_episodes",
+        "text": "以前有两次咳嗽，开始时都是喘不上气，随后才咳嗽。",
+        "source": "user_confirmed"
+      }
+    ],
+    "controller": {
+      "asked_categories": [
+        "main_complaint",
+        "symptom_character"
+      ],
+      "closed_categories": [],
+      "question_counts": {
+        "main_complaint": 1,
+        "onset_course": 0,
+        "symptom_character": 1,
+        "aggravating_relieving": 0,
+        "associated_symptoms": 0,
+        "functional_impact": 0,
+        "relevant_history": 0,
+        "prior_actions_results": 0
+      },
+      "asked_questions": [
+        "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+        "咳嗽的时候有痰吗，还是干咳？"
+      ],
+      "question_count": 2,
+      "no_new_fact_count": 0,
+      "last_question_category": "symptom_character",
+      "linked_context_ids": []
+    },
+    "approved_risk_rules": []
+  },
+  "draft": {
+    "user_intent": "answer",
+    "latest_turn_adds_fact": true,
+    "reply_text": "您更正为咳嗽三天，并说大多是干咳、偶尔有一点白痰，这些我都按您说的记下了。",
+    "suggested_action": "ask",
+    "question_category": "associated_symptoms",
+    "question_importance": "essential",
+    "candidate_question": "除了咳嗽，这几天有没有发烧、喘不上气或胸口不舒服？",
+    "clinical_state": {
+      "main_complaint": {
+        "status": "known",
+        "summary": "咳嗽",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2"
+        ],
+        "context_ids": []
+      },
+      "onset_course": {
+        "status": "known",
+        "summary": "咳嗽三天，晚上明显些",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2",
+          "turn_902dbb0381754982a955cb2ce07eda32"
+        ],
+        "context_ids": []
+      },
+      "symptom_character": {
+        "status": "known",
+        "summary": "大多是干咳，偶尔有一点白痰",
+        "evidence_turn_ids": [
+          "turn_0ed4bfd8e9c241dc9730041263de970e"
+        ],
+        "context_ids": []
+      },
+      "aggravating_relieving": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "associated_symptoms": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "functional_impact": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "relevant_history": {
+        "status": "known",
+        "summary": "以前有两次咳嗽，开始时都是喘不上气，随后才咳嗽",
+        "evidence_turn_ids": [],
+        "context_ids": [
+          "context_synthetic_historypriority_pair20261009"
+        ]
+      },
+      "prior_actions_results": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      }
+    },
+    "relevant_context_ids": [
+      "context_synthetic_historypriority_pair20261009"
+    ],
+    "unknowns": [],
+    "contradictions": [
+      {
+        "text": "咳嗽时间先说两天，后更正为三天",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2",
+          "turn_902dbb0381754982a955cb2ce07eda32"
+        ],
+        "context_ids": []
+      }
+    ],
+    "risk_candidates": []
+  }
+}

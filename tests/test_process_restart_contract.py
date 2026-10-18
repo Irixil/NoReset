@@ -35,12 +35,14 @@ def backend_process(database_path):
     base_url = f"http://127.0.0.1:{port}"
     env = {
         **os.environ,
+        "APP_MODE": "legacy",
+        "API_HOST": "127.0.0.1",
         "API_PORT": str(port),
         "DB_PATH": str(database_path),
         "MODEL_PROVIDER": "mock",
     }
     process = subprocess.Popen(
-        [sys.executable, "-m", "backend.run_local"],
+        [sys.executable, "-m", "backend.server"],
         cwd=ROOT,
         env=env,
         stdout=subprocess.DEVNULL,

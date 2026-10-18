@@ -50,7 +50,7 @@ def serve(host: str, port: int, directory: Path) -> None:
 
 
 def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
-    parser = argparse.ArgumentParser(description="病历不归零·内测版前端")
+    parser = argparse.ArgumentParser(description="NoReset·内测版前端")
     parser.add_argument("--host", default=os.getenv("FRONTEND_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("FRONTEND_PORT", os.getenv("PORT", "5173"))))
     parser.add_argument("--directory", type=Path, default=root / "frontend")

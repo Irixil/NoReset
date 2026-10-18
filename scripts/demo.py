@@ -1,4 +1,4 @@
-"""Replay one licensed public case via real HTTP; mock is explicitly labelled."""
+"""Check unreviewed public-case quarantine via HTTP; never attest source review."""
 import argparse
 import json
 import os
@@ -44,34 +44,40 @@ def replay(base_url):
         # Same key + exact payload must not create a second record.
         status, repeated = request('POST', '/api/events', payload, case['id'])
         assert status == 200 and repeated['event']['record_id'] == rid and repeated['created'] is False
-        if event['state'] == 'inbox':
-            status, organized = request('POST', f'/api/events/{rid}/organize', {'expected_version': event['version']})
-            assert status == 200, {'case_id': case['id'], 'organize_status': status, 'result': organized}
-            event = organized['event']
-        if event['state'] == 'draft':
-            status, reviewed = request('POST', f'/api/events/{rid}/review',
-                                       {'expected_version': event['version'], 'action': 'confirm', 'note': '仅核对中文摘要录入准确，不代表医学确认'})
-            assert status == 200, reviewed
-            event = reviewed['event']
-        assert event['state'] == 'recorded'
+        # Published text is still unreviewed document evidence. This script
+        # cannot impersonate the person comparing a record with its original.
+        for action, body in (
+            ('organize', {'expected_version': event['version']}),
+            ('review', {'expected_version': event['version'], 'action': 'confirm'}),
+        ):
+            status, denied = request('POST', f'/api/events/{rid}/{action}', body)
+            assert status == 409 and denied.get('error') == 'document_source_review_required', {
+                'case_id': case['id'], 'action': action, 'status': status, 'result': denied}
         status, queried = request('GET', f'/api/events/{rid}')
-        assert status == 200 and queried['event']['raw_text'] == case['input']
+        assert status == 200 and queried['event'] == event and event['raw_text'] == case['input']
+        assert event['state'] == 'inbox' and not event.get('source_review')
         status, history = request('GET', f'/api/events/{rid}/history')
-        assert status == 200 and len(history['history']) >= 3
+        assert status == 200 and len(history['history']) == 1
         rows.append({'case_id': case['id'], 'record_id': rid, 'state': event['state'],
                      'local_danger_detected': event['local_safety']['danger_detected'],
-                     'raw_text_queryable': True, 'idempotency_checked': True, 'history_count': len(history['history'])})
+                     'raw_text_queryable': True, 'idempotency_checked': True, 'history_count': len(history['history']),
+                     'organize_blocked': True, 'confirmation_blocked': True})
     status, generated = request('POST', '/api/handoffs', {})
     assert status == 201
     card = generated['handoff']
     status, fetched = request('GET', '/api/handoffs/' + card['handoff_id'])
     assert status == 200 and fetched['handoff'] == card
-    danger_item = next(i for i in card['items'] if i['record_id'] == rows[0]['record_id'])
-    assert danger_item['unresolved'] and 'local_danger_detected' in danger_item['unresolved_reasons']
+    record_ids = {row['record_id'] for row in rows}
+    pending_ids = {item['record_id'] for item in card['pending_documents']
+                   if item['reason'] == 'document_source_review_required'}
+    assert record_ids <= pending_ids
+    assert not record_ids.intersection(item['record_id'] for item in card['items'])
     return {'passed': True, 'provider': health['provider'], 'dataset_version': dataset['dataset_version'],
             'patients': 1, 'extracts': len(rows), 'rows': rows, 'handoff_id': card['handoff_id'],
-            'danger_remains_after_record_confirmation': True,
-            'limitations': ['公开论文改编摘要，不是原始病历或真实用户试验', 'mock 不代表真实模型整理质量', '未命中规则不代表医学正常']}
+            'unreviewed_documents_quarantined': True, 'source_review_performed': False,
+            'record_confirmation_performed': False,
+            'limitations': ['公开论文改编摘要，不是原始病历或真实用户试验', '只检查未核对资料的保存与隔离，不自动代替人工核对',
+                            'mock 不代表真实模型整理质量', '未命中规则不代表医学正常']}
 
 
 def main():

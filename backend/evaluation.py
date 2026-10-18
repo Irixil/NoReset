@@ -92,7 +92,7 @@ def dataset_issues(case, dataset):
         value = expected.get(key)
         if not isinstance(value, str) or not re.match(r'\d{4}-\d{2}-\d{2}', value):
             continue
-        if value == payload.get('occurred_time') or value in raw:
+        if value == payload.get('occurred_time'):
             continue
         reason = '标签要求补成绝对日期，但输入未提供同值 occurred_time；当前合同要求保留原始/相对时间。'
         if reference and ('今天' in raw or '昨晚' in raw or '昨天' in raw):
@@ -108,11 +108,30 @@ def dataset_issues(case, dataset):
     return issues
 
 
-def generated_text(output, raw):
-    """Verbatim evidence is allowed; only newly generated prose is inspected."""
-    texts = [output.get('summary', '')] + list(output.get('follow_up_questions') or [])
-    texts.extend(c.get('text', '') for c in output.get('claims', []) if c.get('text') != c.get('quote'))
-    return '\n'.join(t for t in texts if t and t not in raw)
+def generated_text(output, raw, payload=None):
+    """Only complete, source-bound quotations are exempt from prose checks."""
+    payload = payload or {}
+    sources = {payload.get('record_id'): raw}
+    history = payload.get('history') or payload.get('history_events') or []
+    if isinstance(history, list):
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            record_id = record.get('record_id') or record.get('id')
+            source = record.get('raw_text') or record.get('text')
+            if record_id and isinstance(source, str):
+                sources[record_id] = source
+    summary = output.get('summary', '')
+    texts = [] if isinstance(summary, str) and summary.strip() == raw.strip() else [summary]
+    # A follow-up is model-authored even when its words occur inside evidence.
+    texts.extend(output.get('follow_up_questions') or [])
+    for claim in output.get('claims', []):
+        text, quote = claim.get('text'), claim.get('quote')
+        source = sources.get(claim.get('record_id'))
+        if not (isinstance(text, str) and isinstance(quote, str) and isinstance(source, str)
+                and text.strip() == quote.strip() == source.strip()):
+            texts.append(text or '')
+    return '\n'.join(t for t in texts if t)
 
 
 def evaluate_assertions(case, dataset, output):
@@ -175,7 +194,8 @@ def evaluate_assertions(case, dataset, output):
         elif key in {'preserve_provenance', 'preserve_both_sources'} and value:
             check(field, output.get('provenance_preserved') is True, partial=True)
         elif key == 'evidence_required' and value:
-            check(field, all(c.get('quote') and c.get('record_id') for c in output.get('claims', [])), partial=True)
+            claims = output.get('claims', [])
+            check(field, bool(claims) and all(c.get('quote') and c.get('record_id') for c in claims), partial=True)
         elif key == 'preserve_uncertainty' and value:
             check(field, output.get('review_required') is True, partial=True)
         else:
@@ -187,7 +207,7 @@ def evaluate_assertions(case, dataset, output):
     if 'source_kind' in payload:
         current_sources = {c.get('source_kind') for c in output.get('claims', []) if c.get('record_id') == case['id']}
         check('contract.source_kind', current_sources == {payload['source_kind']})
-    prose = generated_text(output, raw)
+    prose = generated_text(output, raw, payload)
     for index, prohibition in enumerate(case.get('must_not', [])):
         field = f'must_not[{index}]'
         if any(word in prohibition for word in ('医生确认', '医生已确认', '医生结论')):
@@ -198,7 +218,7 @@ def evaluate_assertions(case, dataset, output):
             check(field, '160/90' not in prose, prohibition)
         elif '具体时间' in prohibition or '具体日期' in prohibition or '录入时间当成' in prohibition or '上传日期' in prohibition or '发生日期' in prohibition:
             occurred = output.get('time', {}).get('occurred')
-            supported = occurred is None or occurred == payload.get('occurred_time') or str(occurred) in raw
+            supported = occurred is None or occurred == payload.get('occurred_time')
             check(field, supported, prohibition, partial=True)
         elif any(word in prohibition for word in ('诊断', '药物副作用', '疗效', '病因', '药物有效')):
             check(field, not re.search(r'(?:确诊|诊断)(?:为|是)|(?:就是|患有)(?:心肌梗死|脑卒中|失眠)|(?:是|为)药物副作用|药物(?:有效|起效)|病因(?:已经|已)?解决', prose), prohibition, partial=True)

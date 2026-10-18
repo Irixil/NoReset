@@ -153,6 +153,17 @@ class MediaRecognitionService:
                     actor=actor,
                 )
             )
+        if result.get("is_mock") is True:
+            return dict(
+                self._store.save_media_recognition_failure(
+                    media_id,
+                    attempt_id,
+                    code="provider_mock",
+                    message="模拟识别结果不能作为真实转写记录",
+                    retryable=True,
+                    actor=actor,
+                )
+            )
         saved = dict(
             self._store.save_media_recognition_text(
                 media_id,

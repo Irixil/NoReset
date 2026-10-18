@@ -29,9 +29,9 @@ class Provider(Protocol):
 def now(): return datetime.now(timezone.utc).isoformat()
 def new_id(p): return f'{p}_{uuid.uuid4()}'
 try:
- from .safety import scan_danger, DANGER_REMINDER
+ from .safety import scan_danger, DANGER_REMINDER, document_needs_review
 except ImportError:
- from safety import scan_danger, DANGER_REMINDER
+ from safety import scan_danger, DANGER_REMINDER, document_needs_review
 def danger(t): return scan_danger(t)['danger_detected']
 def medication_review_required(t):
  # This routes uncertain medication/instruction text for review; it is not a diagnosis.
@@ -104,7 +104,7 @@ class OpenAICompatibleProvider:
   try:
    self.client=ChatCompletionsClient(base_url=c.base_url or self.default_base_url,model=c.model,api_key=c.token,timeout=c.timeout,
     json_mode=self.default_json_mode if c.json_mode is None else c.json_mode,
-    extra_body=c.extra_body,max_tokens=c.max_tokens)
+    extra_body=c.extra_body,max_tokens=c.max_tokens,trial_provider=c.provider)
   except ModelClientError as error:
    raise AdapterError(str(error),code='model_configuration_invalid') from None
  def complete_json(self,system_prompt,payload):
@@ -264,6 +264,8 @@ def provider_from(c=None):
  raise AdapterError('不支持的 MODEL_PROVIDER')
 def organize_event(payload,provider=None):
  if not isinstance(payload,dict) or not str(payload.get('raw_text','')).strip():raise AdapterError('raw_text 不能为空')
+ if any(document_needs_review(row) for row in [payload]+_history_records(payload) if isinstance(row,dict)):
+  _validation_error('资料文字必须先对照原件核对。','document_source_review_required')
  raw=str(payload['raw_text']); safety=scan_danger(raw)  # Always before provider selection/network.
  start=time.perf_counter(); p=provider or provider_from()
  model_out=p.complete_json(build_prompt(),payload)

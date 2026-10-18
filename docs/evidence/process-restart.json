@@ -1,9 +1,0 @@
-{
-  "passed": true,
-  "entry_command": "python -m backend.run_local",
-  "environment": "macOS Python 3.12, localhost, temporary SQLite",
-  "provider": "mock",
-  "source": "PMC12890330, 3 adapted extracts",
-  "process_restarted": true,
-  "raw_safety_state_version_and_handoff_preserved": true
-}

@@ -1,0 +1,7 @@
+{
+  "rule_set_version": "reviewed-risk-interface-v1",
+  "scope": "production",
+  "medical_signoff": "pending",
+  "purpose": "Versioned reviewed-rule interface only. No clinical rules have been approved; legacy engineering notices remain explicitly unvalidated.",
+  "rules": []
+}

@@ -1,0 +1,872 @@
+{
+  "N03": {
+    "synthetic_only": true,
+    "mode": "saved_actual_output_offline_regression_no_provider",
+    "provenance_sha256": "c772183a00ad648dae4888592d650550720a8da27cdec0de23638872c4e2aed5",
+    "conversation": {
+      "conversation_id": "conversation_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+      "subject_id": "subject_self",
+      "local_date": "2026-10-11",
+      "last_local_date": "2026-10-11",
+      "created_at": "2026-10-10T18:33:12.437Z",
+      "updated_at": "2026-10-10T18:33:54.884Z",
+      "status": "paused",
+      "version": 5,
+      "turns": [
+        {
+          "turn_id": "turn_saved_audio_opening_cfe918dfc4e24d80a88f70e2eacb7756",
+          "role": "assistant",
+          "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+          "action": "ask",
+          "question_category": "main_complaint",
+          "created_at": "2026-10-10T18:33:12.437Z",
+          "version": 1
+        },
+        {
+          "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+          "role": "elder",
+          "original_text": "上腹这两天不舒服，吃完饭后明显。",
+          "text": "上腹这两天不舒服，吃完饭后明显。",
+          "source_kind": "audio_transcript",
+          "record_id": "rec_29cacab6391d46288b25684c2e43c915",
+          "media_id": "media_2121fbd05ed24165ad20790d118a81d3",
+          "local_safety": {
+            "danger_detected": false,
+            "escalation_level": "none",
+            "review_role": "none",
+            "danger_reminder": null,
+            "matched_rules": [],
+            "safety_rule_version": "offline-danger-v2",
+            "legacy_clinical_review_status": "active_unvalidated",
+            "clinical_review_flags": [],
+            "clinical_review_version": "offline-review-flags-v1",
+            "clinical_review_status": "not_flagged",
+            "clinical_review_required": false,
+            "clinical_review_role": null,
+            "clinical_review_notice": null
+          },
+          "created_at": "2026-10-10T18:33:12.437Z",
+          "version": 1,
+          "versions": []
+        },
+        {
+          "turn_id": "turn_4db522286199451086fb4212c8e40ecd",
+          "role": "assistant",
+          "text": "您说的上腹不舒服、饭后更明显，我已经记下来了。 这种不舒服是胀、痛、烧灼还是别的感觉？",
+          "action": "ask",
+          "question_category": "symptom_character",
+          "stop_reason": null,
+          "created_at": "2026-10-10T18:33:14.853Z",
+          "version": 1,
+          "ai_failed": false
+        }
+      ],
+      "controller": {
+        "asked_categories": [
+          "main_complaint",
+          "symptom_character"
+        ],
+        "closed_categories": [],
+        "question_counts": {
+          "main_complaint": 1,
+          "onset_course": 0,
+          "symptom_character": 1,
+          "aggravating_relieving": 0,
+          "associated_symptoms": 0,
+          "functional_impact": 0,
+          "relevant_history": 0,
+          "prior_actions_results": 0
+        },
+        "asked_questions": [
+          "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+          "这种不舒服是胀、痛、烧灼还是别的感觉？"
+        ],
+        "question_count": 2,
+        "no_new_fact_count": 0,
+        "last_question_category": "symptom_character",
+        "linked_context_ids": []
+      },
+      "active_episode_start_turn_id": null,
+      "completeness": {
+        "complete": false,
+        "clinical_state": {
+          "main_complaint": {
+            "status": "known",
+            "summary": "上腹这两天不舒服，",
+            "evidence_turn_ids": [
+              "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+            ],
+            "context_ids": []
+          },
+          "onset_course": {
+            "status": "known",
+            "summary": "上腹这两天不舒服，",
+            "evidence_turn_ids": [
+              "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+            ],
+            "context_ids": []
+          },
+          "symptom_character": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "aggravating_relieving": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "associated_symptoms": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "functional_impact": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "relevant_history": {
+            "status": "known",
+            "summary": "上腹这两天不舒服，吃完饭后明显。",
+            "evidence_turn_ids": [],
+            "context_ids": [
+              "context_3a13c04396d34a5d8ede496cf0c52410"
+            ]
+          },
+          "prior_actions_results": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          }
+        },
+        "evidence_turn_ids": [
+          "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+        ],
+        "relevant_context_ids": [
+          "context_3a13c04396d34a5d8ede496cf0c52410"
+        ],
+        "unknowns": [],
+        "contradictions": []
+      },
+      "report": {
+        "report_id": "report_eb984d886d414c93a9b35df2f6fcb331",
+        "format_version": 5,
+        "title": "就诊沟通记录",
+        "status": "auto_unreviewed",
+        "status_label": "自动整理 · 本人未核对",
+        "version": 2,
+        "generated_at": "2026-10-10T18:33:14.854Z",
+        "source_turn_ids": [
+          "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+        ],
+        "source_versions": [
+          {
+            "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+            "version": 1,
+            "quote": "上腹这两天不舒服，吃完饭后明显。"
+          }
+        ],
+        "source_context_ids": [
+          "context_3a13c04396d34a5d8ede496cf0c52410"
+        ],
+        "pending_questions": [],
+        "question_coverage": {
+          "format_version": 1,
+          "kind": "assistant_question_coverage_not_clinical_facts",
+          "conversation_id": "conversation_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+          "sources": {
+            "turns": [
+              {
+                "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+                "version": 1,
+                "quote": "上腹这两天不舒服，吃完饭后明显。",
+                "responding_to": null,
+                "responding_to_version": null
+              }
+            ],
+            "selected_context_ids": [
+              "context_3a13c04396d34a5d8ede496cf0c52410"
+            ],
+            "context_version": 1,
+            "context": [
+              {
+                "context_id": "context_3a13c04396d34a5d8ede496cf0c52410",
+                "subject_id": "subject_self",
+                "category": "similar_episodes",
+                "text": "上腹这两天不舒服，吃完饭后明显。",
+                "temporal_status": "historical",
+                "source_kind": "self_statement",
+                "occurred_on": "2022-04-12",
+                "confirmation_status": "confirmed",
+                "confirmed_by": "self",
+                "remember": true,
+                "source": "user_confirmed",
+                "recorded_at": "2026-10-10T15:51:34.262Z",
+                "confirmed_at": "2026-10-10T15:51:34.262Z",
+                "updated_at": "2026-10-10T15:51:34.262Z"
+              }
+            ],
+            "questions": [
+              {
+                "turn_id": "turn_saved_audio_opening_cfe918dfc4e24d80a88f70e2eacb7756",
+                "version": 1,
+                "quote": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+                "action": "ask",
+                "superseded": false,
+                "ai_failed": false
+              },
+              {
+                "turn_id": "turn_4db522286199451086fb4212c8e40ecd",
+                "version": 1,
+                "quote": "您说的上腹不舒服、饭后更明显，我已经记下来了。 这种不舒服是胀、痛、烧灼还是别的感觉？",
+                "action": "ask",
+                "superseded": false,
+                "ai_failed": false
+              }
+            ],
+            "episode": null
+          },
+          "candidates": [],
+          "resolved_questions": [],
+          "historical_scope_questions": [],
+          "pending_questions": []
+        },
+        "reviewed_risk_assessments": [],
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_validation_status": "not_verified_by_this_application",
+        "sections": [
+          {
+            "key": "chief_complaint",
+            "title": "主要不适",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "上腹这两天不舒服，",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [
+                  "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+                ],
+                "source_context_ids": [],
+                "source_versions": [
+                  {
+                    "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+                    "version": 1,
+                    "quote": "上腹这两天不舒服，吃完饭后明显。"
+                  }
+                ],
+                "source_label": "当前原话 1 · 本人未核对"
+              }
+            ]
+          },
+          {
+            "key": "onset_course",
+            "title": "起病与变化",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "上腹这两天不舒服，",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [
+                  "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756"
+                ],
+                "source_context_ids": [],
+                "source_versions": [
+                  {
+                    "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+                    "version": 1,
+                    "quote": "上腹这两天不舒服，吃完饭后明显。"
+                  }
+                ],
+                "source_label": "当前原话 1 · 本人未核对"
+              }
+            ]
+          },
+          {
+            "key": "background_actions",
+            "title": "相关背景与已做处理",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "上腹这两天不舒服，吃完饭后明显。",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [],
+                "source_context_ids": [
+                  "context_3a13c04396d34a5d8ede496cf0c52410"
+                ],
+                "source_versions": [],
+                "source_label": "当前原话与所选背景 · 本人未核对"
+              },
+              {
+                "kind": "context",
+                "text": "上腹这两天不舒服，吃完饭后明显。",
+                "tags": [
+                  "用户已确认陈述",
+                  "历史"
+                ],
+                "source_context_ids": [
+                  "context_3a13c04396d34a5d8ede496cf0c52410"
+                ],
+                "source_context": {
+                  "context_id": "context_3a13c04396d34a5d8ede496cf0c52410",
+                  "subject_id": "subject_self",
+                  "category": "similar_episodes",
+                  "text": "上腹这两天不舒服，吃完饭后明显。",
+                  "temporal_status": "historical",
+                  "source_kind": "self_statement",
+                  "occurred_on": "2022-04-12",
+                  "confirmation_status": "confirmed",
+                  "confirmed_by": "self",
+                  "remember": true,
+                  "source": "user_confirmed",
+                  "recorded_at": "2026-10-10T15:51:34.262Z",
+                  "confirmed_at": "2026-10-10T15:51:34.262Z",
+                  "updated_at": "2026-10-10T15:51:34.262Z"
+                },
+                "source_label": "本人确认 · 本人陈述 · 发生日期 2022-04-12 · 记录 2026-10-10T15:51:34.262Z · 非应用诊断"
+              }
+            ]
+          },
+          {
+            "key": "verification",
+            "title": "尚待医生核实",
+            "lines": [
+              {
+                "kind": "check",
+                "text": "尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、已经采取的处理及结果。",
+                "tags": [
+                  "信息未完整"
+                ],
+                "source_label": "继续对话后会自动补充"
+              }
+            ]
+          }
+        ],
+        "transcript": [
+          {
+            "turn_id": "turn_saved_audio_opening_cfe918dfc4e24d80a88f70e2eacb7756",
+            "role": "assistant",
+            "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+            "source_kind": "system",
+            "created_at": "2026-10-10T18:33:12.437Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+            "role": "elder",
+            "text": "上腹这两天不舒服，吃完饭后明显。",
+            "source_kind": "audio_transcript",
+            "created_at": "2026-10-10T18:33:12.437Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_4db522286199451086fb4212c8e40ecd",
+            "role": "assistant",
+            "text": "您说的上腹不舒服、饭后更明显，我已经记下来了。 这种不舒服是胀、痛、烧灼还是别的感觉？",
+            "source_kind": "system",
+            "created_at": "2026-10-10T18:33:14.853Z",
+            "version": 1
+          }
+        ],
+        "body": "主要不适\n- 当前整理 · 待核对：上腹这两天不舒服，\n\n起病与变化\n- 当前整理 · 待核对：上腹这两天不舒服，\n\n相关背景与已做处理\n- 当前整理 · 待核对：上腹这两天不舒服，吃完饭后明显。\n- 用户已确认陈述、历史：上腹这两天不舒服，吃完饭后明显。\n\n尚待医生核实\n- 信息未完整：尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、已经采取的处理及结果。\n\n老人原话历史（按说话顺序完整保留）\n1. 上腹这两天不舒服，吃完饭后明显。",
+        "disclaimer": "用于和医生沟通，不是诊断，也不包含用药或治疗建议。"
+      },
+      "health_context": [
+        {
+          "context_id": "context_3a13c04396d34a5d8ede496cf0c52410",
+          "subject_id": "subject_self",
+          "category": "similar_episodes",
+          "text": "上腹这两天不舒服，吃完饭后明显。",
+          "temporal_status": "historical",
+          "source_kind": "self_statement",
+          "occurred_on": "2022-04-12",
+          "confirmation_status": "confirmed",
+          "confirmed_by": "self",
+          "remember": true,
+          "source": "user_confirmed",
+          "recorded_at": "2026-10-10T15:51:34.262Z",
+          "confirmed_at": "2026-10-10T15:51:34.262Z",
+          "updated_at": "2026-10-10T15:51:34.262Z"
+        }
+      ],
+      "selected_context_ids": [
+        "context_3a13c04396d34a5d8ede496cf0c52410"
+      ],
+      "health_context_version": 1,
+      "saved_audio_trial": {
+        "grant_id": "cfe918dfc4e24d80a88f70e2eacb7756",
+        "state": "completed",
+        "source_version": 2,
+        "record_id": "rec_29cacab6391d46288b25684c2e43c915",
+        "media_id": "media_2121fbd05ed24165ad20790d118a81d3"
+      },
+      "analysis_sources": {
+        "turns": [
+          {
+            "turn_id": "turn_saved_audio_cfe918dfc4e24d80a88f70e2eacb7756",
+            "version": 1,
+            "quote": "上腹这两天不舒服，吃完饭后明显。"
+          }
+        ],
+        "selected_context_ids": [
+          "context_3a13c04396d34a5d8ede496cf0c52410"
+        ],
+        "context_version": 1,
+        "context": [
+          {
+            "context_id": "context_3a13c04396d34a5d8ede496cf0c52410",
+            "subject_id": "subject_self",
+            "category": "similar_episodes",
+            "text": "上腹这两天不舒服，吃完饭后明显。",
+            "temporal_status": "historical",
+            "source_kind": "self_statement",
+            "occurred_on": "2022-04-12",
+            "confirmation_status": "confirmed",
+            "confirmed_by": "self",
+            "remember": true,
+            "source": "user_confirmed",
+            "recorded_at": "2026-10-10T15:51:34.262Z",
+            "confirmed_at": "2026-10-10T15:51:34.262Z",
+            "updated_at": "2026-10-10T15:51:34.262Z"
+          }
+        ]
+      },
+      "relevant_health_context": [
+        {
+          "context_id": "context_3a13c04396d34a5d8ede496cf0c52410",
+          "subject_id": "subject_self",
+          "category": "similar_episodes",
+          "text": "上腹这两天不舒服，吃完饭后明显。",
+          "temporal_status": "historical",
+          "source_kind": "self_statement",
+          "occurred_on": "2022-04-12",
+          "confirmation_status": "confirmed",
+          "confirmed_by": "self",
+          "remember": true,
+          "source": "user_confirmed",
+          "recorded_at": "2026-10-10T15:51:34.262Z",
+          "confirmed_at": "2026-10-10T15:51:34.262Z",
+          "updated_at": "2026-10-10T15:51:34.262Z"
+        }
+      ],
+      "last_ai_metadata": {
+        "provider": "DeepSeekProvider",
+        "model_id": "deepseek-flash",
+        "prompt_version": "clinical-intake-v10-source-grounded-memory-recall",
+        "trace_id": "ctr_6a4ba1c33bb64e6b926785955b43212f"
+      }
+    }
+  },
+  "N01": {
+    "synthetic_only": true,
+    "mode": "saved_actual_output_offline_regression_no_provider",
+    "provenance_sha256": "92f971272eaa6b989699de60288c8a21c7431a0b506d5573a994824cdf2603bb",
+    "conversation": {
+      "conversation_id": "conversation_3001b2e17e6a4b3686948dc6d83f6659",
+      "local_date": "2026-10-09",
+      "last_local_date": "2026-10-09",
+      "created_at": "2026-10-09T10:37:46.432Z",
+      "updated_at": "2026-10-09T11:37:06.988Z",
+      "status": "paused",
+      "version": 9,
+      "turns": [
+        {
+          "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+          "role": "assistant",
+          "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+          "action": "ask",
+          "question_category": "main_complaint",
+          "created_at": "2026-10-09T10:37:46.432Z",
+          "version": 1
+        },
+        {
+          "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+          "role": "elder",
+          "original_text": "我咳嗽两天了，晚上明显些。",
+          "text": "我咳嗽两天了，晚上明显些。",
+          "source_kind": "audio_transcript",
+          "record_id": "rec_731878cfff954398993ee79f0f1c5716",
+          "media_id": "media_858a368d6c1b4246aa91be47fdb7cf1a",
+          "local_safety": {
+            "danger_detected": false,
+            "escalation_level": "none",
+            "review_role": "none",
+            "danger_reminder": null,
+            "matched_rules": [],
+            "safety_rule_version": "offline-danger-v2",
+            "legacy_clinical_review_status": "active_unvalidated",
+            "clinical_review_flags": [],
+            "clinical_review_version": "offline-review-flags-v1",
+            "clinical_review_status": "not_flagged",
+            "clinical_review_required": false,
+            "clinical_review_role": null,
+            "clinical_review_notice": null
+          },
+          "created_at": "2026-10-09T10:38:03.749Z",
+          "version": 1,
+          "versions": [],
+          "responding_to": {
+            "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+            "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"
+          }
+        },
+        {
+          "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+          "role": "assistant",
+          "text": "您说的咳嗽两天、晚上更明显，我记下了。",
+          "action": "reply",
+          "question_category": null,
+          "stop_reason": "awaiting_user",
+          "created_at": "2026-10-09T11:19:40.617Z",
+          "version": 1,
+          "ai_failed": false
+        },
+        {
+          "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+          "role": "elder",
+          "original_text": "我刚才说错了，不是两天，是三天。",
+          "text": "我刚才说错了，不是两天，是三天。",
+          "source_kind": "elder",
+          "record_id": "rec_2fbbbcf6ec564e91a22776d7ba086e97",
+          "media_id": null,
+          "local_safety": {
+            "danger_detected": false,
+            "escalation_level": "none",
+            "review_role": "none",
+            "danger_reminder": null,
+            "matched_rules": [],
+            "safety_rule_version": "offline-danger-v2",
+            "legacy_clinical_review_status": "active_unvalidated",
+            "clinical_review_flags": [],
+            "clinical_review_version": "offline-review-flags-v1",
+            "clinical_review_status": "not_flagged",
+            "clinical_review_required": false,
+            "clinical_review_role": null,
+            "clinical_review_notice": null
+          },
+          "created_at": "2026-10-09T11:19:40.762Z",
+          "version": 1,
+          "versions": [],
+          "responding_to": {
+            "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+            "text": "您说的咳嗽两天、晚上更明显，我记下了。"
+          }
+        },
+        {
+          "turn_id": "turn_6489104a00294657af2b4be2c7ebc01b",
+          "role": "assistant",
+          "text": "好的，我把咳嗽的时间改成三天，不是两天。",
+          "action": "reply",
+          "question_category": null,
+          "stop_reason": "awaiting_user",
+          "created_at": "2026-10-09T11:37:06.986Z",
+          "version": 1,
+          "ai_failed": false
+        }
+      ],
+      "controller": {
+        "asked_categories": [
+          "main_complaint"
+        ],
+        "closed_categories": [],
+        "question_counts": {
+          "main_complaint": 1,
+          "onset_course": 0,
+          "symptom_character": 0,
+          "aggravating_relieving": 0,
+          "associated_symptoms": 0,
+          "functional_impact": 0,
+          "relevant_history": 0,
+          "prior_actions_results": 0
+        },
+        "asked_questions": [
+          "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"
+        ],
+        "question_count": 1,
+        "no_new_fact_count": 0,
+        "last_question_category": "main_complaint",
+        "linked_context_ids": []
+      },
+      "active_episode_start_turn_id": null,
+      "completeness": {
+        "complete": false,
+        "clinical_state": {
+          "main_complaint": {
+            "status": "known",
+            "summary": "我咳嗽",
+            "evidence_turn_ids": [
+              "turn_995fb60fedaf4506b85425e186272ce2"
+            ],
+            "context_ids": []
+          },
+          "onset_course": {
+            "status": "known",
+            "summary": "三天",
+            "evidence_turn_ids": [
+              "turn_902dbb0381754982a955cb2ce07eda32"
+            ],
+            "context_ids": []
+          },
+          "symptom_character": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "aggravating_relieving": {
+            "status": "known",
+            "summary": "晚上明显些。",
+            "evidence_turn_ids": [
+              "turn_995fb60fedaf4506b85425e186272ce2"
+            ],
+            "context_ids": []
+          },
+          "associated_symptoms": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "functional_impact": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "relevant_history": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "prior_actions_results": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          }
+        },
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2",
+          "turn_902dbb0381754982a955cb2ce07eda32"
+        ],
+        "relevant_context_ids": [],
+        "unknowns": [],
+        "contradictions": []
+      },
+      "report": {
+        "report_id": "report_94e1c1b2a5c2451886a978bae2b4ff9e",
+        "format_version": 5,
+        "title": "就诊沟通记录",
+        "status": "auto_unreviewed",
+        "status_label": "自动整理 · 本人未核对",
+        "version": 4,
+        "generated_at": "2026-10-09T11:37:06.987Z",
+        "source_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2",
+          "turn_902dbb0381754982a955cb2ce07eda32"
+        ],
+        "source_versions": [
+          {
+            "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+            "version": 1,
+            "quote": "我咳嗽两天了，晚上明显些。"
+          },
+          {
+            "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+            "version": 1,
+            "quote": "我刚才说错了，不是两天，是三天。"
+          }
+        ],
+        "source_context_ids": [],
+        "reviewed_risk_assessments": [],
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_validation_status": "not_verified_by_this_application",
+        "sections": [
+          {
+            "key": "chief_complaint",
+            "title": "主要不适",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "我咳嗽",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [
+                  "turn_995fb60fedaf4506b85425e186272ce2"
+                ],
+                "source_context_ids": [],
+                "source_versions": [
+                  {
+                    "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+                    "version": 1,
+                    "quote": "我咳嗽两天了，晚上明显些。"
+                  }
+                ],
+                "source_label": "当前原话 1 · 本人未核对"
+              }
+            ]
+          },
+          {
+            "key": "onset_course",
+            "title": "起病与变化",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "三天",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [
+                  "turn_902dbb0381754982a955cb2ce07eda32"
+                ],
+                "source_context_ids": [],
+                "source_versions": [
+                  {
+                    "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+                    "version": 1,
+                    "quote": "我刚才说错了，不是两天，是三天。"
+                  }
+                ],
+                "source_label": "当前原话 2 · 本人未核对"
+              }
+            ]
+          },
+          {
+            "key": "symptoms_impact",
+            "title": "症状特点与生活影响",
+            "lines": [
+              {
+                "kind": "summary",
+                "text": "晚上明显些。",
+                "tags": [
+                  "当前整理 · 待核对"
+                ],
+                "source_turn_ids": [
+                  "turn_995fb60fedaf4506b85425e186272ce2"
+                ],
+                "source_context_ids": [],
+                "source_versions": [
+                  {
+                    "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+                    "version": 1,
+                    "quote": "我咳嗽两天了，晚上明显些。"
+                  }
+                ],
+                "source_label": "当前原话 1 · 本人未核对"
+              }
+            ]
+          },
+          {
+            "key": "verification",
+            "title": "尚待医生核实",
+            "lines": [
+              {
+                "kind": "check",
+                "text": "尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、相关既往情况或相似经历、已经采取的处理及结果。",
+                "tags": [
+                  "信息未完整"
+                ],
+                "source_label": "继续对话后会自动补充"
+              }
+            ]
+          }
+        ],
+        "transcript": [
+          {
+            "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+            "role": "assistant",
+            "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+            "source_kind": "system",
+            "created_at": "2026-10-09T10:37:46.432Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+            "role": "elder",
+            "text": "我咳嗽两天了，晚上明显些。",
+            "source_kind": "audio_transcript",
+            "created_at": "2026-10-09T10:38:03.749Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+            "role": "assistant",
+            "text": "您说的咳嗽两天、晚上更明显，我记下了。",
+            "source_kind": "system",
+            "created_at": "2026-10-09T11:19:40.617Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+            "role": "elder",
+            "text": "我刚才说错了，不是两天，是三天。",
+            "source_kind": "elder",
+            "created_at": "2026-10-09T11:19:40.762Z",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_6489104a00294657af2b4be2c7ebc01b",
+            "role": "assistant",
+            "text": "好的，我把咳嗽的时间改成三天，不是两天。",
+            "source_kind": "system",
+            "created_at": "2026-10-09T11:37:06.986Z",
+            "version": 1
+          }
+        ],
+        "body": "主要不适\n- 当前整理 · 待核对：我咳嗽\n\n起病与变化\n- 当前整理 · 待核对：三天\n\n症状特点与生活影响\n- 当前整理 · 待核对：晚上明显些。\n\n尚待医生核实\n- 信息未完整：尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、相关既往情况或相似经历、已经采取的处理及结果。\n\n老人原话历史（按说话顺序完整保留）\n1. 我咳嗽两天了，晚上明显些。\n2. 我刚才说错了，不是两天，是三天。",
+        "disclaimer": "用于和医生沟通，不是诊断，也不包含用药或治疗建议。"
+      },
+      "health_context": [],
+      "selected_context_ids": [],
+      "trial_control": {
+        "review_required": true,
+        "state": "completed",
+        "source_kind": "elder",
+        "conversation_id": "conversation_3001b2e17e6a4b3686948dc6d83f6659",
+        "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+        "turn_version": 1,
+        "media_id": null
+      },
+      "health_context_version": 0,
+      "analysis_sources": {
+        "turns": [
+          {
+            "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+            "version": 1,
+            "quote": "我咳嗽两天了，晚上明显些。"
+          },
+          {
+            "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+            "version": 1,
+            "quote": "我刚才说错了，不是两天，是三天。"
+          }
+        ],
+        "selected_context_ids": [],
+        "context_version": 0,
+        "context": []
+      },
+      "relevant_health_context": [],
+      "last_ai_metadata": {
+        "provider": "DeepSeekProvider",
+        "model_id": "deepseek-flash",
+        "prompt_version": "clinical-intake-v8-risk-candidates",
+        "trace_id": "ctr_16db75687fe84413b08f326419d63732"
+      }
+    },
+    "first_model_usage_verified": false,
+    "second_model_usage_verified": true
+  }
+}

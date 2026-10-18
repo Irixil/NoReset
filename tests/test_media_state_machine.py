@@ -196,7 +196,7 @@ def test_full_text_safety_and_one_event_link_survive_human_revision(tmp_path):
         text=original_text,
         provider="mock",
         model="mock-recognition-v1",
-        is_mock=True,
+        is_mock=False,
         actor="老人",
     )
     scanned = store.save_media_recognition_safety(
@@ -299,7 +299,7 @@ def test_failure_and_too_long_text_remain_queryable_without_fake_event(tmp_path)
         text=text,
         provider="mock",
         model="mock-recognition-v1",
-        is_mock=True,
+        is_mock=False,
         actor="老人",
     )
     safety = __import__("backend.safety", fromlist=["scan_danger"]).scan_danger(text)
@@ -328,3 +328,30 @@ def test_failure_and_too_long_text_remain_queryable_without_fake_event(tmp_path)
     assert reopened["link_status"] == "pending"
     assert reopened["latest_attempt"]["text"] == text
     assert reopened["local_safety"]["danger_detected"] is True
+
+
+def test_mock_recognition_cannot_be_linked_as_a_patient_event(tmp_path):
+    store = SQLiteStore(tmp_path / "records.sqlite3")
+    media = saved_media(store)
+    claim = store.claim_media_recognition(
+        MEDIA_ID,
+        expected_version=media["version"],
+        idempotency_key="recognize-mock",
+        actor="老人",
+    )
+    attempt_id = claim["attempt"]["attempt_id"]
+    store.save_media_recognition_text(
+        MEDIA_ID, attempt_id, text="[Mock ASR] voice.wav", provider="mock",
+        model="mock-recognition-v1", is_mock=True, actor="老人",
+    )
+    store.save_media_recognition_safety(
+        MEDIA_ID, attempt_id, safety={"danger_detected": False}, actor="老人",
+    )
+
+    with pytest.raises(Conflict, match="^mock_recognition_not_linkable$"):
+        store.create_and_link_media_event(
+            MEDIA_ID, attempt_id, payload={"raw_text": "[Mock ASR] voice.wav"},
+            idempotency_key="link-mock", actor="系统", household_id="hh_local_default",
+        )
+
+    assert store.list() == []

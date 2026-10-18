@@ -40,6 +40,18 @@ def test_even_plausible_short_excerpt_is_rejected(payload):
     assert_rejected(payload, lambda out: out.update(summary='膝盖疼'), 'summary')
     assert_rejected(payload, lambda out: out['claims'][0].update(text='膝盖疼', quote='膝盖疼'), 'claim.quote')
 
+def test_reviewed_document_unknowns_cannot_be_completed_by_the_organizing_model(payload):
+    payload.update(source_kind='document', raw_text='[标题被裁切，无法辨认]\nRBC 4.53 [单位无法辨认]\nMCV [无法辨认]')
+    payload['source_review'] = {'method': 'original_comparison', 'text': payload['raw_text'], 'confirmed_at': '2026-10-01'}
+    class Guessing(MockProvider):
+        def complete_json(self, prompt, evidence):
+            out = super().complete_json(prompt, evidence)
+            out['summary'] = '血常规\nRBC 4.53 10^12/L\nMCV 90'
+            return out
+    with pytest.raises(AdapterError, match='summary'):
+        organize_event(payload, Guessing())
+    assert organize_event(payload, MockProvider())['output']['summary'] == payload['raw_text']
+
 
 @pytest.mark.parametrize('action', ['diagnosis', 'medication_change', 'source_overwrite', 'invented_time_or_dose'])
 def test_model_reported_forbidden_action_blocks_otherwise_valid_draft(payload, action):

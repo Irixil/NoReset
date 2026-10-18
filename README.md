@@ -1,18 +1,26 @@
+[简体中文](README.md) · [English](README.en.md)
+
 <div align="center">
   <img src="frontend/assets/brand-mascot.png" width="100" alt="NoReset 的小零吉祥物">
   <h1>NoReset · 病历不归零</h1>
-  <p><strong>把这次的不舒服聊清楚，让每一次健康记录都能接着说。</strong></p>
-  <p>语音与文字对话 · 看病资料整理 · 就诊沟通记录 · 本机加密保存</p>
-  <p><a href="#先看一遍怎么用">看演示</a> · <a href="#它能帮你做什么">看功能</a> · <a href="#第一次使用跟着这四步走">开始使用</a> · <a href="#在自己的电脑上运行">本机安装</a></p>
+  <p><strong>本地优先的 AI 健康记录与就诊沟通工具</strong></p>
+  <p>把这次的不舒服聊清楚，让每一次健康记录都能接着说。</p>
+  <p>A local-first AI health journal for personal health records and visit preparation.</p>
+  <p>语音与文字对话 · 病历与检查单整理 · 原话与来源可追溯 · 本机加密保存</p>
+  <p><a href="#先看一遍怎么用">看演示</a> · <a href="#在自己的电脑上运行">快速运行</a> · <a href="#第一次使用跟着这四步走">使用指南</a> · <a href="README.en.md">English</a> · <a href="https://github.com/Irixil/NoReset/issues">反馈问题</a></p>
 </div>
 
 ---
 
-身体有什么变化，你可以直接说给「小零」听，也可以打字慢慢写。小零会结合你刚才说的话和相关背景回应，必要时再问一个问题，帮助你把情况说清楚。
+复诊或换一家医院时，常常又要从头说明哪里不舒服、什么时候开始、以前有哪些情况。NoReset 面向个人和陪伴家人的照护者，把日常身体变化、看病资料和就诊前要说的话留在一起。
+
+身体有什么变化，你可以直接说给「小零」听，也可以打字慢慢写。小零会结合你刚才说的话和选中的相关背景回应，必要时再问一个问题，帮助你把情况说清楚。
 
 NoReset 把这些原话、录音和看病资料留在一起。你可以补充、纠正、回头查找，再整理成带有来源的就诊沟通记录，方便自己回顾，也方便向医生说明情况。
 
 适合想少填表、多说话的使用者，也适合陪家人一起整理看病资料的人。
+
+记录加密保存在当前浏览器；在线 AI 对话、语音转写和图片识字使用你自己配置的服务。NoReset 用于健康记录与就诊沟通，诊断和治疗决定由医生负责。
 
 ## 先看一遍怎么用
 
@@ -114,12 +122,12 @@ NoReset 把这些原话、录音和看病资料留在一起。你可以补充、
 
 ## 在自己的电脑上运行
 
-准备 **Python 3.12**，以及自己的 DeepSeek 和 AIHubMix 服务配置。完整应用使用下方指定的整合分支。
+准备 **Python 3.12**，以及自己的 DeepSeek 和 AIHubMix 服务配置。前端是浏览器应用，界面以简体中文为主；从默认分支即可获取完整源码。
 
 ### 下载并准备环境
 
 ```bash
-git clone --branch codex/backend-integration-2026-09-14 https://github.com/Irixil/NoReset.git
+git clone https://github.com/Irixil/NoReset.git
 cd NoReset
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -183,6 +191,10 @@ NoReset 用于健康记录与就诊沟通。记录核对只确认内容；诊断
 
 ## 进一步了解
 
-[模型接入说明](https://github.com/Irixil/NoReset/blob/codex/backend-integration-2026-09-14/docs/MODEL-CONNECTION.md) · [API 文档](https://github.com/Irixil/NoReset/blob/codex/backend-integration-2026-09-14/docs/API.md) · [产品规格](https://github.com/Irixil/NoReset/blob/codex/backend-integration-2026-09-14/docs/sdlc/spec-contextual-dialogue-v10.md)
+[模型接入说明](docs/MODEL-CONNECTION.md) · [API 文档](docs/API.md) · [架构与目录](docs/ARCHITECTURE.md) · [English guide](README.en.md)
+
+## 交流与反馈
+
+使用问题、功能建议或可复现的问题，可以提交到 [GitHub Issues](https://github.com/Irixil/NoReset/issues)。请说明操作步骤、预期结果与实际表现；截图和示例请使用虚构内容，避免上传真实病历、录音、恢复口令或服务密钥。
 
 代码目前未授予通用开源许可证。公开示例资料的独立许可见对应资料说明。

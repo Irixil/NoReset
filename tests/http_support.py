@@ -5,6 +5,8 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 @dataclass(frozen=True)
@@ -55,12 +57,28 @@ class HttpClient:
 
 @contextmanager
 def running_http_server(handler):
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
-    worker.start()
+    from backend import text_trial
+    operator_binding = Path(__file__).resolve().parents[1] / 'runtime/synthetic-trial/browser-metered-qa/current-text-trial.json'
+    previous_binding = text_trial.BINDING_PATH
+    isolated = previous_binding == operator_binding
+    temporary = TemporaryDirectory(prefix='noreset-http-test-grants-') if isolated else None
+    if isolated:
+        # Keep explicit temporary native grants intact; ordinary HTTP fixtures
+        # must never discover retained operator grants from another test run.
+        text_trial.BINDING_PATH = Path(temporary.name) / 'current-text-trial.json'
+    httpd = worker = None
     try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
         yield f"http://127.0.0.1:{httpd.server_port}"
     finally:
-        httpd.shutdown()
-        httpd.server_close()
-        worker.join(timeout=2)
+        if httpd is not None:
+            if worker is not None and worker.ident is not None:
+                httpd.shutdown()
+            httpd.server_close()
+        if worker is not None and worker.ident is not None:
+            worker.join(timeout=2)
+        if isolated:
+            text_trial.BINDING_PATH = previous_binding
+            temporary.cleanup()

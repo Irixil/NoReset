@@ -8,6 +8,24 @@ def draft(event, kind='symptom', escalation='none', conflict=False, review_role=
  return {'ok':True,'ai_failed':False,'output': {'schema_version':'event-v0.3','event_kind':kind,'summary':event['raw_text'],'time':{'occurred':event['occurred_time'],'recorded':event['recorded_at'],'certainty':'relative'},'claims':[{'text':event['raw_text'],'source_kind':event['source_kind'],'record_id':event['record_id'],'quote':event['raw_text']}],'review_required':True,'review_role':review_role,'escalation_level':escalation,'conflict':{'present':conflict,'record_refs':[]},'provenance_preserved':True,'plan_change_allowed':False,'follow_up_questions':[],'forbidden_actions':[]},'trace_id':'tr_test','provider':'MockProvider','prompt_version':'prompt-v0.4','schema_version':'event-v0.3','latency_ms':1,'safety_guard_applied':False}
 def payload(text='女儿观察：今天头晕', actor='女儿'):
  return {'raw_text':text,'source_kind':'family_observation','actor_name':actor}
+
+def test_document_ocr_requires_separate_source_review_and_revision_invalidates_it(tmp_path):
+ s=SQLiteStore(tmp_path/'source-review.sqlite3')
+ e,_=s.create({**payload('胸部120法及以上CT'), 'source_kind':'document'},'ocr')
+ for action in (lambda:s.organize(e['record_id'],e['version'],draft(e),'家属'), lambda:s.review(e['record_id'],e['version'],'confirm','家属','核对')):
+  with pytest.raises(Conflict, match='document_source_review_required'):action()
+ h=s.handoff()
+ assert h['items']==[] and h['pending_documents'][0]['record_id']==e['record_id']
+ assert '胸部120法' not in str(h)
+ with pytest.raises(StoreError, match='source_review_confirmation_required'):s.source_review(e['record_id'],e['version'],False,'家属')
+ e=s.source_review(e['record_id'],e['version'],True,'家属')
+ assert e['source_review']['text']==e['raw_text']
+ e=s.organize(e['record_id'],e['version'],draft(e),'家属')
+ e=s.review(e['record_id'],e['version'],'confirm','家属','核对')
+ new=s.revise(e['record_id'],e['version'],{**payload('[无法辨认]'), 'reason':'对照原件'},'家属')
+ assert new['source_kind']=='document' and new['source_review'] is None
+ assert SQLiteStore(s.path).get(new['record_id'])['source_review'] is None
+ assert s.handoff()['items']==[]
 def test_persistence_and_state_machine():
  with tempfile.TemporaryDirectory() as d:
   path=os.path.join(d,'家庭记录.sqlite3'); s=SQLiteStore(path); e,created=s.create(payload(),'k1'); assert created and e['state']=='inbox'

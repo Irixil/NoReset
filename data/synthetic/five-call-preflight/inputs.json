@@ -1,0 +1,50 @@
+{
+  "schema_version": "noreset-five-call-inputs-v1",
+  "synthetic_only": true,
+  "approved": false,
+  "real_requests_executed": 0,
+  "reference_time": "2026-10-08T12:00:00Z",
+  "source": "Authored solely for this local test; no patient or benchmark material.",
+  "calls": [
+    {
+      "number": 1,
+      "kind": "asr",
+      "expected_text_for_human_comparison": "以下内容完全虚构。我咳嗽两天了，晚上明显，想整理给医生看。"
+    },
+    {
+      "number": 2,
+      "kind": "llm",
+      "purpose": "回应已人工对照的合成转写",
+      "depends_on": 1,
+      "current_turn": "以下内容完全虚构。我咳嗽两天了，晚上明显，想整理给医生看。"
+    },
+    {
+      "number": 3,
+      "kind": "llm",
+      "purpose": "回应当前担忧/纠正",
+      "current_turn": "以下内容完全虚构。刚才说错了，不是两天，是三天。我担心把时间讲错，能先帮我把原话记清楚吗？"
+    },
+    {
+      "number": 4,
+      "kind": "ocr",
+      "expected_text_for_human_comparison": "完全虚构 · 合成测试资料\n姓名：合成人甲\n记录日期：2026年10月8日\n来源：虚构家庭记录\n本人描述：咳嗽两天，晚上更明显。\n这张资料由测试人员原创，不是患者文件。"
+    },
+    {
+      "number": 5,
+      "kind": "llm",
+      "purpose": "人工对照原图后整理已选必要资料",
+      "depends_on": 4,
+      "source_review_required": true,
+      "source_kind": "document",
+      "human_comparison_pending": true
+    }
+  ],
+  "activation": "This input packet is not an authorization receipt. Actual provider bodies and their hashes must be reviewed before explicit budget authorization. Unknown recognition output may not silently continue.",
+  "manual_review": [
+    "原音/原图逐项对照",
+    "切题与纠正回应",
+    "报告来源与版本",
+    "临床问诊和风险规则由专业人员审阅"
+  ],
+  "portability_note": "Authored text only. Original audio/image evidence is separate; no ASR/OCR execution or clinical approval is asserted."
+}

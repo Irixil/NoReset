@@ -163,7 +163,35 @@ export type Event = {
   household_id: string;
   local_safety: LocalSafety;
   confirmation_scope: "record_accuracy" | null;
+  /** Human source comparison of this exact version; never supplied by OCR. */
+  source_review?: { method: "original_comparison"; text: string; confirmed_at: string; /** Local audio comparison binds the exact record. */ record_id?: string } | null;
 };
+
+export type SourceReviewRequest = { expected_version: number; compared_with_original: true };
+
+/** Response metadata for an independent, single reviewed saved-audio LLM trial.
+ * Only a trusted local native approval can provide this; clients never create it. */
+type SavedAudioTrialGrantBase = {
+  grant_id: string;
+  receipt_sha256: string;
+  expires_at: string;
+  requests: 1;
+  retries: 0;
+  source: { media_id: string; media_version: number; record_id: string; source_version: 1 | 2;
+    subject_id: "subject_self"; text_sha256: string; confirmed_at: string; audio_sha256: string };
+  prior_media_control: { review_required: true; state: "review_required" | "stopped" };
+  prior_global_control: SavedAudioTrialGrantBase["prior_media_control"] & { media_id: string; conversation_id: null };
+  http_payload_sha256: string;
+};
+export type SavedAudioTrialGrant = SavedAudioTrialGrantBase & (
+  { schema_version: "noreset-n03-saved-audio-llm-v1"; source: SavedAudioTrialGrantBase["source"] & { source_version: 2 } } |
+  { schema_version: "noreset-n01-saved-audio-llm-v1"; source: SavedAudioTrialGrantBase["source"] & { source_version: 1 } } |
+  { schema_version: "noreset-n01-saved-audio-llm-reviewed-v2"; source: SavedAudioTrialGrantBase["source"] & { source_version: 2 } }
+);
+export type SavedAudioTrialGrantResponse = { ok: true; grant: SavedAudioTrialGrant | null };
+/** Browser HealthLocal route, not the legacy SQLite conversation API. */
+export type SavedAudioTrialStartRequest = { media_id: string; media_version: number; record_id: string;
+  source_version: 1 | 2; local_date: string };
 
 export type SaveEventRequest = {
   raw_text: string;
@@ -231,9 +259,189 @@ export type AppConfigResponse = {
   mode: "local_first";
   access_configured: boolean;
   cloud_backup_configured: boolean;
-  product_name: "病历不归零·内测版";
+  product_name: "NoReset·内测版";
   data_location: "this_device";
   backup_mode: "encrypted_archive";
+  /** True means the backend requires an exact one-shot text-trial grant for LLM turns. */
+  text_trial_required: boolean;
+  provider: string;
+  reviewed_risk_rules: ReviewedRiskManifest;
+  capabilities: {
+    text_ai: ConfiguredCapability;
+    audio_recognition: ConfiguredCapability;
+    image_recognition: ConfiguredCapability;
+  };
+};
+
+// `available` means the selected trusted ProductHandler may attempt use;
+// a default Handler reports false, and neither value asserts connectivity.
+export type ConfiguredCapability = {
+  configured: boolean;
+  available: boolean;
+  connection_state: "not_configured" | "not_attempted" | "unverified";
+  execution_restricted: boolean;
+  reason: string;
+};
+
+export type ConversationAction = "ask" | "reply" | "finish" | "urgent" | "soon_evaluation";
+
+/** Local encrypted-store operation; confirmation never sends an AI request. */
+export type ConfirmConversationCorrectionRequest = {
+  expected_conversation_version: number;
+  expected_correction_version: number;
+  target_turn_id: string;
+  expected_target_version: number;
+  expected_event_version: number | null;
+  old_quote: string; // One complete, uniquely present sentence selected by the user.
+  confirmed: true;
+  // No client-supplied replacement: it is read from the saved correction text.
+};
+
+export type ConfirmedConversationCorrection = {
+  correction_turn_id: string;
+  correction_version: number;
+  correction_text: string;
+  target_turn_id: string;
+  target_version_before: number;
+  target_version_after: number;
+  old_quote: string;
+  new_quote: string;
+  target_text_before: string;
+  target_text_after: string;
+  record_id: string | null;
+  subject_id: string;
+  confirmed_by: "local_user";
+  confirmation_scope: "text_revision_only_not_medical_confirmation";
+  confirmed_at: string;
+};
+
+export type ConversationIntent =
+  | "health_fact" | "answer" | "correction" | "declined"
+  | "meta_feedback" | "patient_question" | "explicit_finish"
+  | "non_health" | "unclear";
+
+export type ReviewedRiskLevel = "soon_evaluation" | "urgent";
+export type ReviewedRiskManifest = {
+  contract_version: "reviewed-risk-candidates-v1";
+  rule_set_version: string;
+  status: "no_approved_rules" | "reviewed_rules_loaded";
+  clinical_validation: "not_completed" | "synthetic_fixture_only" | "clinical_review_metadata_present";
+  config_sha256: string | null;
+  rules: { rule_id: string; version: string; level: ReviewedRiskLevel }[];
+};
+
+export type ReviewedRiskSource = { turn_id: string; version: number; quote: string };
+export type ReviewedRiskAssessment = Omit<ReviewedRiskManifest, "rules"> & {
+  level: "none" | ReviewedRiskLevel;
+  notice: string | null;
+  matched_rules: { rule_id: string; version: string; level: ReviewedRiskLevel; evidence: ReviewedRiskSource[] }[];
+  sources: ReviewedRiskSource[];
+  rejected_candidates: number;
+};
+
+export type ConversationModelTurn = {
+  turn_id: string;
+  text: string;
+  version?: number;
+  // Previous assistant question or response; context only, never patient evidence.
+  responding_to?: { turn_id: string; text: string };
+};
+
+/** Backend-managed continuity markers. Session binding is a stale-state guard,
+ * not an authentication or clinical-truth credential. */
+export type ConversationNonHealthSource = {
+  turn_id: string;
+  version: number;
+  text_sha256: string;
+  responding_to_sha256: string;
+  session_id: string;
+};
+export type ConversationController = Record<string, unknown> & {
+  session_id?: string;
+  session_anchor_turn_id?: string;
+  session_turn_ids?: string[];
+  non_health_sources?: ConversationNonHealthSource[];
+};
+
+/** Local encrypted subject separation; this is not an account permission. */
+export type HealthSubject = {
+  subject_id: string;
+  label: string;
+  relationship: "self" | "family";
+  created_at: string;
+};
+
+export type HealthMemoryCategory =
+  | "conditions" | "medications" | "allergies"
+  | "procedures" | "tests" | "similar_episodes";
+
+/** User-confirmed statements remain statements, not verified diagnoses. */
+export type HealthMemoryInput = {
+  category: HealthMemoryCategory;
+  text: string;
+  temporal_status: "current" | "historical" | "uncertain";
+  confirmation_status: "confirmed" | "unconfirmed";
+  confirmed_by: "self" | "family";
+  source_kind: "self_statement" | "family_report" | "document";
+  occurred_on: string | null;
+  remember: boolean;
+};
+
+export type HealthMemoryEntry = Omit<HealthMemoryInput, "temporal_status"> & {
+  context_id: string;
+  subject_id: string;
+  source: "user_confirmed" | "user_unconfirmed";
+  recorded_at: string;
+  confirmed_at: string | null;
+  updated_at: string;
+  temporal_status: HealthMemoryInput["temporal_status"] | null;
+  /** Legacy records have no invented occurrence date or time status. */
+  legacy_entry?: boolean;
+};
+
+export type HealthMemoryProfile = {
+  subject_id: string;
+  version: number;
+  updated_at: string | null;
+  entries: HealthMemoryEntry[];
+};
+
+export type HealthMemoryWriteRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+  entry: HealthMemoryInput;
+};
+
+export type HealthSubjectsResponse = {
+  ok: true;
+  subjects: HealthSubject[];
+  active_subject_id: string;
+  /** The current tab keeps its owner until an explicit re-selection. */
+  observed_subject_id?: string;
+  version: number;
+};
+
+export type DeleteHealthMemoryRequest = {
+  subject_id: string;
+  expected_subject_version: number;
+  expected_version: number;
+};
+
+export type HealthMemoryResponse = {
+  ok: true;
+  health_context: HealthMemoryProfile;
+  subject_id?: string;
+};
+
+/** Only today's explicit selection or confirmed remembered entries, <=5. */
+export type ConversationHealthMemoryRequest = {
+  subject_id: string;
+  turns: ConversationModelTurn[];
+  controller: ConversationController;
+  health_context: Array<Omit<HealthMemoryEntry, "temporal_status"> & {
+    temporal_status?: "current" | "historical";
+  }>;
 };
 
 export type AppSessionResponse =
@@ -273,9 +481,10 @@ export type StatelessOrganizeRequest = {
   record_id: string;
   raw_text: string;
   source_kind: SourceKind;
+  source_review?: Event["source_review"];
   recorded_at: string;
   occurred_time?: string | null;
-  history?: Array<Pick<Event, "record_id" | "raw_text" | "source_kind" | "recorded_at" | "occurred_time">>;
+  history?: Array<Pick<Event, "record_id" | "raw_text" | "source_kind" | "source_review" | "recorded_at" | "occurred_time">>;
   consent: true;
 };
 
@@ -289,6 +498,10 @@ export type StatelessOrganizeSuccess = LocalSafety & OrganizeResultMeta & {
 
 export type StatelessMediaRecognitionSuccess = {
   ok: true;
+  /** Trusted response-only marker for the controlled synthetic voice trial.
+   * It requires local review before a separately authorized model reply;
+   * it never grants budget, retries, or a provider call. */
+  trial_control?: { review_required: true; stopped?: true };
   recognition: {
     text: string;
     provider: string;
@@ -443,6 +656,7 @@ export type HandoffItem = Event & {
 };
 
 export type Handoff = {
+  pending_documents?: Array<{ record_id: string; recorded_at: string; reason: "document_source_review_required" }>;
   handoff_id: string;
   created_at: string;
   household_id: string | null;
@@ -507,6 +721,7 @@ export const MEDIA_RECOGNITION_ERROR_CODES = [
   "provider_auth_failed",
   "provider_rate_limited",
   "invalid_provider_response",
+  "incomplete_provider_response",
 ] as const;
 
 export type MediaRecognitionErrorCode =
@@ -742,6 +957,18 @@ export const MEDIA_HTTP_ERROR_CODES = [
   "provider_rate_limited",
   "invalid_provider_response",
   "no_text_detected",
+  "incomplete_provider_response",
+  "document_source_review_required",
+  "source_review_confirmation_required",
+  "source_review_not_available",
+  "audio_original_unavailable",
+  "audio_source_review_required",
+  "audio_source_changed",
+  "saved_audio_trial_not_authorized",
+  "saved_audio_trial_input_changed",
+  "saved_audio_trial_used",
+  "saved_audio_trial_source_changed",
+  "conversation_source_invalid",
   "household_access_denied",
   "cross_household_reference_denied",
   "related_record_not_found",

@@ -1,1 +1,0 @@
-{"case_count": 54, "flagged_case_count": 53, "review_items": 24, "medical_signoff": "pending"}

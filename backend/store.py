@@ -29,9 +29,9 @@ def uid(prefix=''):
 
 
 try:
-    from .safety import scan_danger, reconcile_safety
+    from .safety import scan_danger, reconcile_safety, document_needs_review
 except ImportError:
-    from safety import scan_danger, reconcile_safety
+    from safety import scan_danger, reconcile_safety, document_needs_review
 
 class StoreError(RuntimeError):
     status = 400
@@ -64,6 +64,7 @@ MEDIA_RECOGNITION_STATES = {
 }
 MEDIA_LINK_STATES = {'not_linked', 'pending', 'linked', 'link_failed'}
 RECOGNITION_FAILURES = {
+    'provider_mock': ('当前是模拟识别，不能生成真实转写', True),
     'provider_not_configured': ('识别服务未配置', False),
     'unsupported_format': ('不支持的媒体类型或格式', False),
     'invalid_media': ('媒体文件无效或无法读取', False),
@@ -74,11 +75,12 @@ RECOGNITION_FAILURES = {
     'provider_auth_failed': ('识别服务鉴权失败，请检查配置', False),
     'provider_rate_limited': ('识别服务请求过于频繁，可稍后重试', True),
     'invalid_provider_response': ('识别服务返回了无法使用的结果', False),
+    'incomplete_provider_response': ('识别返回被截断，未作为完整结果保存；原件仍保留，可重试', True),
 }
 SNAPSHOT_FIELDS = (
     'record_id', 'raw_text', 'source_kind', 'actor_name', 'occurred_time',
     'recorded_at', 'state', 'version', 'draft', 'result_meta', 'review_notes',
-    'local_safety',
+    'local_safety', 'source_review',
     'related_record_ids', 'supersedes_id', 'confirmation_scope',
 )
 
@@ -371,6 +373,8 @@ class SQLiteStore:
                 c.execute('ALTER TABLE events ADD COLUMN safety_json TEXT')
             if 'household_id' not in cols:
                 c.execute('ALTER TABLE events ADD COLUMN household_id TEXT')
+            if 'source_review_json' not in cols:
+                c.execute('ALTER TABLE events ADD COLUMN source_review_json TEXT')
             # Account credentials were added after the first local auth
             # prototype.  Migrate in place and never store a raw password.
             user_cols = {r['name'] for r in c.execute('PRAGMA table_info(users)')}
@@ -456,6 +460,7 @@ class SQLiteStore:
         for db_field, field in (
             ('draft_json', 'draft'), ('result_meta_json', 'result_meta'),
             ('related_record_ids_json', 'related_record_ids'),
+            ('source_review_json', 'source_review'),
         ):
             raw = event.pop(db_field, None)
             event[field] = json.loads(raw) if raw else ([] if field == 'related_record_ids' else None)
@@ -488,6 +493,15 @@ class SQLiteStore:
         event = self.dec(c.execute('SELECT * FROM events WHERE record_id=?', (rid,)).fetchone())
         if event is None:
             raise NotFound('event_not_found')
+        previous, seen = event.get('supersedes_id'), {rid}
+        while previous and previous not in seen and event['source_kind'] != 'document':
+            seen.add(previous)
+            ancestor = c.execute('SELECT source_kind,supersedes_id FROM events WHERE record_id=?', (previous,)).fetchone()
+            if ancestor is None:
+                break
+            if ancestor['source_kind'] == 'document':
+                event.update(source_kind='document')
+            previous = ancestor['supersedes_id']
         return event
 
     def _versioned(self, c, rid, expected):
@@ -535,15 +549,17 @@ class SQLiteStore:
 
     def get(self, rid, household_id=None):
         with self.connection() as c:
-            if household_id:
-                return self.dec(c.execute('SELECT * FROM events WHERE record_id=? AND household_id=?', (rid, household_id)).fetchone())
-            return self.dec(c.execute('SELECT * FROM events WHERE record_id=?', (rid,)).fetchone())
+            try:
+                event = self._get(c, rid)
+            except NotFound:
+                return None
+            return event if not household_id or event['household_id'] == household_id else None
 
     def list(self, household_id=None):
         with self.connection() as c:
             if household_id:
-                return [self.dec(r) for r in c.execute('SELECT * FROM events WHERE household_id=? ORDER BY recorded_at,created_at,record_id', (household_id,))]
-            return [self.dec(r) for r in c.execute('SELECT * FROM events ORDER BY recorded_at,created_at,record_id')]
+                return [self._get(c, r['record_id']) for r in c.execute('SELECT record_id FROM events WHERE household_id=? ORDER BY recorded_at,created_at,record_id', (household_id,))]
+            return [self._get(c, r['record_id']) for r in c.execute('SELECT record_id FROM events ORDER BY recorded_at,created_at,record_id')]
 
     # --- Durable media ingestion and recognition state ---
 
@@ -1058,6 +1074,8 @@ class SQLiteStore:
                 or attempt['status'] != 'succeeded' or not attempt['text']
             ):
                 raise Conflict('stale_recognition_attempt')
+            if attempt['is_mock']:
+                raise Conflict('mock_recognition_not_linkable')
             if media['local_safety'] is None:
                 raise Conflict('safety_scan_required')
             if len(attempt['text']) > 10000:
@@ -1373,9 +1391,11 @@ class SQLiteStore:
             raise StoreError('validated_output_required')
         with self.transaction() as c:
             event = self._versioned(c, rid, expected)
+            if document_needs_review(event):
+                raise Conflict('document_source_review_required')
             if event['state'] not in {'inbox', 'needs_review', 'draft'}:
                 raise Conflict('organize_state_invalid')
-            related = [self._get(c, related_id) for related_id in event.get('related_record_ids', [])]
+            related = [item for related_id in event.get('related_record_ids', []) if not document_needs_review(item := self._get(c, related_id))]
             try:
                 try:
                     from .adapter import AdapterError, validate_output
@@ -1406,6 +1426,24 @@ class SQLiteStore:
             event = self._versioned(c, rid, expected)
             self.aud(c, rid, action, event['version'], actor, details)
 
+    def source_review(self, rid, expected, compared_with_original, actor):
+        expected = expected_version(expected)
+        text_field(actor, 'actor_name', 80)
+        if compared_with_original is not True:
+            raise StoreError('source_review_confirmation_required')
+        with self.transaction() as c:
+            event = self._versioned(c, rid, expected)
+            if event['source_kind'] != 'document' or event['state'] == 'superseded':
+                raise Conflict('source_review_not_available')
+            review = {'method': 'original_comparison', 'text': event['raw_text'], 'confirmed_at': now()}
+            c.execute('''UPDATE events SET source_review_json=?,state='inbox',draft_json=NULL,
+                result_meta_json=NULL,review_notes=NULL,version=version+1,updated_at=? WHERE record_id=?''',
+                (json.dumps(review, ensure_ascii=False), now(), rid))
+            event = self._get(c, rid)
+            self.rev(c, event, 'source_reviewed', actor)
+            self.aud(c, rid, 'source_reviewed', event['version'], actor, {'method': 'original_comparison'})
+            return event
+
     def review(self, rid, expected, action, actor, note):
         expected = expected_version(expected)
         text_field(actor, 'actor_name', 80)
@@ -1417,6 +1455,8 @@ class SQLiteStore:
             raise StoreError('return_note_required')
         with self.transaction() as c:
             event = self._versioned(c, rid, expected)
+            if document_needs_review(event):
+                raise Conflict('document_source_review_required')
             if action == 'confirm':
                 if event['state'] != 'draft':
                     raise Conflict('confirm_state_invalid')
@@ -1453,6 +1493,8 @@ class SQLiteStore:
                 if rr['household_id'] not in (None, old.get('household_id')): raise Forbidden('cross_household_reference_denied')
             # The old evidence is never edited. Its state/version and a newly
             # appended snapshot record which replacement superseded it.
+            if old['source_kind'] == 'document':
+                payload = {**payload, 'source_kind': 'document'}
             new = self._insert(c, payload, related, supersedes_id=rid, reason=reason)
             c.execute('''UPDATE events SET state='superseded',version=version+1,
                 updated_at=? WHERE record_id=? AND version=?''', (now(), rid, expected))
@@ -1502,7 +1544,15 @@ class SQLiteStore:
                 rows = c.execute('''SELECT * FROM events
                     WHERE state IN ('recorded','draft','needs_review','inbox')
                     ORDER BY recorded_at,created_at,record_id''')
-            events = [self.dec(r) for r in rows]
+            events = [self._get(c, r['record_id']) for r in rows]
+            pending = [event for event in events if document_needs_review(event)]
+            pending_ids = {event['record_id'] for event in pending}
+            for event in pending:
+                previous = event.get('supersedes_id')
+                while previous and previous not in pending_ids:
+                    pending_ids.add(previous)
+                    previous = self._get(c, previous).get('supersedes_id')
+            events = [event for event in events if not document_needs_review(event)]
             for event in events:
                 event['unresolved_reasons'] = self.unresolved_reasons(event)
                 event['unresolved'] = bool(event['unresolved_reasons'])
@@ -1517,6 +1567,9 @@ class SQLiteStore:
                 media = self._decode_media(c, row)
                 attempt = media.get('latest_attempt') or {}
                 reasons = []
+                unreviewed = media.get('record_id') in pending_ids
+                if unreviewed:
+                    reasons.append('document_source_review_required')
                 if media['recognition_status'] == 'failed':
                     reasons.append('media_recognition_failed')
                 elif media['recognition_status'] in {'not_started', 'processing', 'interrupted'}:
@@ -1537,14 +1590,15 @@ class SQLiteStore:
                     'record_id': media.get('record_id'),
                     'pending_reason': pending_reason,
                     'has_text': bool(attempt.get('text')),
-                    'local_safety': media.get('local_safety'),
+                    'local_safety': None if unreviewed else media.get('local_safety'),
                     'unresolved': bool(reasons),
                     'unresolved_reasons': reasons,
                 })
             handoff = {
                 'handoff_id': uid('handoff_'), 'created_at': now(), 'household_id': household_id, 'items': events,
+                'pending_documents': [{'record_id': event['record_id'], 'recorded_at': event['recorded_at'], 'reason': 'document_source_review_required'} for event in pending],
                 'unresolved_count': (
-                    sum(event['unresolved'] for event in events)
+                    len(pending) + sum(event['unresolved'] for event in events)
                     + sum(item['unresolved'] for item in media_attachments)
                 ),
             }
@@ -1561,4 +1615,26 @@ class SQLiteStore:
             row = c.execute('SELECT snapshot_json FROM handoffs WHERE handoff_id=?', (hid,)).fetchone()
             if row is None:
                 raise NotFound('handoff_not_found')
-            return json.loads(row['snapshot_json'])
+            saved = json.loads(row['snapshot_json'])
+            # Historical snapshots may predate source inheritance in _get and
+            # label a document-derived revision as patient speech. Normalize
+            # only the source identity for this response; keep its text, review
+            # attestation, and timestamps frozen at snapshot time.
+            for item in saved.get('items', []):
+                if item.get('source_kind') == 'document' or not item.get('supersedes_id'):
+                    continue
+                try:
+                    current = self._get(c, item.get('record_id'))
+                except NotFound:
+                    continue
+                if current.get('source_kind') == 'document':
+                    item['source_kind'] = 'document'
+            pending = [event for event in saved['items'] if document_needs_review(event)]
+            if pending:
+                saved['items'] = [event for event in saved['items'] if not document_needs_review(event)]
+                saved['pending_documents'] = saved.get('pending_documents', []) + [{'record_id': event['record_id'], 'recorded_at': event['recorded_at'], 'reason': 'document_source_review_required'} for event in pending]
+                for item in saved.get('media_attachments', []):
+                    if item.get('kind') == 'image':
+                        item.update(local_safety=None, unresolved=True)
+                saved['unresolved_count'] = len(saved['pending_documents']) + sum(bool(item.get('unresolved')) for item in saved['items'] + saved.get('media_attachments', []))
+            return saved

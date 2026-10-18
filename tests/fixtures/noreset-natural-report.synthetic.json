@@ -1,0 +1,668 @@
+{
+  "conversation_id": "conversation_3001b2e17e6a4b3686948dc6d83f6659",
+  "local_date": "2026-10-09",
+  "last_local_date": "2026-10-09",
+  "created_at": "2026-10-09T10:37:46.432Z",
+  "updated_at": "2026-10-09T15:03:24.254Z",
+  "status": "paused",
+  "version": 22,
+  "turns": [
+    {
+      "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+      "role": "assistant",
+      "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+      "action": "ask",
+      "question_category": "main_complaint",
+      "created_at": "2026-10-09T10:37:46.432Z",
+      "version": 1
+    },
+    {
+      "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+      "role": "elder",
+      "original_text": "我咳嗽两天了，晚上明显些。",
+      "text": "我咳嗽两天了，晚上明显些。",
+      "source_kind": "audio_transcript",
+      "record_id": "rec_731878cfff954398993ee79f0f1c5716",
+      "media_id": "media_858a368d6c1b4246aa91be47fdb7cf1a",
+      "local_safety": {
+        "danger_detected": false,
+        "escalation_level": "none",
+        "review_role": "none",
+        "danger_reminder": null,
+        "matched_rules": [],
+        "safety_rule_version": "offline-danger-v2",
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_review_flags": [],
+        "clinical_review_version": "offline-review-flags-v1",
+        "clinical_review_status": "not_flagged",
+        "clinical_review_required": false,
+        "clinical_review_role": null,
+        "clinical_review_notice": null
+      },
+      "created_at": "2026-10-09T10:38:03.749Z",
+      "version": 1,
+      "versions": [],
+      "responding_to": {
+        "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+        "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？"
+      }
+    },
+    {
+      "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+      "role": "assistant",
+      "text": "您说的咳嗽两天、晚上更明显，我记下了。",
+      "action": "reply",
+      "question_category": null,
+      "stop_reason": "awaiting_user",
+      "created_at": "2026-10-09T11:19:40.617Z",
+      "version": 1,
+      "ai_failed": false
+    },
+    {
+      "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+      "role": "elder",
+      "original_text": "我刚才说错了，不是两天，是三天。",
+      "text": "我刚才说错了，不是两天，是三天。",
+      "source_kind": "elder",
+      "record_id": "rec_2fbbbcf6ec564e91a22776d7ba086e97",
+      "media_id": null,
+      "local_safety": {
+        "danger_detected": false,
+        "escalation_level": "none",
+        "review_role": "none",
+        "danger_reminder": null,
+        "matched_rules": [],
+        "safety_rule_version": "offline-danger-v2",
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_review_flags": [],
+        "clinical_review_version": "offline-review-flags-v1",
+        "clinical_review_status": "not_flagged",
+        "clinical_review_required": false,
+        "clinical_review_role": null,
+        "clinical_review_notice": null
+      },
+      "created_at": "2026-10-09T11:19:40.762Z",
+      "version": 1,
+      "versions": [],
+      "responding_to": {
+        "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+        "text": "您说的咳嗽两天、晚上更明显，我记下了。"
+      }
+    },
+    {
+      "turn_id": "turn_9b0c45209d4a4b389bfe28a2f675283f",
+      "role": "assistant",
+      "text": "好的，我把咳嗽的时间改成三天，不是两天。 咳嗽的时候有痰吗，还是干咳？",
+      "action": "ask",
+      "question_category": "symptom_character",
+      "stop_reason": null,
+      "created_at": "2026-10-09T12:22:50.783Z",
+      "version": 1,
+      "ai_failed": false
+    },
+    {
+      "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+      "role": "elder",
+      "original_text": "大多是干咳，偶尔有一点白痰。",
+      "text": "大多是干咳，偶尔有一点白痰。",
+      "source_kind": "elder",
+      "record_id": "rec_f969f5a6bf7e44e9b40fdeed55cf18a8",
+      "media_id": null,
+      "local_safety": {
+        "danger_detected": false,
+        "escalation_level": "none",
+        "review_role": "none",
+        "danger_reminder": null,
+        "matched_rules": [],
+        "safety_rule_version": "offline-danger-v2",
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_review_flags": [],
+        "clinical_review_version": "offline-review-flags-v1",
+        "clinical_review_status": "not_flagged",
+        "clinical_review_required": false,
+        "clinical_review_role": null,
+        "clinical_review_notice": null
+      },
+      "created_at": "2026-10-09T13:17:02.781Z",
+      "version": 1,
+      "versions": [],
+      "responding_to": {
+        "turn_id": "turn_9b0c45209d4a4b389bfe28a2f675283f",
+        "text": "好的，我把咳嗽的时间改成三天，不是两天。 咳嗽的时候有痰吗，还是干咳？"
+      }
+    },
+    {
+      "turn_id": "turn_a06d10d16d2344c99000df4c14104c14",
+      "role": "assistant",
+      "text": "好的，我把咳嗽时间改成三天，也记下大多是干咳、偶尔有一点白痰。",
+      "action": "reply",
+      "question_category": null,
+      "stop_reason": "awaiting_user",
+      "created_at": "2026-10-09T14:07:16.968Z",
+      "version": 1,
+      "ai_failed": false
+    },
+    {
+      "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+      "role": "elder",
+      "original_text": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。",
+      "text": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。",
+      "source_kind": "elder",
+      "record_id": "rec_f1b2d55b11b545b7979753ff8618041b",
+      "media_id": null,
+      "local_safety": {
+        "danger_detected": false,
+        "escalation_level": "none",
+        "review_role": "none",
+        "danger_reminder": null,
+        "matched_rules": [],
+        "safety_rule_version": "offline-danger-v2",
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_review_flags": [],
+        "clinical_review_version": "offline-review-flags-v1",
+        "clinical_review_status": "not_flagged",
+        "clinical_review_required": false,
+        "clinical_review_role": null,
+        "clinical_review_notice": null
+      },
+      "created_at": "2026-10-09T14:11:35.098Z",
+      "version": 1,
+      "versions": [],
+      "responding_to": {
+        "turn_id": "turn_a06d10d16d2344c99000df4c14104c14",
+        "text": "好的，我把咳嗽时间改成三天，也记下大多是干咳、偶尔有一点白痰。"
+      }
+    },
+    {
+      "turn_id": "turn_55648dd9384f4551bf62756d8475a05a",
+      "role": "assistant",
+      "text": "好的，我按您更正后的说法记录：咳嗽三天，主要是干咳，白痰是前天出现过，今天没有痰；体温您还没量过。",
+      "action": "reply",
+      "question_category": null,
+      "stop_reason": "awaiting_user",
+      "created_at": "2026-10-09T14:12:17.909Z",
+      "version": 1,
+      "ai_failed": false
+    },
+    {
+      "turn_id": "turn_95f20c1739de4823b530864a761a6131",
+      "role": "elder",
+      "original_text": "先说到这里，帮我整理给医生看。",
+      "text": "先说到这里，帮我整理给医生看。",
+      "source_kind": "elder",
+      "record_id": "rec_38b41fce337a4ed4a7ba51186e4fcf71",
+      "media_id": null,
+      "local_safety": {
+        "danger_detected": false,
+        "escalation_level": "none",
+        "review_role": "none",
+        "danger_reminder": null,
+        "matched_rules": [],
+        "safety_rule_version": "offline-danger-v2",
+        "legacy_clinical_review_status": "active_unvalidated",
+        "clinical_review_flags": [],
+        "clinical_review_version": "offline-review-flags-v1",
+        "clinical_review_status": "not_flagged",
+        "clinical_review_required": false,
+        "clinical_review_role": null,
+        "clinical_review_notice": null
+      },
+      "created_at": "2026-10-09T14:19:15.129Z",
+      "version": 1,
+      "versions": [],
+      "responding_to": {
+        "turn_id": "turn_55648dd9384f4551bf62756d8475a05a",
+        "text": "好的，我按您更正后的说法记录：咳嗽三天，主要是干咳，白痰是前天出现过，今天没有痰；体温您还没量过。"
+      }
+    },
+    {
+      "turn_id": "turn_d3c70ab913684bd4a6aad57035da1f2e",
+      "role": "assistant",
+      "text": "好的，先到这里。您说过的原话会保留，之后可以回来继续。",
+      "action": "finish",
+      "question_category": null,
+      "stop_reason": "user_finished",
+      "created_at": "2026-10-09T14:19:43.682Z",
+      "version": 1,
+      "ai_failed": false
+    }
+  ],
+  "controller": {
+    "asked_categories": [
+      "main_complaint",
+      "symptom_character"
+    ],
+    "closed_categories": [],
+    "question_counts": {
+      "main_complaint": 1,
+      "onset_course": 0,
+      "symptom_character": 1,
+      "aggravating_relieving": 0,
+      "associated_symptoms": 0,
+      "functional_impact": 0,
+      "relevant_history": 0,
+      "prior_actions_results": 0
+    },
+    "asked_questions": [
+      "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+      "咳嗽的时候有痰吗，还是干咳？"
+    ],
+    "question_count": 2,
+    "no_new_fact_count": 1,
+    "last_question_category": null,
+    "linked_context_ids": [],
+    "grounded_answers": [
+      {
+        "category": "symptom_character",
+        "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+        "version": 1,
+        "quote": "大多是干咳，偶尔有一点白痰。",
+        "responding_to": {
+          "turn_id": "turn_9b0c45209d4a4b389bfe28a2f675283f",
+          "text": "好的，我把咳嗽的时间改成三天，不是两天。 咳嗽的时候有痰吗，还是干咳？"
+        },
+        "question": "咳嗽的时候有痰吗，还是干咳？",
+        "correction": {
+          "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+          "version": 1,
+          "quote": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。",
+          "responding_to": {
+            "turn_id": "turn_a06d10d16d2344c99000df4c14104c14",
+            "text": "好的，我把咳嗽时间改成三天，也记下大多是干咳、偶尔有一点白痰。"
+          }
+        }
+      }
+    ]
+  },
+  "active_episode_start_turn_id": null,
+  "completeness": {
+    "complete": false,
+    "clinical_state": {
+      "main_complaint": {
+        "status": "known",
+        "summary": "我咳嗽",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2"
+        ],
+        "context_ids": []
+      },
+      "onset_course": {
+        "status": "known",
+        "summary": "晚上明显些；三天",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2",
+          "turn_902dbb0381754982a955cb2ce07eda32"
+        ],
+        "context_ids": []
+      },
+      "symptom_character": {
+        "status": "known",
+        "summary": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。",
+        "evidence_turn_ids": [
+          "turn_7dfe07fed7e84974a92597703a659a29"
+        ],
+        "context_ids": []
+      },
+      "aggravating_relieving": {
+        "status": "known",
+        "summary": "晚上明显些。",
+        "evidence_turn_ids": [
+          "turn_995fb60fedaf4506b85425e186272ce2"
+        ],
+        "context_ids": []
+      },
+      "associated_symptoms": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "functional_impact": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "relevant_history": {
+        "status": "missing",
+        "summary": "",
+        "evidence_turn_ids": [],
+        "context_ids": []
+      },
+      "prior_actions_results": {
+        "status": "known",
+        "summary": "我没量体温。",
+        "evidence_turn_ids": [
+          "turn_7dfe07fed7e84974a92597703a659a29"
+        ],
+        "context_ids": []
+      }
+    },
+    "evidence_turn_ids": [
+      "turn_995fb60fedaf4506b85425e186272ce2",
+      "turn_902dbb0381754982a955cb2ce07eda32",
+      "turn_7dfe07fed7e84974a92597703a659a29"
+    ],
+    "relevant_context_ids": [],
+    "unknowns": [],
+    "contradictions": [
+      {
+        "text": "大多是干咳，偶尔有一点白痰。；刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。",
+        "evidence_turn_ids": [
+          "turn_0ed4bfd8e9c241dc9730041263de970e",
+          "turn_7dfe07fed7e84974a92597703a659a29"
+        ],
+        "context_ids": []
+      }
+    ]
+  },
+  "report": {
+    "report_id": "report_58dc989b4d704d4480e079873ee485eb",
+    "format_version": 5,
+    "title": "就诊沟通记录",
+    "status": "auto_unreviewed",
+    "status_label": "自动整理 · 本人未核对",
+    "version": 1,
+    "generated_at": "2026-10-09T15:03:24.258Z",
+    "source_turn_ids": [
+      "turn_995fb60fedaf4506b85425e186272ce2",
+      "turn_902dbb0381754982a955cb2ce07eda32",
+      "turn_0ed4bfd8e9c241dc9730041263de970e",
+      "turn_7dfe07fed7e84974a92597703a659a29",
+      "turn_95f20c1739de4823b530864a761a6131"
+    ],
+    "source_versions": [
+      {
+        "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+        "version": 1,
+        "quote": "我咳嗽两天了，晚上明显些。"
+      },
+      {
+        "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+        "version": 1,
+        "quote": "我刚才说错了，不是两天，是三天。"
+      },
+      {
+        "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+        "version": 1,
+        "quote": "大多是干咳，偶尔有一点白痰。"
+      },
+      {
+        "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+        "version": 1,
+        "quote": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。"
+      },
+      {
+        "turn_id": "turn_95f20c1739de4823b530864a761a6131",
+        "version": 1,
+        "quote": "先说到这里，帮我整理给医生看。"
+      }
+    ],
+    "source_context_ids": [],
+    "reviewed_risk_assessments": [],
+    "legacy_clinical_review_status": "active_unvalidated",
+    "clinical_validation_status": "not_verified_by_this_application",
+    "sections": [
+      {
+        "key": "chief_complaint",
+        "title": "主要不适",
+        "lines": [
+          {
+            "kind": "summary",
+            "text": "我咳嗽",
+            "tags": [
+              "当前整理 · 待核对"
+            ],
+            "source_turn_ids": [
+              "turn_995fb60fedaf4506b85425e186272ce2"
+            ],
+            "source_context_ids": [],
+            "source_versions": [
+              {
+                "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+                "version": 1,
+                "quote": "我咳嗽两天了，晚上明显些。"
+              }
+            ],
+            "source_label": "当前原话 1 · 本人未核对"
+          }
+        ]
+      },
+      {
+        "key": "onset_course",
+        "title": "起病与变化",
+        "lines": [
+          {
+            "kind": "summary",
+            "text": "晚上明显些；三天",
+            "tags": [
+              "当前整理 · 待核对"
+            ],
+            "source_turn_ids": [
+              "turn_995fb60fedaf4506b85425e186272ce2",
+              "turn_902dbb0381754982a955cb2ce07eda32"
+            ],
+            "source_context_ids": [],
+            "source_versions": [
+              {
+                "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+                "version": 1,
+                "quote": "我咳嗽两天了，晚上明显些。"
+              },
+              {
+                "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+                "version": 1,
+                "quote": "我刚才说错了，不是两天，是三天。"
+              }
+            ],
+            "source_label": "当前原话 1、2 · 本人未核对"
+          }
+        ]
+      },
+      {
+        "key": "symptoms_impact",
+        "title": "症状特点与生活影响",
+        "lines": [
+          {
+            "kind": "summary",
+            "text": "晚上明显些。",
+            "tags": [
+              "当前整理 · 待核对"
+            ],
+            "source_turn_ids": [
+              "turn_995fb60fedaf4506b85425e186272ce2"
+            ],
+            "source_context_ids": [],
+            "source_versions": [
+              {
+                "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+                "version": 1,
+                "quote": "我咳嗽两天了，晚上明显些。"
+              }
+            ],
+            "source_label": "当前原话 1 · 本人未核对"
+          }
+        ]
+      },
+      {
+        "key": "background_actions",
+        "title": "相关背景与已做处理",
+        "lines": [
+          {
+            "kind": "summary",
+            "text": "我没量体温。",
+            "tags": [
+              "当前整理 · 待核对"
+            ],
+            "source_turn_ids": [
+              "turn_7dfe07fed7e84974a92597703a659a29"
+            ],
+            "source_context_ids": [],
+            "source_versions": [
+              {
+                "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+                "version": 1,
+                "quote": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。"
+              }
+            ],
+            "source_label": "当前原话 4 · 本人未核对"
+          }
+        ]
+      },
+      {
+        "key": "verification",
+        "title": "尚待医生核实",
+        "lines": [
+          {
+            "kind": "check",
+            "text": "这些原话可能有出入：“大多是干咳，偶尔有一点白痰。”；“刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。”",
+            "tags": [
+              "原话有出入"
+            ],
+            "source_turn_ids": [
+              "turn_0ed4bfd8e9c241dc9730041263de970e",
+              "turn_7dfe07fed7e84974a92597703a659a29"
+            ],
+            "source_label": "请结合原话确认"
+          },
+          {
+            "kind": "check",
+            "text": "尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、相关既往情况或相似经历。",
+            "tags": [
+              "信息未完整"
+            ],
+            "source_label": "继续对话后会自动补充"
+          }
+        ]
+      }
+    ],
+    "transcript": [
+      {
+        "turn_id": "turn_ffb772930dc946a58acb638df8fbbc24",
+        "role": "assistant",
+        "text": "您好，我会帮您把不舒服的地方记清楚，方便和医生说。您今天最难受的是什么？",
+        "source_kind": "system",
+        "created_at": "2026-10-09T10:37:46.432Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+        "role": "elder",
+        "text": "我咳嗽两天了，晚上明显些。",
+        "source_kind": "audio_transcript",
+        "created_at": "2026-10-09T10:38:03.749Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_c6eb0f1002e64203b293ea9e7f77c1df",
+        "role": "assistant",
+        "text": "您说的咳嗽两天、晚上更明显，我记下了。",
+        "source_kind": "system",
+        "created_at": "2026-10-09T11:19:40.617Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+        "role": "elder",
+        "text": "我刚才说错了，不是两天，是三天。",
+        "source_kind": "elder",
+        "created_at": "2026-10-09T11:19:40.762Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_9b0c45209d4a4b389bfe28a2f675283f",
+        "role": "assistant",
+        "text": "好的，我把咳嗽的时间改成三天，不是两天。 咳嗽的时候有痰吗，还是干咳？",
+        "source_kind": "system",
+        "created_at": "2026-10-09T12:22:50.783Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+        "role": "elder",
+        "text": "大多是干咳，偶尔有一点白痰。",
+        "source_kind": "elder",
+        "created_at": "2026-10-09T13:17:02.781Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_a06d10d16d2344c99000df4c14104c14",
+        "role": "assistant",
+        "text": "好的，我把咳嗽时间改成三天，也记下大多是干咳、偶尔有一点白痰。",
+        "source_kind": "system",
+        "created_at": "2026-10-09T14:07:16.968Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+        "role": "elder",
+        "text": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。",
+        "source_kind": "elder",
+        "created_at": "2026-10-09T14:11:35.098Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_55648dd9384f4551bf62756d8475a05a",
+        "role": "assistant",
+        "text": "好的，我按您更正后的说法记录：咳嗽三天，主要是干咳，白痰是前天出现过，今天没有痰；体温您还没量过。",
+        "source_kind": "system",
+        "created_at": "2026-10-09T14:12:17.909Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_95f20c1739de4823b530864a761a6131",
+        "role": "elder",
+        "text": "先说到这里，帮我整理给医生看。",
+        "source_kind": "elder",
+        "created_at": "2026-10-09T14:19:15.129Z",
+        "version": 1
+      },
+      {
+        "turn_id": "turn_d3c70ab913684bd4a6aad57035da1f2e",
+        "role": "assistant",
+        "text": "好的，先到这里。您说过的原话会保留，之后可以回来继续。",
+        "source_kind": "system",
+        "created_at": "2026-10-09T14:19:43.682Z",
+        "version": 1
+      }
+    ],
+    "body": "主要不适\n- 当前整理 · 待核对：我咳嗽\n\n起病与变化\n- 当前整理 · 待核对：晚上明显些；三天\n\n症状特点与生活影响\n- 当前整理 · 待核对：晚上明显些。\n\n相关背景与已做处理\n- 当前整理 · 待核对：我没量体温。\n\n尚待医生核实\n- 原话有出入：这些原话可能有出入：“大多是干咳，偶尔有一点白痰。”；“刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。”\n- 信息未完整：尚未问清：具体感觉和严重程度、是否同时出现其他身体变化、对走路、睡眠、进食或自理的影响、相关既往情况或相似经历。\n\n老人原话历史（按说话顺序完整保留）\n1. 我咳嗽两天了，晚上明显些。\n2. 我刚才说错了，不是两天，是三天。\n3. 大多是干咳，偶尔有一点白痰。\n4. 刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。\n5. 先说到这里，帮我整理给医生看。",
+    "disclaimer": "用于和医生沟通，不是诊断，也不包含用药或治疗建议。"
+  },
+  "health_context": [],
+  "selected_context_ids": [],
+  "health_context_version": 0,
+  "analysis_sources": {
+    "turns": [
+      {
+        "turn_id": "turn_995fb60fedaf4506b85425e186272ce2",
+        "version": 1,
+        "quote": "我咳嗽两天了，晚上明显些。"
+      },
+      {
+        "turn_id": "turn_902dbb0381754982a955cb2ce07eda32",
+        "version": 1,
+        "quote": "我刚才说错了，不是两天，是三天。"
+      },
+      {
+        "turn_id": "turn_0ed4bfd8e9c241dc9730041263de970e",
+        "version": 1,
+        "quote": "大多是干咳，偶尔有一点白痰。"
+      },
+      {
+        "turn_id": "turn_7dfe07fed7e84974a92597703a659a29",
+        "version": 1,
+        "quote": "刚才说错了，白痰是前天的，今天没有痰，主要是干咳。我没量体温。"
+      },
+      {
+        "turn_id": "turn_95f20c1739de4823b530864a761a6131",
+        "version": 1,
+        "quote": "先说到这里，帮我整理给医生看。"
+      }
+    ],
+    "selected_context_ids": [],
+    "context_version": 0,
+    "context": []
+  },
+  "relevant_health_context": []
+}

@@ -252,8 +252,8 @@ def loopback_auto_bind_allowed(client_host: str, origin: str | None, allowed_ori
         client_is_loopback = ipaddress.ip_address(client_host).is_loopback
         parsed_origin = urlparse((origin or "").strip().rstrip("/"))
         parsed_allowed = urlparse(allowed_origin.strip().rstrip("/"))
-        origin_is_loopback = bool(parsed_origin.hostname) and ipaddress.ip_address(parsed_origin.hostname).is_loopback
-        allowed_is_loopback = bool(parsed_allowed.hostname) and ipaddress.ip_address(parsed_allowed.hostname).is_loopback
+        origin_is_loopback = _is_loopback_host(parsed_origin.hostname)
+        allowed_is_loopback = _is_loopback_host(parsed_allowed.hostname)
     except ValueError:
         return False
     return bool(
@@ -263,3 +263,14 @@ def loopback_auto_bind_allowed(client_host: str, origin: str | None, allowed_ori
         and parsed_origin.scheme in {"http", "https"}
         and parsed_origin.geturl() == parsed_allowed.geturl()
     )
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower().rstrip(".") == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

@@ -1,5 +1,5 @@
 {
-  "name": "bing-li-bu-gui-ling-contracts",
+  "name": "noreset-contracts",
   "private": true,
   "scripts": {
     "check:contracts": "tsc --project tsconfig.contracts.json"

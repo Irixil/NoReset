@@ -44,6 +44,29 @@ def failed_names(report):
     return [check["name"] for check in report["checks"] if not check["passed"]]
 
 
+def install_contract_fixtures(monkeypatch, backend):
+    """Use deterministic, explicitly non-provider fixtures for HTTP workflow tests."""
+    config = replace(adapter.Config.from_env(), provider="openai_compatible")
+    monkeypatch.setattr(server.Config, "from_env", classmethod(lambda cls: config))
+
+    class ContractFixtureProvider(adapter.MockProvider):
+        pass
+
+    monkeypatch.setattr(
+        server, "organize_event",
+        lambda payload: adapter.organize_event(payload, ContractFixtureProvider()),
+    )
+
+    def recognize(_path, *, kind, attempt_id, **_kwargs):
+        text = "合成语音内容：今天散步十分钟。" if kind == "audio" else "合成图片文字：家庭记录资料。"
+        return {
+            "text": text, "provider": "contract_fixture", "model": "fixture",
+            "is_mock": False, "attempt_id": attempt_id,
+        }
+
+    backend._recognition._recognizer = recognize
+
+
 def test_default_refuses_mock_and_makes_no_writes(deployment, tmp_path):
     url, store, _, audio, image = deployment
     output = io.StringIO()
@@ -59,8 +82,9 @@ def test_default_refuses_mock_and_makes_no_writes(deployment, tmp_path):
     assert all(call["method"] == "GET" for call in report["http_calls"])
 
 
-def test_explicit_offline_runs_full_http_path_without_overriding_environment(deployment):
-    url, store, _, audio, image = deployment
+def test_contract_fixture_runs_full_http_path_without_overriding_environment(deployment, monkeypatch):
+    url, store, backend, audio, image = deployment
+    install_contract_fixtures(monkeypatch, backend)
     env_before = dict(os.environ)
     report = SelfTest(url, audio=audio, image=image, allow_mock=True).run()
     assert report["passed"] is True, failed_names(report)
@@ -76,7 +100,7 @@ def test_explicit_offline_runs_full_http_path_without_overriding_environment(dep
             "audio.original_equal", "image.original_equal", "audio.recognition_idempotent", "image.linked"} <= names
     assert server.SESSION_TOKEN not in json.dumps(report)
     assert str(audio) not in json.dumps(report)
-    assert report["providers"]["audio"]["is_mock"] is True
+    assert report["providers"]["audio"]["is_mock"] is False
     assert len([call for call in report["http_calls"] if call["name"].startswith("audio.part_")]) > 2
 
 
@@ -89,8 +113,9 @@ def test_missing_sample_is_reported_without_writes(deployment):
     assert not store.list_media()
 
 
-def test_expected_transcript_mismatch_cannot_pass(deployment):
-    url, _, _, audio, image = deployment
+def test_expected_transcript_mismatch_cannot_pass(deployment, monkeypatch):
+    url, _, backend, audio, image = deployment
+    install_contract_fixtures(monkeypatch, backend)
     report = SelfTest(url, audio=audio, image=image, allow_mock=True,
                       audio_expect=["this_text_is_not_in_mock_transcript"]).run()
     assert not report["passed"]
@@ -155,7 +180,7 @@ def test_real_health_label_does_not_make_mock_results_pass(deployment, monkeypat
     monkeypatch.setattr(server, "organize_event", lambda payload: adapter.organize_event(payload, adapter.MockProvider()))
     report = SelfTest(url, audio=audio, image=image, audio_expect=["Mock"], image_expect=["Mock"]).run()
     assert not report["passed"] and not report["online_passed"]
-    assert {"text.real_provider", "audio.real_recognition", "image.real_recognition"} <= set(failed_names(report))
+    assert {"text.real_provider", "audio.recognition_success", "image.recognition_success"} <= set(failed_names(report))
 
 
 def test_real_mode_contract_with_controlled_provider_substitutes(deployment, monkeypatch):

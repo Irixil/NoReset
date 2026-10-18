@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.recognition import recognize_file
 from backend.media_service import MediaRecognitionService
 from backend.store import SQLiteStore
 
@@ -174,31 +173,60 @@ def _saved_audio(tmp_path: Path) -> tuple[dict, Path]:
     )
 
 
+def _synthetic_recognizer(text: str):
+    def recognize(_path, **kwargs):
+        return {"text": text, "provider": "synthetic-test", "model": "fixture", "is_mock": False, "attempt_id": kwargs["attempt_id"]}
+    return recognize
+
+
 def test_saved_audio_is_recognized_scanned_and_linked_without_auto_confirmation(tmp_path):
     media, original = _saved_audio(tmp_path)
     original_bytes = original.read_bytes()
     store = _MediaStore(SQLiteStore(tmp_path / "events.sqlite3"), media)
-    service = MediaRecognitionService(store, _FileStore({"media_1": original}))
+    service = MediaRecognitionService(store, _FileStore({"media_1": original}), recognizer=_synthetic_recognizer("我头晕"))
 
     result = service.recognize_media(
         "media_1",
         expected_version=1,
         idempotency_key="recognize-1",
         actor="老人",
-        provider="mock",
     )
 
-    assert result["attempt"]["text"] == "[Mock ASR] original.wav"
-    assert result["attempt"]["provider"] == "mock"
-    assert result["attempt"]["is_mock"] is True
+    assert result["attempt"]["text"] == "我头晕"
+    assert result["attempt"]["provider"] == "synthetic-test"
+    assert result["attempt"]["is_mock"] is False
     assert result["attempt"]["local_safety"]["danger_detected"] is False
     assert result["media"]["recognition_status"] == "succeeded"
     assert result["media"]["link_status"] == "linked"
-    assert result["event"]["raw_text"] == "[Mock ASR] original.wav"
+    assert result["event"]["raw_text"] == "我头晕"
     assert result["event"]["source_kind"] == "audio_transcript"
     assert result["event"]["state"] == "inbox"
     assert original.read_bytes() == original_bytes
     assert store.operations == ["claim", "save_text", "save_safety", "link_event"]
+
+
+def test_mock_transcript_fails_without_saving_patient_text_or_creating_event(tmp_path):
+    media, original = _saved_audio(tmp_path)
+    original_bytes = original.read_bytes()
+    store = _MediaStore(SQLiteStore(tmp_path / "events.sqlite3"), media)
+    service = MediaRecognitionService(
+        store,
+        _FileStore({"media_1": original}),
+        recognizer=lambda _path, **kwargs: {
+            "text": "[Mock ASR] original.wav", "provider": "mock", "model": "fixture",
+            "is_mock": True, "attempt_id": kwargs["attempt_id"],
+        },
+    )
+
+    result = service.recognize_media("media_1", 1, "recognize-mock", "老人", provider="mock")
+
+    assert result["media"]["recognition_status"] == "failed"
+    assert result["attempt"]["error_code"] == "provider_mock"
+    assert result["attempt"].get("text") is None
+    assert result["media"]["link_status"] == "not_linked"
+    assert store.event is None
+    assert store.operations == ["claim", "save_failure"]
+    assert original.read_bytes() == original_bytes
 
 
 def test_recognition_failure_is_persisted_without_losing_original_or_creating_event(tmp_path):
@@ -225,20 +253,22 @@ def test_recognition_failure_is_persisted_without_losing_original_or_creating_ev
 
 def test_dangerous_machine_text_is_persisted_and_scanned_before_event_link(tmp_path):
     media, original = _saved_audio(tmp_path)
-    dangerous_original = original.with_name("胸闷喘不上气.wav")
+    dangerous_original = original.with_name("voice.wav")
     original.rename(dangerous_original)
     store = _MediaStore(SQLiteStore(tmp_path / "events.sqlite3"), media)
-    service = MediaRecognitionService(store, _FileStore({"media_1": dangerous_original}))
+    service = MediaRecognitionService(
+        store, _FileStore({"media_1": dangerous_original}),
+        recognizer=_synthetic_recognizer("今天胸闷，而且喘不上气。"),
+    )
 
     result = service.recognize_media(
         "media_1",
         expected_version=1,
         idempotency_key="recognize-danger",
         actor="老人",
-        provider="mock",
     )
 
-    assert result["attempt"]["text"] == "[Mock ASR] 胸闷喘不上气.wav"
+    assert result["attempt"]["text"] == "今天胸闷，而且喘不上气。"
     assert result["attempt"]["local_safety"]["danger_detected"] is True
     assert result["attempt"]["local_safety"]["danger_reminder"]
     assert result["event"]["local_safety"]["danger_detected"] is True
@@ -254,7 +284,7 @@ def test_same_recognition_key_replays_one_attempt_and_one_event(tmp_path):
     def counted_recognize(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return recognize_file(*args, **kwargs)
+        return _synthetic_recognizer("我头晕")(*args, **kwargs)
 
     service = MediaRecognitionService(
         store,
@@ -262,13 +292,12 @@ def test_same_recognition_key_replays_one_attempt_and_one_event(tmp_path):
         recognizer=counted_recognize,
     )
 
-    first = service.recognize_media("media_1", 1, "same-key", "老人", provider="mock")
+    first = service.recognize_media("media_1", 1, "same-key", "老人")
     replay = service.recognize_media(
         "media_1",
         first["media"]["version"],
         "same-key",
         "老人",
-        provider="mock",
     )
 
     assert calls == 1

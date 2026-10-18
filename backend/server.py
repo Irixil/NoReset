@@ -5,23 +5,32 @@ from email.policy import default as email_policy
 from dataclasses import asdict, is_dataclass
 from urllib.error import URLError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import nullcontext
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 try:
  from .adapter import AdapterError, Config, organize_event, PROMPT_VERSION, SCHEMA_VERSION, PROMPT_SHA256, payload_sha256
- from . import app_access, cloud_backup
+ from .conversation import ConversationError, conversation_turn, reground_report, payload_sha256 as conversation_payload_sha256
+ from . import app_access, cloud_backup, saved_audio_trial, text_trial, trial_gate
+ from .ai_limits import AIRequestLimiter
+ from .capabilities import local_first_capabilities
  from .media_backend import create_default_media_backend
  from .media_store import MediaStoreError
  from .recognition import RecognitionError, recognize_file
- from .safety import scan_danger
+ from .model_client import product_execution_scope, reset_trial_context, stop_current_trial, trial_control
+ from .safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from .store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 except ImportError:
  from adapter import AdapterError, Config, organize_event, PROMPT_VERSION, SCHEMA_VERSION, PROMPT_SHA256, payload_sha256
- import app_access, cloud_backup
+ from conversation import ConversationError, conversation_turn, reground_report, payload_sha256 as conversation_payload_sha256
+ import app_access, cloud_backup, saved_audio_trial, text_trial, trial_gate
+ from ai_limits import AIRequestLimiter
+ from capabilities import local_first_capabilities
  from media_backend import create_default_media_backend
  from media_store import MediaStoreError
  from recognition import RecognitionError, recognize_file
- from safety import scan_danger
+ from model_client import product_execution_scope, reset_trial_context, stop_current_trial, trial_control
+ from safety import scan_danger, document_needs_review, reviewed_risk_manifest
  from store import SQLiteStore, StoreError, NotFound, Conflict, Unauthorized, Forbidden, expected_version
 ROOT=Path(__file__).resolve().parents[1]
 # The elder UI is plain HTML/JS; serve its source when no optional build exists.
@@ -35,6 +44,7 @@ ALLOWED_ORIGIN=os.getenv('ALLOWED_ORIGIN','')
 MAX_MEDIA_REQUEST_BYTES=int(os.getenv('MEDIA_REQUEST_MAX_BYTES','0') or '0')
 MEDIA_ROOT=os.getenv('MEDIA_ROOT',str(ROOT/'runtime'/'media'))
 MEDIA_BACKEND=None if app_access.local_first_enabled() else create_default_media_backend(STORE,root=MEDIA_ROOT)
+AI_REQUEST_LIMITER=AIRequestLimiter()
 
 _SAFE_MEDIA_ID=re.compile(r'^(?:media|upload)_[A-Za-z0-9_-]+$')
 
@@ -54,6 +64,7 @@ def _media_error_status(error):
  code=getattr(error,'code',str(error))
  if code in {'limit_exceeded','request_too_large'}:return 413
  if code=='media_limits_not_configured':return 503
+ if code in {'trial_authorization_required','trial_budget_exhausted'}:return 503
  if code in {'invalid_media','integrity_mismatch'}:return 422
  if code in {'storage_failed','storage_corrupt','unsafe_storage'}:return 500
  if code in {'unsupported_format','content_type_kind_mismatch'}:return 415
@@ -71,6 +82,7 @@ def _media_error_code(error):
   'provider_unavailable','provider_not_configured','provider_auth_failed',
   'provider_rate_limited','invalid_provider_response','no_text_detected','storage_failed',
   'storage_corrupt','unsafe_storage','media_limits_not_configured','invalid_range',
+  'trial_authorization_required','trial_budget_exhausted',
  }
  return code if code in known else 'media_request_failed'
 
@@ -110,7 +122,7 @@ def request_actor(b):
 def model_evidence(event):
  # Only original evidence crosses the model boundary. Prior drafts, audit
  # notes, review state and model output must never become new source facts.
- return {key:event.get(key) for key in ('record_id','raw_text','source_kind','recorded_at','occurred_time')}
+ return {key:event.get(key) for key in ('record_id','raw_text','source_kind','recorded_at','occurred_time')} | ({'source_review':event.get('source_review')} if event.get('source_kind')=='document' else {})
 
 def configured_model_metadata():
  try:
@@ -119,13 +131,19 @@ def configured_model_metadata():
  except (ValueError,TypeError):
   return {'provider':None,'model_id':None}
 
+def _mock_text_provider():
+ try:return Config.from_env().provider=='mock'
+ except (AdapterError,ValueError,TypeError):return False
+
 def model_failure_details(error):
  # Use known codes, never a remote message/body, URL or arbitrary error field.
  messages={'model_timeout':'模型超时','model_network_error':'网络连接失败',
            'model_configuration_invalid':'模型配置无效','model_redirect_rejected':'模型地址返回重定向，已拒绝转发',
            'model_response_too_large':'模型响应超过大小限制','model_output_truncated':'模型输出被截断',
            'model_response_invalid':'模型返回内容格式无效','model_http_error':'模型服务请求失败',
-           'model_account_binding_required':'魔搭账号需先绑定阿里云账号'}
+           'model_account_binding_required':'魔搭账号需先绑定阿里云账号',
+           'trial_authorization_required':'合成试验尚未获预算授权，原文已保留',
+           'trial_budget_exhausted':'合成试验调用额度已用尽，原文已保留'}
  code=error.code if isinstance(error,AdapterError) and type(error.code) is str and error.code in messages else None
  status=error.status if isinstance(error,AdapterError) and code in {'model_http_error','model_account_binding_required'} and type(error.status)==int and 100<=error.status<=599 else None
  if code:
@@ -137,6 +155,13 @@ def model_failure_details(error):
  reason=('模型超时' if isinstance(cause,TimeoutError) else '模型返回非法 JSON' if isinstance(cause,json.JSONDecodeError) else '网络连接失败' if isinstance(cause,URLError) else '模型调用失败或返回内容未通过校验')
  return {'failure_reason':reason}
 
+def trial_failure_control(error):
+ # Only internal context/error codes carry authority; never HTTP payload IDs.
+ stop_current_trial('business_validation_failed')
+ if trial_control(stopped=True) or getattr(error,'code',None) in {'trial_authorization_required','trial_budget_exhausted'}:
+  return {'trial_control':{'review_required':True,'stopped':True}}
+ return {}
+
 def local_first_model_evidence(body):
  raw=body.get('raw_text')
  if not isinstance(raw,str) or not raw.strip():raise StoreError('raw_text_required')
@@ -145,6 +170,7 @@ def local_first_model_evidence(body):
  if not isinstance(record_id,str) or not re.fullmatch(r'rec_[A-Za-z0-9_-]{8,100}',record_id):raise StoreError('record_id_invalid')
  source_kind=body.get('source_kind','elder')
  if source_kind not in {'elder','family_observation','family_report','caregiver','clinician_evidence','document','audio_transcript','system','unknown'}:raise StoreError('invalid_source_kind')
+ if document_needs_review(body):raise Conflict('document_source_review_required')
  history=body.get('history') or []
  if not isinstance(history,list) or len(history)>20:raise StoreError('history_invalid')
  clean_history=[]
@@ -153,10 +179,18 @@ def local_first_model_evidence(body):
   history_id=item.get('record_id');history_text=item.get('raw_text')
   if not isinstance(history_id,str) or not re.fullmatch(r'rec_[A-Za-z0-9_-]{8,100}',history_id):raise StoreError('history_invalid')
   if not isinstance(history_text,str) or not history_text.strip() or len(history_text)>10000:raise StoreError('history_invalid')
-  clean_history.append({'record_id':history_id,'raw_text':history_text,'source_kind':item.get('source_kind','unknown'),'recorded_at':item.get('recorded_at'),'occurred_time':item.get('occurred_time')})
- return {'record_id':record_id,'raw_text':raw,'source_kind':source_kind,'recorded_at':body.get('recorded_at'),'occurred_time':body.get('occurred_time'),'history':clean_history}
+  if document_needs_review(item):raise Conflict('document_source_review_required')
+  clean_history.append({'record_id':history_id,'raw_text':history_text,'source_kind':item.get('source_kind','unknown'),'source_review':item.get('source_review'),'recorded_at':item.get('recorded_at'),'occurred_time':item.get('occurred_time')})
+ return {'record_id':record_id,'raw_text':raw,'source_kind':source_kind,'source_review':body.get('source_review'),'recorded_at':body.get('recorded_at'),'occurred_time':body.get('occurred_time'),'history':clean_history}
 
 class Handler(BaseHTTPRequestHandler):
+ product_execution_enabled=False
+ def _provider_execution_scope(self):
+  return product_execution_scope() if self.product_execution_enabled else nullcontext()
+ def _asr_trial_config(self):
+  try:
+   with self._provider_execution_scope():return trial_gate.current_standalone_asr_trial()
+  except Exception:return None
  def log_message(self,*a): pass
  def origin_allowed(self):
   origin=self.headers.get('Origin','').strip().rstrip('/')
@@ -224,13 +258,41 @@ class Handler(BaseHTTPRequestHandler):
   auth_token=self.headers.get('X-Auth-Token')
   if auth_token:return self._auth_ctx() is not None
   return self.headers.get('X-Session-Token')==SESSION_TOKEN
+ def _require_ai_access(self,limit=False):
+  origin=self.headers.get('Origin','').strip().rstrip('/')
+  expected=_allowed_origin()
+  if not expected or not origin or origin!=expected:return None,(403,'origin_rejected',{})
+  if not app_access.session_configured():return None,(503,'access_not_configured',{})
+  cookie=self.headers.get('Cookie')
+  session=app_access.parse_session(cookie)
+  if session is None:return None,(401,'authentication_required',{})
+  if app_access.request_authorized(cookie,self.headers.get('X-CSRF-Token'),write=True) is None:
+   return None,(403,'csrf_invalid',{})
+  key=hashlib.sha256(session.csrf.encode('utf-8')).hexdigest()
+  if limit:
+   retry_after=AI_REQUEST_LIMITER.acquire(key)
+   if retry_after is not None:return None,(429,'ai_rate_limited',{'Retry-After':str(retry_after),'X-AI-Limit-Scope':'process'})
+   self._ai_rate_session=key
+  return session,None
  def csrf(self):
   if self.command=='GET': return True
   path=urlparse(self.path).path
   if app_access.local_first_enabled():
-   if not self.origin_allowed():return False
+   if path=='/api/reports/reground':
+    origin=self.headers.get('Origin','').strip().rstrip('/')
+    expected=_allowed_origin()
+    if not expected or origin!=expected: rejection=(403,'origin_rejected',{})
+    elif not app_access.session_configured(): rejection=(503,'access_not_configured',{})
+    elif app_access.parse_session(self.headers.get('Cookie')) is None: rejection=(401,'authentication_required',{})
+    elif app_access.request_authorized(self.headers.get('Cookie'),self.headers.get('X-CSRF-Token'),write=True) is None: rejection=(403,'csrf_invalid',{})
+    else: rejection=None
+    self._request_rejection=rejection
+    return rejection is None
    if path.startswith('/api/ai/'):
-    return bool(self.headers.get('Origin')) and bool(_allowed_origin())
+    _,rejection=self._require_ai_access(limit=True)
+    self._request_rejection=rejection
+    return rejection is None
+   if not self.origin_allowed():return False
    if path in {'/api/app/login','/api/app/device/activate'}:return True
    if path=='/api/app/logout' or path.startswith('/api/backups/'):
     return app_access.request_authorized(self.headers.get('Cookie'),self.headers.get('X-CSRF-Token'),write=True) is not None
@@ -251,7 +313,7 @@ class Handler(BaseHTTPRequestHandler):
   except StoreError: return None
  def do_OPTIONS(self):
   if not self.origin_allowed():return self.send_json(403,{'ok':False,'error':'origin_rejected'})
-  self.send_response(204);self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS');self.send_header('Access-Control-Allow-Headers','Content-Type, Idempotency-Key, X-Session-Token, X-Auth-Token, X-CSRF-Token, Range');self.send_header('Access-Control-Max-Age','600');self.end_headers()
+  self.send_response(204);self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS');self.send_header('Access-Control-Allow-Headers','Content-Type, Idempotency-Key, X-Session-Token, X-Auth-Token, X-CSRF-Token, X-NoReset-Saved-Audio-Trial, X-NoReset-Text-Trial, Range');self.send_header('Access-Control-Max-Age','600');self.end_headers()
  def do_GET(self):
   try:return self._do_GET()
   except StoreError as e:return self.send_json(e.status,{'ok':False,'error':str(e)})
@@ -259,11 +321,19 @@ class Handler(BaseHTTPRequestHandler):
   except Exception:return self.send_json(500,{'ok':False,'error':'internal_server_error'})
  def _do_GET(self):
   p=unquote(urlparse(self.path).path)
+  if app_access.local_first_enabled() and p.startswith('/api/ai/'):
+   _,rejection=self._require_ai_access(limit=False)
+   if rejection:return self.send_json(rejection[0],{'ok':False,'error':rejection[1]},rejection[2])
   if app_access.local_first_enabled() and p.startswith('/api/') and not self.origin_allowed():return self.send_json(403,{'ok':False,'error':'origin_rejected'})
   if app_access.local_first_enabled() and p=='/':return self.send_json(200,{'ok':True,'service':'bingli-beta-api','kind':'api','frontend_hosted':False})
   if p=='/api/app/config':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
-   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'病历不归零·内测版','data_location':'this_device','backup_mode':'encrypted_archive'})
+   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive','reviewed_risk_rules':reviewed_risk_manifest(),'asr_trial':self._asr_trial_config(),'text_trial':text_trial.available_grant(),'text_trial_required':text_trial.is_installed(),**local_first_capabilities(product_execution_enabled=self.product_execution_enabled)})
+  if p=='/api/app/saved-audio-trial':
+   if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
+   _,rejection=self._require_ai_access(limit=False)
+   if rejection:return self.send_json(rejection[0],{'ok':False,'error':rejection[1]},rejection[2])
+   return self.send_json(200,{'ok':True,'grant':saved_audio_trial.available_grant()})
   if p=='/api/app/session':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
    session=app_access.request_authorized(self.headers.get('Cookie'),write=False)
@@ -353,9 +423,20 @@ class Handler(BaseHTTPRequestHandler):
     b=f.read_bytes();self.send_response(200);self.send_header('Content-Type',mimetypes.guess_type(str(f))[0] or 'application/octet-stream');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
   return self.send_json(404,{'ok':False,'error':'not_found'})
  def do_POST(self):
-  if not self.csrf():return self.send_json(403,{'ok':False,'error':'csrf_or_origin_rejected'})
+  self._ai_rate_session=None
+  self._request_rejection=None
+  try:return self._do_POST()
+  finally:
+   if self._ai_rate_session is not None:AI_REQUEST_LIMITER.release(self._ai_rate_session)
+ def _do_POST(self):
+  if not self.csrf():
+   rejection=self._request_rejection
+   if rejection:return self.send_json(rejection[0],{'ok':False,'error':rejection[1]},rejection[2])
+   return self.send_json(403,{'ok':False,'error':'csrf_or_origin_rejected'})
   p=urlparse(self.path).path
-  if app_access.local_first_enabled() and p.startswith('/api/') and p not in {'/api/app/login','/api/app/device/activate','/api/app/logout','/api/ai/organize','/api/backups/upload-grant','/api/backups/download-grant'} and not p.startswith('/api/ai/media/'):
+  if p.startswith('/api/ai/'):
+   reset_trial_context()
+  if app_access.local_first_enabled() and p.startswith('/api/') and p not in {'/api/app/login','/api/app/device/activate','/api/app/logout','/api/ai/organize','/api/ai/conversation-turn','/api/reports/reground','/api/backups/upload-grant','/api/backups/download-grant'} and not p.startswith('/api/ai/media/'):
    return self.send_json(404,{'ok':False,'error':'legacy_api_disabled'})
   if p.startswith('/api/media/') and not p.startswith('/api/media/uploads'):
    try:self.media_write_enabled()
@@ -367,14 +448,22 @@ class Handler(BaseHTTPRequestHandler):
      return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e)})
     return self.send_json(500,{'ok':False,'error':'internal_server_error'})
   if p=='/api/ai/media/recognize':
+   reset_trial_context()
    try:return self._do_local_first_media_recognize()
    except (StoreError,MediaStoreError,RecognitionError) as e:
-    return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e),'retryable':bool(getattr(e,'retryable',False))})
-   except Exception:return self.send_json(500,{'ok':False,'error':'internal_server_error','retryable':False})
+    control=trial_failure_control(e)
+    return self.send_json(_media_error_status(e),{'ok':False,'error':_media_error_code(e),'retryable':False if control else bool(getattr(e,'retryable',False)),**control})
+   except Exception as e:return self.send_json(500,{'ok':False,'error':'internal_server_error','retryable':False,**trial_failure_control(e)})
+  if p in {'/api/ai/organize','/api/ai/conversation-turn'} and _mock_text_provider():
+   return self.send_json(503,{'ok':False,'error':'provider_mock_unavailable','retryable':True})
   try:b=self.body()
   except StoreError as e:return self.send_json(e.status,{'ok':False,'error':str(e)})
   except (json.JSONDecodeError,UnicodeDecodeError,ValueError):return self.send_json(400,{'ok':False,'error':'invalid_json_payload'})
   try:
+   if p=='/api/reports/reground':
+    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
+    try:return self.send_json(200,{'ok':True,**reground_report(b)})
+    except ConversationError as ex:return self.send_json(422,{'ok':False,'error':ex.code})
    if p=='/api/app/login':
     if not app_access.configured():return self.send_json(503,{'ok':False,'error':'access_not_configured'})
     login_id=self.client_address[0]
@@ -400,11 +489,35 @@ class Handler(BaseHTTPRequestHandler):
     except cloud_backup.CloudBackupError as e:return self.send_json(e.status,{'ok':False,'error':e.code})
     return self.send_json(200,{'ok':True,'grant':grant})
    if p=='/api/ai/organize':
+    reset_trial_context()
     payload=local_first_model_evidence(b)
     safety=scan_danger(payload['raw_text'])
-    try:r=organize_event(payload)
+    try:
+     with self._provider_execution_scope():r=organize_event(payload)
     except Exception as ex:
-     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_organize_failed','trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(payload['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved_on_device':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex)})
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_organize_failed','trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(payload['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved_on_device':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)})
+    return self.send_json(200,{'ok':True,'raw_text_preserved_on_device':True,**r})
+   if p=='/api/ai/conversation-turn':
+    reset_trial_context()
+    try:
+     grant_id=self.headers.get('X-NoReset-Saved-Audio-Trial')
+     text_grant_id=self.headers.get('X-NoReset-Text-Trial')
+     with self._provider_execution_scope():
+      if text_grant_id is not None:
+       if grant_id is not None:raise trial_gate.TrialGateError()
+       r=text_trial.run_turn(text_grant_id,b,conversation_turn)
+      elif text_trial.is_installed() and grant_id is None:
+       raise trial_gate.TrialGateError()
+      else:
+       r=saved_audio_trial.run_turn(grant_id,b,conversation_turn) if grant_id is not None else conversation_turn(b)
+    except trial_gate.TrialGateError as ex:
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'raw_text_preserved_on_device':True})
+    except ConversationError as ex:
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**trial_failure_control(ex)})
+    except Exception as ex:
+     return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_conversation_failed','trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)})
+    if r.get('stop_reason')=='model_output_blocked':
+     r.update(trial_failure_control(ConversationError('model_reply_unsafe')))
     return self.send_json(200,{'ok':True,'raw_text_preserved_on_device':True,**r})
    if p=='/api/auth/households':
     result=STORE.create_household(b.get('name'),b.get('display_name'),b.get('role','owner'),b.get('external_key'),b.get('password'))
@@ -470,7 +583,8 @@ class Handler(BaseHTTPRequestHandler):
      if ctx: STORE.authorize(self.headers.get('X-Auth-Token'),'organize',ctx['household_id'])
      expected=expected_version(b.get('expected_version'))
      if e['version']!=expected:raise Conflict('stale_version')
-     related=[STORE.get(x) for x in e.get('related_record_ids',[])]; payload={**model_evidence(e),'history':[model_evidence(item) for item in related]}
+     if document_needs_review(e):raise Conflict('document_source_review_required')
+     related=[STORE.get(x) for x in e.get('related_record_ids',[])]; payload={**model_evidence(e),'history':[model_evidence(item) for item in related if not document_needs_review(item) and item['state']!='superseded']}
      safety=e['local_safety']
      try:
       r=organize_event(payload)
@@ -478,13 +592,16 @@ class Handler(BaseHTTPRequestHandler):
       # Do not expose provider bodies/credentials or misclassify storage/version
       # failures: only the provider+validation call is caught here.
       cause=ex.__cause__ or ex
-      failure={'error':'ai_organize_failed','failure_type':type(ex).__name__,'failure_cause_type':type(cause).__name__,'trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(e['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex)}
+      failure={'error':'ai_organize_failed','failure_type':type(ex).__name__,'failure_cause_type':type(cause).__name__,'trace_id':'tr_'+secrets.token_hex(16),'raw_text_sha256':hashlib.sha256(e['raw_text'].encode()).hexdigest(),'input_sha256':payload_sha256(payload),'prompt_version':PROMPT_VERSION,'prompt_sha256':PROMPT_SHA256,'schema_version':SCHEMA_VERSION,'raw_text_preserved':True,'local_safety':safety,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)}
       STORE.fail(rid,expected,'organize_failed',actor,failure)
       return self.send_json(422,{'ok':False,'ai_failed':True,'record_id':rid,'event':STORE.get(rid),'local_safety':safety,**failure,**safety})
      # The outward notice includes historical positives retained on rule upgrade.
      r.update(local_safety=safety,**safety)
      out=STORE.organize(rid,expected,r,actor)
      return self.send_json(200,{'event':out,'raw_text_preserved':True,**r})
+    if z[3]=='source-review':
+     if ctx: STORE.authorize(self.headers.get('X-Auth-Token'),'review',ctx['household_id'])
+     return self.send_json(200,{'ok':True,'event':STORE.source_review(rid,b.get('expected_version'),b.get('compared_with_original'),actor)})
     if z[3]=='review':
      if ctx: STORE.authorize(self.headers.get('X-Auth-Token'),'review',ctx['household_id'])
      return self.send_json(200,{'ok':True,'event':STORE.review(rid,b.get('expected_version'),b.get('action'),actor,b.get('note'))})
@@ -509,9 +626,13 @@ class Handler(BaseHTTPRequestHandler):
   try:
    with tempfile.NamedTemporaryFile(prefix='bingli-ai-',suffix=suffix,delete=False) as temporary:
     temporary.write(media['data']);path=Path(temporary.name)
-   recognition=recognize_file(path,kind=kind,content_type=content_type,attempt_id=attempt_id,max_bytes=limit)
+   with self._provider_execution_scope():
+    recognition=recognize_file(path,kind=kind,content_type=content_type,attempt_id=attempt_id,max_bytes=limit)
+   if recognition.get('is_mock') is True:
+    return self.send_json(503,{'ok':False,'error':'media_mock_unavailable','retryable':True})
    local_safety=scan_danger(recognition['text'])
-   return self.send_json(200,{'ok':True,'recognition':recognition,'local_safety':local_safety})
+   control={'trial_control':{'review_required':True}} if recognition.get('trial_control')=={'review_required':True} else {}
+   return self.send_json(200,{'ok':True,'recognition':recognition,'local_safety':local_safety,**control})
   finally:
    if path is not None:
     try:path.unlink(missing_ok=True)
@@ -559,5 +680,8 @@ class Handler(BaseHTTPRequestHandler):
    media,created=backend.complete_upload(upload_id,key,household_id)
    return self.send_json(201 if created else 200,{'ok':True,'created':created,'media':_public_value(media)})
   return self.send_json(404,{'ok':False,'error':'not_found'})
-def serve(host=None,port=None): ThreadingHTTPServer((host or os.getenv('API_HOST','127.0.0.1'),int(os.getenv('API_PORT',os.getenv('PORT',port or 18768)))),Handler).serve_forever()
+class ProductHandler(Handler):
+ product_execution_enabled=True
+
+def serve(host=None,port=None): ThreadingHTTPServer((host or os.getenv('API_HOST','127.0.0.1'),int(os.getenv('API_PORT',os.getenv('PORT',port or 18768)))),ProductHandler).serve_forever()
 if __name__=='__main__':serve()

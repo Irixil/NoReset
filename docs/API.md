@@ -1,23 +1,71 @@
 # 前后端接口合同 v0.5
 
+## 2026-10-17 待核实更正的本机恢复
+
+自然更正无法逐字唯一对应旧话时，保持待核实，不做近义匹配。文字对话提供“核对这条更正”：使用者自行选中同一所属人、同一对话中更早的一整句原话，查看原句与更正原文中的新句，再明确确认。没有默认选项，不推测确认者是否患者本人。语音文字继续走原录音核对流程。
+
+本机 `POST /api/conversations/:id/corrections/:correctionTurnId` 接受 `{expected_conversation_version,expected_correction_version,target_turn_id,expected_target_version,expected_event_version,old_quote,confirmed:true}`。关联记录存在时必须提供其版本，否则 `expected_event_version:null`。替换文字只能从库内该条完整更正中解析；请求不能提供新内容。校验原句完整且仅出现一次、时间顺序、当前版本、来源归属与关联记录，在同一原子事务保存目标新版本、旧版、更正原文及确认记录。过期、跨人、来源改变或保存失败均不写入部分结果。
+
+此动作不调用模型。成功返回 `model_called:false`，旧自动分析失效，报告标记“原话已修订 · 自动整理待更新”。应用过的更正保留在修订历史，不再次作为当前事实发送；后续请求采用修订后的原话。修订历史记载当时版本，不将旧修订称作后来仍然有效的事实。
+
+生活影响的来源校验可保留模型已分类且引用到真实原话的完整字面句子，不受既有关键词清单遗漏影响。程序不采用模型改写的片段，保留时间和否定；未知、假设、他人话语、来源不符、已被替代的旧句不能借此成为确定事实。这是来源保真处理，不代表模型分类准确率已得到临床验证。
+
+## 2026-10-01 照片来源核对门槛
+
+照片 OCR 只生成候选文字。`source_kind:document` 的记录必须有绑定当前完整 `raw_text` 的 `source_review:{method:"original_comparison",text,confirmed_at}`，才能进入整理、记录确认和交接正文。它表示使用者对照原件后的声明，不代表系统证明视觉识别准确或医学确认。创建、OCR 和修订不能自行设置该声明；修订清空声明，历史 `recorded` 状态不替代原件核对，旧修订即使误标为自述也继承照片来源。
+
+本机 `POST /api/events/:id/source-review` 请求 `{expected_version,compared_with_original:true}`；界面先展示原件，再允许逐行核对和明确勾选。看不清、遮挡、裁切处应修订为 `[无法辨认]`。该动作清除旧 AI 草稿，保留原件、原识别和修订历史。SQLite 兼容接口执行同一门槛。无状态 `/api/ai/organize` 也检查当前记录与历史中的照片声明；缺失或文字版本不一致时在模型请求前返回 `409 document_source_review_required`。原件核对只能防止未经确认的自动流转，不能阻止使用者错误确认。
+
+交接 `items` 不含未核对照片文字、旧 AI 摘要或风险结论，另以 `pending_documents:[{record_id,recorded_at,reason:"document_source_review_required"}]` 提醒查看原件。附件只含状态，不再夹带整份识别内容。恢复加密备份后使用相同判断。照片记录不能通过修订改成患者自述，也不能作为语音对话回合提交。
+
+供应商明确表示输出被截断/未正常结束时，返回可重试的 `incomplete_provider_response`，不把半截文字关联为成功记录。HTML 清理保留表格行列分隔、比较符和上下标，不推测单位或缺失项。已核对资料再进入整理时，原有完整原文约束仍阻断模型补写未知项。
+
 ## 内测版的正式边界
 
 `APP_MODE=local_first` 是内测版的正式运行模式。记录、修订历史、媒体原件和备份由浏览器的 Web Crypto + IndexedDB 处理，后端不创建 SQLite 健康数据库，并对旧 `/api/events`、`/api/media`、`/api/handoffs` 服务端路由返回 `404 legacy_api_disabled`。前端保留同形本地请求层，用于降低旧界面迁移风险；这些本地请求不会离开浏览器。
 
+### 2026-10-09 隔离语音试验保护
+
+受预算 gate 管理的 ASR 成功响应增加顶层 `trial_control:{review_required:true}`。该字段由服务端依据本次实际预占与同次用量生成；HTTP 入参、供应商同名字段、媒体 `attempt_id` 和前端按钮不能批准预算。客户端先加密保存原件、转写和来源版本，再持久停在 `review_required`，不自动请求后续 LLM。缺少标记的普通产品流程沿用原行为；存在但非法的标记保守停止。
+
+本机 `POST /api/conversations/:id/trial-continue` 接受 `{expected_version,turn_id,turn_version}`，只核当前原话/事件版本并继续一次既有 LLM 路由。它不是新的后端授权接口：必须另有受信的有效授权，且完整派生请求 SHA、范围和累计预算符合 gate。继续前持久 `continuing`，刷新不补发，重复点击不增加请求。任何本次发送、计量或服务端业务失败都会停止后续受控请求；包括 HTTP 200 的 `model_output_blocked` 安全阻断。成功 ASR 不因后续 LLM 失败变成可重试识别，原件继续保留。
+
+本地可信 `append_trial` 支持在同一累计账本追加 v3 授权快照，保留旧 attempt、原报价、用量及预占；不从空库创建 v3，不退款、不重算旧价，也不解除冻结。v2/v3 金额硬界模式仍要求完整计费合同界、有效许可与准确来源/请求 SHA。另有独立 `noreset-synthetic-trial-informed-risk-v1` 有限请求模式，只能在所有者明确接受最终费用未知后使用，严格限制次数、时效、精确输入、模型、参数、顺序和逐笔业务审核；它不声称美元硬封顶。该模式的 `remaining_usd:null`、`cost_bound_known:false` 和新条目 `reserved_usd:0` 分别表示金额剩余未知、成本界未知和没有硬界预占，不表示免费、零扣费或释放历史预占。
+
+可信本地 `continue_informed_trial(new_receipt_path,new_state_path,previous_receipt_path=…,previous_state_path=…,closure_path=…,failure_evidence_path=…)` 支持此次明确新批的独立副本：只承接旧3LLM＋已永久关闭的首ASR失败（第4行usage仍未知、原response_invalid冻结保留），绑定完整旧文件与失败证据SHA，复制全部历史，旧ledger/receipt字节不改。旧metadata在副本保留为closed_metadata，新scope只开放1ASR及人工核对后的1LLM，累计最多6次；同一旧receipt＋attempts逻辑历史只有一份固定独占claim，改变SQLite无关字节、文件名或目标路径不能获得第二份许可。旧closed条目不能补报用量、核对成成功或复用剩余名额。此入口不能由HTTP、环境变量、前端按钮或代理接力建立授权；既有v2/v3冻结规则不变。root本进程显式选择新receipt/state，人工审核与派生hash追加仍分别走confirm_trial_review/amend_trial；执行失败仍停止新批，不能自动重建副本。
+
+实际请求先写入对应控制记录，再从同次有界响应校验模型与完整用量；不额外请求计量或重试。Gemini 仅在非负整数 `promptTokenCount + candidatesTokenCount = totalTokenCount` 时把缺省 `thoughtsTokenCount` 规范为0；缺总量、不平衡、非法类型、未知模型和异常结束仍拒绝并停止。该推断只表示同次用量平衡，不表示未知费用为0。LLM wire 上限24000 bytes/输出至多2048，ASR wire 上限3145728 bytes/输出1024/思考0，仅是请求控制，不能代替供应商所有尝试和失败收费的总金额保证。
+
+2026-10-09 曾激活上述独立有限请求许可并实际执行1次合成ASR，因解析失败停止，0次LLM、0次重试；旧3行账本和USD0.9510912历史保守预占保留。该失败批已关闭、账本保持冻结，剩余3次名义次数不自动续用；当前免费诊断不是新收费许可。解析修复已有离线证据，尚未重新调用真实服务；转写输出与参考台词有语义差异，发音尚未独立听取。[实际失败记录](evidence/goal-audit-2026-10-09/real-voice-attempt/README.md)与[免费诊断](evidence/goal-audit-2026-10-09/asr-free-diagnosis/business-diagnosis.md)分别说明实际结果和未测边界。
+
+ASR文字是机器初稿，可供正常对话整理，但会话报告保持 `auto_unreviewed`/“本人未核对”，当前摘要仍标“待核对”，不表示本人或医生已确认病情。当前语音可在保留期内对照原录音、修改文字；修改保留旧版，后续模型输入与报告绑定当前文字和版本。成功结果展示不自动暂停；普通流程仍在使用者主动离开或结束时清理成功的临时录音，保留文字与修改历史。受控试验原件按其停止和人工审核规则保留；播放器的内存链接释放不等于删除加密原件。
+
+普通识别等待中主动暂停或结束后，迟到成功先保存转写、来源和本人未核对报告，保持暂停/结束状态，不在离开后自动请求回复；成功临时录音按同一清理规则删除。返回对话后可从已保存文字接上回复，不重新识别。刷新、失败和受控试验不采用该清理。已下载的备份是导出时的密文快照；当前库清理不会修改旧备份，恢复旧快照可能带回当时尚存的录音，恢复本地状态也不构成新的收费许可。
+
 函数服务只提供以下无状态能力：
 
 - `GET /health`：返回 `mode:"local_first"` 和 `storage:"encrypted_on_device"`，不返回旧 `session_token`。
-- `GET /api/app/config`：返回产品名、数据位置、访问保护和私有云备份是否配置。
+- `GET /api/app/config`：返回产品名、数据位置、访问保护、私有云备份配置，以及 `provider` 和 `capabilities.text_ai/audio_recognition/image_recognition`。每项区分 `configured`（配置有效）、`available`（正式产品路由允许尝试调用）、`connection_state`（连通性状态）、`execution_restricted` 和 `reason`。`unverified` 表示尚未通过真实服务调用验证，不保证网络连通、准确率或产品验收；Mock 与不支持的外部传输不可用。
 - `GET /api/app/session`：返回当前浏览器是否已登录；已登录时同时返回 CSRF 令牌和过期时间。
 - `POST /api/app/login`：请求 `{"password":"..."}`，成功设置已签名、HttpOnly、SameSite=Strict 的 Cookie。
 - `POST /api/app/logout`：需 Cookie + `X-CSRF-Token`，清除当前 Cookie。
 - `POST /api/ai/organize`：需 Cookie + CSRF + `consent:true`；只返回经验证的草稿和本地安全字段，不写数据库。
+- `POST /api/ai/conversation-turn`：需精确 Origin、签名 Cookie 和 CSRF。`turns` 为 1–40 条老人原话，每条 `{turn_id,text,version?,responding_to?:{turn_id,text}}`；`responding_to` 只解释回答语境，助手 ID 不能作为患者事实来源。`health_context` 在客户端发送前限制为本次显式勾选的最多 5 项；未勾选内容不外发。完整对话仍保存在本机。`action` 可为 `ask / reply / finish / urgent`：`reply` 表示本轮仅回应、不结束、不新增追问计数；`assistant_text` 是已经验证的完整回应，模型内部 `reply_text` 不作为患者事实。若 `model_intent="non_health"`，最新原话与健康记录无关，返回 `action="reply"`、`stop_reason="non_health_input"`，不追问、不将这句话写入临床字段；原话仍由本机完整保留。
+  `controller.followup_questions?:string[]` 保存模型多项候选中经过现有单问和范围校验的项目（最多 12 条，每条最多 160 字，包含已问/已答项目）；客户端原样加密保存并在后续发言时回传。`completeness.pending_questions?:string[]` 是未明确的候选，医生报告将其标为“助手候选 · 待核实”，不得当作患者事实或阴性结论。未知的实际回答保留原句和来源，不称为已经否认。模型仍选择下一问；此元数据不强制固定问序，不突破主动结束、疲劳与总计 12 问上限。未核实项会在结束后保留，`complete` 不因其他类别已有事实而忽略它们。同一类别多个短回答分别绑定实际问题和患者来源。
+  本机医生报告另列“原话与对应问题”：短答保留患者原句、原话 ID 和版本，旁列实际助手问题全文及其 ID/版本，标为非患者陈述；不会将“没有”扩写成症状结论。对应关系须匹配库内实际问题和原始顺序，失效问题只作历史展示。
+  报告的 `question_coverage` 是候选提名来源与当前回答的工程记录，不是临床分析。追加危险原话后，即使旧临床分析已清除，仍逐项从当前原话和有效问答重算待核实清单；未知、拒答、历史、他人和未回答说明不作否认。提名的原话或背景范围改变时，旧候选明确标为历史、范围需重新核实。刷新与加密备份恢复同样检查来源和版本，不复用失效摘要。
 - `POST /api/ai/media/recognize`：需 Cookie + CSRF，`multipart/form-data` 严格包含 `kind` / `content_type` / `attempt_id` / `file`；原件只写入临时文件，请求完成或失败后删除。
 - `GET /api/backups`：需登录 Cookie；只列出私有 TOS 中 `backups/` 下密文对象的名称、大小和时间，不返回内容。
 - `POST /api/backups/upload-grant`：需 Cookie + CSRF，请求 `size` 与 64 位十六进制 `sha256`；返回服务端生成对象名及最多 15 分钟、默认 5 分钟有效的 TOS `PUT` 地址。浏览器直接上传已经加密的 `.bingli` 包。
 - `POST /api/backups/download-grant`：需 Cookie + CSRF，请求 `object_key`；只允许当前备份前缀内的 `.bingli` 对象，返回短时 `GET` 地址。下载后仍须在浏览器验证恢复口令并预览，不能静默覆盖当前设备。
 
 `POST /api/ai/organize` 的文字请求最多 10000 字符，历史证据最多 20 条；媒体默认最大 20 MiB，可用 `APP_AI_MEDIA_MAX_BYTES` 下调，不可超过 25 MiB。付费 AI 失败后不在函数内自动重试。密文备份最大 100 MiB；签名地址属于短时持有者权限，不能写入日志、反馈或长期存储。
+
+2026-09-30 本地实现：所有 `/api/ai/*` 在调用供应商前检查来源、签名会话与 CSRF。缺配置返回 503，未授权 401，来源/CSRF 不符 403；单进程频率或并发超限返回 429 和 `Retry-After`，不会触发模型。默认每会话每分钟 12 次、全进程 120 次，并发分别 2/8；它不是跨实例或可持久化的费用上限，公开部署还需网关/供应商总预算控制。`scripts.start_app` 仅在回环监听和回环前端时启用静默本地会话；无第二个老人端密码。公网不自动签发该会话。
+
+只有服务启动时明确选用的 `ProductHandler` 才为本地优先产品路由建立普通产品执行作用域；默认导入的 `Handler` 和直接构造的客户端保持有限试验授权门禁。显式 standalone／已保存录音试验上下文优先于产品作用域，失效上下文不能复用。HTTP 请求、环境变量不能切换此策略。`GET /api/app/config` 的 `capabilities.*.available` 反映当前 Handler 是否允许产品路由尝试；`connection_state: unverified` 仍表示没有验证供应商连接。服务端放行不等于识别质量或真实用户流程已验证。Mock 路由仍返回 `503 provider_mock_unavailable` / `503 media_mock_unavailable`，隔离自动化测试里的 Mock 不能作为用户功能验收。客户端也拒绝 `recognition.is_mock` 或旧 `[Mock ASR/OCR]` 占位文字进入患者事实，并保留录音。历史模拟回合标记 `is_mock:true`，从模型输入与报告事实中排除，历史不静默删除。
+
+本机接口 `POST /api/conversations/:id/context {context_ids:[...]}` 只保存这次选择，不请求 AI；下次发言或主动重试才发送。`POST /api/conversations/:id/resume-assistant` 可重试未完成回复或失败提示，保留同一条老人原话。交接材料带记录/日期筛选时只附所选记录关联的原件；未关联原件仍在“看病资料”。首次空库可直接从已验证加密备份恢复，已有库覆盖恢复仍需明确确认。
 
 生产环境的 TOS 签名使用函数所绑定 IAM 角色的请求级 STS 凭据（`X-Faas-Access-Key-Id`、`X-Faas-Secret-Access-Key`、`X-Faas-Session-Token`），不配置长期 TOS AK/SK。角色策略必须限制到目标私有 Bucket 的 `backups/` 前缀。函数到 TOS 的列表请求使用同地域内网 Endpoint；签发给浏览器的短链接使用公网 HTTPS Endpoint。
 
@@ -236,3 +284,58 @@ link_status:        not_linked | pending | linked | link_failed
 - 版本冲突 `409` 时重新 GET 详情，让用户选择重载或修订，不能覆盖别人新版本。
 
 完整 TypeScript 类型在 `contracts/api.ts`。Schema 只约束 AI 草稿；`local_safety` 是后端外层安全字段。
+
+## 本机长期健康记忆（2026-10-10）
+
+以下接口由 `HealthLocal.request` 在浏览器加密仓库执行，适用于 `local_first`。它们不写后端 SQLite、不创建云账号，不是公网身份鉴权。独立使用者应使用各自浏览器资料库和口令；家庭成员在拥有者同一资料库内按 `subject_id` 分开记录。原资料归 `subject_self`（本人），不根据病史文字猜所属人。
+
+| 接口 | 请求 | 结果 |
+|---|---|---|
+| `GET /api/health-subjects` | 无 | `subjects, active_subject_id, observed_subject_id, version` |
+| `POST /api/health-subjects` | `label, relationship: self\|family, expected_version` | 创建本机所属人 |
+| `POST /api/health-subjects/active` | `subject_id, expected_version` | 切换当前记录所属人 |
+| `GET /api/health-memory` | 无 | 当前人的 `health_context: {subject_id,version,updated_at,entries}` |
+| `POST /api/health-memory` | `subject_id, expected_subject_version, expected_version, entry` | 新增一条必要背景 |
+| `PATCH /api/health-memory/{context_id}` | `subject_id, expected_subject_version, expected_version, entry` | 纠正该条背景 |
+| `DELETE /api/health-memory/{context_id}` | `subject_id, expected_subject_version, expected_version` | 从当前资料库删除该条背景 |
+
+`entry` 包含 `category, text, temporal_status, confirmation_status, confirmed_by, source_kind, occurred_on, remember`。分类沿用疾病/长期问题、用药、过敏、手术外伤、已有资料、相似经历六类。`temporal_status` 为 `current|historical|uncertain`，`confirmation_status` 为 `confirmed|unconfirmed`；确认者为 `self|family`，来源为 `self_statement|family_report|document`。发生日可为空，不得以保存时间代替，未来日期在保存前拒绝。保存生成编号、所属人、真实记录/更新时间和确认时间；未确认的 `confirmed_at` 为 `null`。这是对用户陈述的确认，不是医生诊断认证。
+
+新版页面每次本地读写附 `X-Health-Subject-Id` 和 `X-Health-Subject-Version`，记忆及旧字段写入另带显示的 `subject_id, expected_subject_version`。每个已解锁页面保持自己的所属人观察值，另一页切换不会让旧页面跟着读取或写入新人的资料。`GET /api/health-subjects` 的 `observed_subject_id` 标明本页观察值；遇到跨页切换返回 `409 subject_changed` 或 `403 subject_mismatch`，页面保留未保存输入，要求明确重新选择。读取登记表本身不等于确认新身份。
+
+`remember=true` 只允许已确认、时间状态明确的条目，同一人最多五项。用户作出此选择后，新对话沿用这些背景；界面显示发送范围，仍可逐段取消或手工选择其他已确认条目。取消沿用或撤销、纠正、删除时清理旧选择和背景缓存，使旧分析失效。撤销确认的资料不发送给模型。旧字段编辑器不自动将资料选为记忆；存在新版逐条记忆时，拒绝旧全量覆盖以避免误删。
+
+写入使用资料版本和加密仓库原子比较，冲突返回 `409 stale_health_memory` 或 `409 stale_health_subjects`；调用方保留输入，重新读取后再处理。另一所属人的记录访问返回 `403 subject_mismatch`；跨所属人的编号不能加入本轮背景或关联原话。不存在返回 `404 health_subject_not_found|health_memory_not_found`。非法记忆字段、确认条件或超过五项分别返回 `400 health_memory_invalid|health_memory_remember_invalid|health_memory_remember_limit`。
+
+实际联网 `POST /api/ai/conversation-turn` 携带 `subject_id` 和精简 `health_context`（前端最多五项）。后端保留来源、记录/确认/发生日期、当前或历史状态、确认者和所属人；显式未确认、撤销、时间不确定或所属人不符的条目在供应商入口前拒绝。背景错误为 `health_context_source_invalid|unconfirmed|temporal_invalid|subject_invalid|subject_mismatch|confirmation_invalid|remember_invalid|date_invalid`（每项均有 `health_context_` 前缀）。`remember=false` 只表示不自动沿用，仍允许用户为今天明确选择已确认背景。兼容旧四字段背景，但不补造缺失日期、身份或当前状态；具有 `subject_id` 的新请求不能混入身份未知的旧行。
+
+`controller` 由本机加密会话保存并回传。后端在其中记录已判定为无关的回合编号、原话版本与 SHA-256，并绑定所属人及会话首个回合 ID；只有回合仍属于当前会话且版本、原话和回应上下文哈希一致时，才从临床事实提取、来源核对、风险证据与交接材料中排除。无关原话仍保留在完整聊天中。原话或版本被修改、会话不匹配或标记无效时，标记被忽略并重新判断。该绑定是防止旧状态串会话的完整性检查，不是身份认证或真实医学判断证明。普通续聊需回传完整 controller；若编辑某条原话时重置追问状态，前端必须同时保留 `session_id`、`session_anchor_turn_id`、`session_turn_ids`、`non_health_sources`，后端会按当前会话和来源版本重验。当前整合前端的编辑路径会重置整个 controller，因此在前端保留这些字段前，编辑后的跨轮来源排除尚未端到端通过。
+
+模型只引用与本次话语相关的条目，不把过去停用药物写成正在用药，也不把用户确认的自述写成正式诊断。模型回应、真实供应商召回、病例持久化和加密备份分别验收。
+
+
+## 本机录音文字的修订与来源核对（2026-10-10）
+
+本节只描述浏览器 `HealthLocal` 的本机加密接口，不能当成后端 SQLite HTTP 已支持录音 source-review 的声明。
+
+- 录音媒体的 `recognition.text` 与原始 `event_link` 保留为原始 ASR 和来源锚点。原件核对入口沿同一所属人的 `supersedes_id` 修订链读取唯一当前记录，分叉、循环、缺失或跨所属人链不能作为当前来源。
+- 本机 `POST /api/events/:record_id/source-review` 对 `audio_transcript` 要求当前版本 `expected_version`、显式 `compared_with_original:true` 和仍存在的关联录音原件。返回的 `source_review` 包含 `method, text, confirmed_at, record_id`；记录保持 inbox、医学确认范围为空。确认只证明使用者声明文字准确，不清除风险。再次修订清空该确认。
+- 用已保存录音新建对话时使用当前已核对记录的 `raw_text`、`record_id`、`media_id` 与 `source_version`；本机保存再次检查版本和来源，冲突拒绝，不能重用原始 ASR 代替当前文字。当前受控试验停点优先阻止新建，不会通过文字确认解除或自动调用模型。
+- 本机新增错误：`audio_original_unavailable`、`audio_source_review_required`、`audio_source_changed`。无原件或保存失败不能显示确认成功。多使用者／家庭隔离、原始识别回包及历史保留规则沿用。
+
+### 独立的已核对录音单次承接
+
+仅适用于两项既有虚构来源，各自使用精确 schema：N03 已更正的 version 2；N01 已有有效首版核对凭证的 version 1；或 N01 经正常 source-review 后的 version 2（`noreset-n01-saved-audio-llm-reviewed-v2`）。本次实际 N01 旧首版原本缺少本机核对，正常 UI 核对后得到 version 2。每个 schema 只接受对应版本，还必须匹配当前原话、原件、所属人与核对凭证；真实 ASR 成功本身不能代替核对。旧媒体与全局 `trial_control` 保留，不重新执行旧 ASR，也不恢复旧额度。
+
+- N03 沿用 `noreset-n03-saved-audio-llm-v1`，N01 使用独立的 `noreset-n01-saved-audio-llm-v1`。每种只允许对应样例的确切文字、音频哈希和真实来源版本；不开放任意版本或未核对记录。
+- 后端 `GET /api/app/saved-audio-trial` 沿用当前会话、Origin 和 CSRF 校验；默认返回 `grant:null`。操作员须先通过既有原生单次累计预算审批，在本机固定路径 `runtime/synthetic-trial/saved-audio-continuation.json` 安装精确绑定。HTTP 接口不能创建或修改授权，也不接收账本／凭据路径。
+- 新授权必须是独立原生范围、同一累计预算、仅 `['llm']` 一次、最多 20 分钟、0 重试、原 DeepSeek `deepseek-flash`、2048 输出／0 思考／24000 请求字节。元数据绑定录音及当前记录编号、版本、原件和文字 SHA、核对时间、旧停点快照及完整首轮 HTTP 输入 SHA；不是对旧失败批次的续额。
+- 正常“用录音文字新建对话”在旧停点存在时调用本机 `POST /api/conversations/saved-audio-trial/start`。本机先核验当前来源、原件、所属人及新授权，再原子保存新对话和独立一次性使用记录。旧标记只参加冲突检查，始终不被清空或改写；不同版本或背景变化须重新准备具体输入。
+- 本次正常模型请求使用 `X-NoReset-Saved-Audio-Trial` 指定已批准标识。服务端逐次核验完整输入和原生范围，并在供应商入口前独占写入持久一次性记录，随后仍由原生计量校验实际 wire／source。进程中断、超时、未知结果、第二次点击及服务重启都不会重发或退回占额。正常读回已保存结果可以复用，不能再次调用模型。
+- `saved_audio_trial_not_authorized|input_changed|used|source_changed` 是对应本机错误（均带 `saved_audio_trial_` 前缀）。任何一层失败都保留文字、原件与历史；单次回复结束后该新对话不能借此自动开启下一请求。
+
+这只证明人工纠正后受控续聊的承接；原 ASR 错字和无人干预语音流的未通过结论仍分别保留。费用预占为披露估算，供应商实际费用硬上限仍未知。
+
+N01 已完成的旧合成档案仍有 review-required 标记；新增第2版 schema 也可精确绑定该档案已保存的媒体/全局控制、记录、原件和版本。新授权独立于旧流程，旧控制只作未变条件，不能用通用 completed 状态或改写旧标记来通过。
+
+已关联旧对话的录音只在新的单次授权匹配当前原文、原件、所属人、核对时间和旧控制时显示独立新对话入口；读取可用状态不占额、不发送模型。未审批、来源变化或已使用时不会显示；点击后仍通过原有完整守卫。

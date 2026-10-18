@@ -9,9 +9,12 @@ const { webcrypto, randomUUID } = require('node:crypto');
 const { test } = require('node:test');
 
 const frontend = path.join(__dirname, '../frontend');
+const appSource = fs.readFileSync(path.join(frontend, 'app.js'), 'utf8');
 
-function harness({ media = false } = {}) {
+function harness({ media = false, activeView = null, startupMode = 'stub', storageFailure = null, healthLocal = null, fetchImpl = null } = {}) {
   const elements = new Map();
+  const viewNodes = activeView ? [element(activeView)] : [];
+  const queriedSelectors = [];
   let response = async route => {
     if (route === '/api/media/capabilities') return { r: { ok: true, status: 200 }, j: { capabilities: { enabled: true, disabled_reason: null } } };
     if (route === '/api/media') return { r: { ok: true, status: 200 }, j: { media: [] } };
@@ -47,35 +50,211 @@ function harness({ media = false } = {}) {
     crypto: { subtle: webcrypto.subtle, randomUUID },
     location: { hostname: 'localhost', port: '5173' },
     navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [] }) } },
-    document: { getElementById: element, querySelectorAll: () => [], createElement: tag => element(`new-${tag}-${Math.random()}`) },
+    document: {
+      getElementById: element,
+      querySelector: selector => selector === '.view.active' ? viewNodes.find(view => view.classList.contains('active')) ?? null : null,
+      querySelectorAll: selector => { queriedSelectors.push(selector); return selector === '.view' ? viewNodes : []; },
+      createElement: tag => element(`new-${tag}-${Math.random()}`),
+    },
     window: { scrollTo() {}, addEventListener() {} },
-    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
-    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, session_token: 'test', provider: 'mock', events: [] }) }),
+    localStorage: { getItem() { if (storageFailure === 'getItem') { const error = new Error('blocked'); error.name = 'SecurityError'; throw error; } return null; }, setItem() {}, removeItem() {} },
+    fetch: fetchImpl || (async () => ({ ok: true, status: 200, json: async () => ({ ok: true, session_token: 'test', provider: 'mock', events: [] }) })),
     setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 1; }, clearTimeout() {},
   });
+  if (healthLocal) context.HealthLocal = healthLocal;
+  if (storageFailure === 'getter') {
+    context.throwStorageSecurityError = () => { const error = new Error('blocked'); error.name = 'SecurityError'; throw error; };
+    vm.runInContext("Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throwStorageSecurityError(); } })", context);
+  }
+  if (activeView) element(activeView).classList.add('active');
   const run = code => vm.runInContext(code, context);
   run(fs.readFileSync(path.join(frontend, 'app.js'), 'utf8'));
   context.testApi = async (route, options = {}) => response(route, options);
   // Keep startup work deterministic. The production code still performs the
   // same health/capability calls; this harness only avoids network races.
-  run('api=testApi; health=async()=>true; loadEvents=async()=>{};');
+  if (startupMode === 'stub') run('api=testApi; health=async()=>true; loadEvents=async()=>{};');
   if (media) run(fs.readFileSync(path.join(frontend, 'media.js'), 'utf8'));
   return {
     context,
     element,
     run,
+    queriedSelectors,
     setResponse(fn) { response = fn; },
   };
 }
 
-test('text fallback copy matches its actual create-a-new-event behavior', () => {
+test('localStorage read rejection cannot prevent the real app from reaching local vault initialization', async t => {
+  for (const storageFailure of ['getItem', 'getter']) await t.test(storageFailure, async () => {
+    let initialiseCalls = 0;
+    const h = harness({
+      startupMode: 'actual',
+      storageFailure,
+      healthLocal: {
+        initialise: async () => { initialiseCalls += 1; return false; },
+        async request() { return { r: { ok: true, status: 200 }, j: {} }; },
+      },
+    });
+    await new Promise(setImmediate);
+    assert.ok(h.queriedSelectors.includes('.view'), 'the real app DOM initialization must run');
+    assert.equal(h.run('localMode'), true);
+    assert.equal(initialiseCalls, 1, 'the real startup chain must call HealthLocal.initialise');
+    assert.equal(h.run('localStartupFailed'), true, 'the simulated vault failure remains visibly not-ready');
+  });
+});
+
+test('a pending manual correction report guide does not claim that the report is organized', () => {
+  const h = harness();
+  h.run(`activeConversation = { subject_id: 'subject_self', report: { manual_correction_analysis_pending: true,
+    source_turn_ids: [], source_versions: [], transcript: [], sections: [], version: 7, body: '当前原话待整理' } };
+    renderConversationReport();`);
+  const html = h.element('conversationReportBody').innerHTML;
+  assert.match(html, /原话已修订，以下逐段保留当前原话；自动整理待更新/);
+  assert.doesNotMatch(html, /按就诊时最常用的顺序整理/);
+});
+
+test('a pending manual correction exposes an explicit reorganization action without adding a patient turn', () => {
+  const h = harness();
+  h.run(`activeConversation = { conversation_id: 'synthetic-correction', subject_id: 'subject_self',
+    manual_correction_analysis_pending: true,
+    turns: [{ turn_id: 'synthetic-current', role: 'elder', source_kind: 'elder', text: '虚构原话当前版本', version: 2 }],
+    report: { manual_correction_analysis_pending: true, status_label: '原话已修订 · 自动整理待更新' } };
+    renderVoiceConversation();`);
+  const html = h.element('voiceConversationTurns').innerHTML;
+  assert.match(html, /data-correction-reorganize/);
+  assert.match(html, /按更正后的原话重新整理/);
+  assert.doesNotMatch(html, /将重新整理文本作为一条患者原话/);
+  assert.equal(h.run('activeConversation.turns.filter(turn => turn.role === "elder").length'), 1);
+});
+
+test('legacy health installs its fresh in-memory token and the real API sends it as X-Session-Token', async () => {
+  const calls = [];
+  const pill = { textContent: '' };
+  const sandbox = {
+    localStorage: { getItem() { const error = new Error('blocked'); error.name = 'SecurityError'; throw error; } },
+    localMode: false, demoMode: true, modelProvider: '', API: '', FormData,
+    fetch: async (url, options = {}) => {
+      calls.push({ url, headers: options.headers || {} });
+      return { ok: true, status: 200, json: async () => url.endsWith('/health')
+        ? { ok: true, session_token: 'fresh-legacy-health-token', provider: 'legacy-test' }
+        : { ok: true, events: [] } };
+    },
+    $: id => id === 'modePill' ? pill : null,
+  };
+  const healthStart = appSource.indexOf('async function health()');
+  const modeStart = appSource.indexOf('function setModeLabel()', healthStart);
+  const modeEnd = appSource.indexOf('\n}', modeStart) + 2;
+  const apiStart = appSource.indexOf('async function api(');
+  const apiEnd = appSource.indexOf('\nasync function refreshRuntimeConfiguration', apiStart);
+  assert.ok(healthStart >= 0 && modeStart > healthStart && modeEnd > modeStart && apiStart > modeEnd && apiEnd > apiStart);
+  const startupPrefix = appSource.split('\n').slice(0, 2).join('\n');
+  const context = vm.createContext(sandbox);
+  vm.runInContext(`${startupPrefix}\n${appSource.slice(healthStart, modeEnd)}\n${appSource.slice(apiStart, apiEnd)}\nthis.runHealth=health;this.send=api;this.currentToken=()=>token;`, context);
+  assert.equal(await context.runHealth(), true);
+  assert.equal(context.currentToken(), 'fresh-legacy-health-token');
+  await context.send('/api/events');
+  assert.deepEqual(calls.map(call => call.url), ['/health', '/api/events']);
+  assert.equal(calls[1].headers['X-Session-Token'], 'fresh-legacy-health-token');
+  assert.match(pill.textContent, /本机记录中/);
+});
+
+test('health background cannot be edited or saved before the initial read completes', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run('localMode=true');
+  const loading = h.run('loadHealthContext()');
+  assert.equal(h.element('healthConditions').disabled, true);
+  assert.equal(h.element('saveHealthContextBtn').disabled, true);
+  release({ r: { ok: true }, j: { health_context: { entries: [] } } });
+  await loading;
+  assert.equal(h.element('healthConditions').disabled, false);
+  assert.equal(h.element('saveHealthContextBtn').disabled, false);
+});
+
+test('an organize reply after leaving detail cannot reopen the old record', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:1};detailRequestSerial=10");
+  const pending = h.run("organize(current)");
+  h.run("showView('homeView')");
+  release({ r: { ok: true, status: 200 }, j: { event: { record_id: 'rec_test', raw_text: '虚构旧详情', version: 2, state: 'draft' } } });
+  await pending;
+  assert.equal(h.run('current'), null);
+  assert.equal(h.element('detail').classList.contains('hidden'), true);
+});
+
+test('a review reply after leaving detail does not force navigation back', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:2};detailRequestSerial=10;showDetail=async()=>{current={record_id:'rec_test'}}");
+  const pending = h.run("review(current)");
+  h.run("showView('homeView')");
+  release({ r: { ok: true, status: 200 }, j: {} });
+  await pending;
+  assert.equal(h.run('current'), null);
+});
+
+test('late related history cannot render an older version over a newer draft', async () => {
+  const h = harness();
+  let release;
+  h.setResponse(() => new Promise(resolve => { release = resolve; }));
+  h.run("current={record_id:'rec_test',version:1,related_record_ids:['rec_other']};detailRequestSerial=10");
+  const pending = h.run('loadRelatedHistory(current)');
+  h.run("current={record_id:'rec_test',version:2,state:'draft',raw_text:'虚构新版'}");
+  release({ r: { ok: true, status: 200 }, j: { event: { record_id: 'rec_other', raw_text: '虚构相关记录' } } });
+  await pending;
+  assert.equal(h.run('current.version'), 2);
+});
+
+test('document OCR remains a reviewable transcription rather than a promise of exact original text', () => {
+  const h = harness();
+  const html = h.run("detailHtml({source_kind:'document',raw_text:'HEB 130',state:'draft',draft:{summary:'检验表'}})");
+  assert.match(html, /资料文字（请对照原件）/);
+  assert.match(html, /核对前不会用于 AI 整理、事实或交接正文/);
+  assert.doesNotMatch(html, /id="organizeBtn"|id="reviewBtn"|整理摘要/);
+  assert.doesNotMatch(html, /AI 只做分类和归档，没有改写原文/);
+  assert.match(html, /HEB 130/);
+});
+
+test('text and voice share the same resumable conversation behavior', () => {
   const markup = fs.readFileSync(path.join(frontend, 'index.html'), 'utf8');
   const app = fs.readFileSync(path.join(frontend, 'app.js'), 'utf8');
-  assert.match(markup, /可以单独用文字记录/);
-  assert.match(markup, /会保存为一条新的记录，原话会保留/);
-  assert.doesNotMatch(markup, /不会另起一份档案/);
-  assert.match(app, /source_kind:'elder'/);
-  assert.match(app, /method:'POST'/);
+  assert.match(markup, /打字说，或者点麦克风/);
+  assert.match(markup, /退出也会自动留下报告/);
+  assert.match(app, /submitConversationText/);
+  assert.match(app, /source_kind:extra\.source_kind\|\|'elder'/);
+  assert.match(app, /\/api\/conversations\/\$\{encodeURIComponent\(activeConversation\.conversation_id\)\}\/turns/);
+});
+
+test('a saved elder turn without an assistant reply is resumed automatically', async () => {
+  const h = harness({ activeView: 'voiceView' });
+  const pending = {
+    conversation_id: 'conversation_resume_test', version: 2,
+    turns: [
+      { turn_id: 'turn_assistant_open', role: 'assistant', text: '您今天最难受的是什么？', action: 'ask' },
+      { turn_id: 'turn_elder_leg', role: 'elder', text: '测试用：左腿疼得伸不直。', version: 1 },
+    ],
+    report: { report_id: 'report_test', status_label: '自动整理 · 本人未核对', source_turn_ids: ['turn_elder_leg'], body: '老人原话' },
+  };
+  const recovered = {
+    ...pending, version: 3,
+    turns: [...pending.turns, { turn_id: 'turn_assistant_followup', role: 'assistant', text: '这种不舒服大概什么时候开始的，后来有什么变化？', action: 'ask' }],
+  };
+  const calls = [];
+  h.setResponse(async route => {
+    calls.push(route);
+    if (route.startsWith('/api/conversations/current?')) return { r: { ok: true, status: 200 }, j: { conversation: pending, resume_choice_required: false } };
+    if (route.endsWith('/resume-assistant')) return { r: { ok: true, status: 200 }, j: { conversation: recovered, recovered: true, ai_failed: false } };
+    return { r: { ok: true, status: 200 }, j: {} };
+  });
+
+  await h.run('conversationLoading=false;activeConversation=null;loadConversation()');
+
+  assert.ok(calls.some(route => route.endsWith('/resume-assistant')));
+  assert.equal(h.run('activeConversation.turns.at(-1).text'), '这种不舒服大概什么时候开始的，后来有什么变化？');
+  assert.match(h.element('voiceConversationStatus').textContent, /已经接上刚才的话/);
 });
 
 test('event recents and media archive order newest first while retaining superseded filtering', () => {
@@ -163,4 +342,34 @@ test('reselecting the same photo or audio clears the file input value after reta
   audioInput.value = '/tmp/same.wav';
   await audioInput.onchange({ target: audioInput });
   assert.equal(audioInput.value, '');
+});
+
+test('renamed photos retain original bytes but use the detected image type', async () => {
+  const h = harness({ media: true });
+  const bytes = Uint8Array.from([137,80,78,71,13,10,26,10,1,2,3]);
+  h.context.renamedPhoto = new Blob([bytes], { type: 'image/jpeg' });
+  const retained = await h.run('retainSelectedFile(renamedPhoto)');
+  assert.equal(retained.type, 'image/png');
+  assert.deepEqual(new Uint8Array(await retained.arrayBuffer()), bytes);
+  h.run("mediaMessage('照片原件读取失败，请重新选择')");
+  assert.equal(h.element('photoStatus').textContent, '照片原件读取失败，请重新选择');
+});
+
+
+test('organize explains a real version conflict without relabeling other rejections', async () => {
+  for (const [error, message] of [
+    ['stale_version', '记录已有新版本，请刷新后重试'],
+    ['trial_authorization_required', '整理失败，原话仍在'],
+    ['display_only_no_ai', '整理失败，原话仍在'],
+  ]) {
+    const h = harness();
+    let calls = 0;
+    h.setResponse(async () => { calls += 1; return { r: { ok: false, status: 409 }, j: { error } }; });
+    h.run("current={record_id:'rec_test',version:1,raw_text:'虚构原话保持不变'};detailRequestSerial=10");
+    await h.run('organize(current)');
+    assert.equal(h.element('toast').textContent, message);
+    assert.equal(h.element('organizeBtn').disabled, false);
+    assert.equal(h.run('current.raw_text'), '虚构原话保持不变');
+    assert.equal(calls, 1, 'A rejection never automatically resends the request');
+  }
 });

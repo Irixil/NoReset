@@ -7,8 +7,8 @@
 有原仓库写权限的同学使用下面的命令。
 
 ```bash
-git clone https://github.com/Irixil/bing-li-bu-gui-ling.git
-cd bing-li-bu-gui-ling
+git clone https://github.com/Irixil/NoReset.git
+cd NoReset
 git status --short --branch
 ```
 
@@ -36,13 +36,13 @@ git switch -c feat/media-recognition
 
 ```bash
 # 首次 git clone 使用自己 fork 页面的地址，不使用上面原仓库地址
-git remote add upstream https://github.com/Irixil/bing-li-bu-gui-ling.git
+git remote add upstream https://github.com/Irixil/NoReset.git
 git fetch upstream
 git switch main
 git merge --ff-only upstream/main
 ```
 
-再从这个 main 创建 A 或 B 分支，后续仍推 `origin`，PR 的目标选择 `Irixil/bing-li-bu-gui-ling` 的 main。下文同步代码时，fork 用户将 `origin/main` 换为 `upstream/main` 并先 `git fetch upstream`。若已误克隆原仓库，先检查 `git remote -v`，让 Codex 协助调整远端，不要尝试向无权限的地址强推。
+再从这个 main 创建 A 或 B 分支，后续仍推 `origin`，PR 的目标选择 `Irixil/NoReset` 的 main。下文同步代码时，fork 用户将 `origin/main` 换为 `upstream/main` 并先 `git fetch upstream`。若已误克隆原仓库，先检查 `git remote -v`，让 Codex 协助调整远端，不要尝试向无权限的地址强推。
 
 环境安装及启动见 [根 README](../../README.md)。首先运行现有测试确认本机基线；失败先报告和定位。模型缓存、依赖及运行数据都留在被忽略的本地目录。
 

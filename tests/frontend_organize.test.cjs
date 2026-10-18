@@ -46,7 +46,7 @@ async function harness(initial) {
     }
     return elements.get(id);
   }
-  for (const id of ['modePill', 'toast', 'homeRecent', 'eventsList', 'archiveEvents', 'detail', 'dangerBanner', 'recordBtn', 'resumeBtn', 'pauseBtn', 'saveBtn', 'refreshBtn', 'handoffBtn', 'rawText']) element(id);
+  for (const id of ['modePill', 'toast', 'homeRecent', 'eventsList', 'archiveEvents', 'detail', 'dangerBanner', 'recordBtn', 'saveBtn', 'refreshBtn', 'handoffBtn', 'rawText']) element(id);
   const context = vm.createContext({
     console, FormData, URL,
     location: { hostname: 'localhost', port: '18768' },
@@ -173,7 +173,7 @@ test('revision network failure retains both inputs and permits retry', async () 
   assert.equal(h.element('revText').value, '仍未确认保存的修订');
   assert.equal(h.element('revReason').value, '待补充说明');
   assert.equal(h.element('submitRev').disabled, false);
-  assert.match(h.element('reviseStatus').textContent, /保存未确认，输入已保留/);
+  assert.match(h.element('reviseStatus').textContent, /未保存成功，输入已保留/);
   await h.click('submitRev');
   assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 2);
 });

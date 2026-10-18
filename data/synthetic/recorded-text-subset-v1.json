@@ -1,0 +1,212 @@
+{
+  "schema_version": "noreset-recorded-synthetic-native-v1",
+  "synthetic_only": true,
+  "source": "Two original authored text inputs and their recorded model drafts; no patients, credentials, account or HTTP metadata.",
+  "execution": "Offline in-memory replay only; semantic and clinical review remain pending.",
+  "records": [
+    {
+      "job_id": "dialogue1",
+      "engine": "conversation",
+      "native_input": {
+        "turns": [
+          {
+            "turn_id": "turn_texttrial_patient01",
+            "text": "以下内容完全虚构。我咳嗽两天了，晚上明显，想整理给医生看。",
+            "version": 1
+          }
+        ],
+        "health_context": [],
+        "controller": {}
+      },
+      "draft": {
+        "user_intent": "health_fact",
+        "latest_turn_adds_fact": true,
+        "reply_text": "您说咳嗽两天、晚上更明显，想整理给医生看，我会按这个方向帮您记录。",
+        "suggested_action": "ask",
+        "question_category": "associated_symptoms",
+        "question_importance": "essential",
+        "candidate_question": "咳嗽的时候有没有痰，或者同时有发热、咽痛、气短这些情况？",
+        "clinical_state": {
+          "main_complaint": {
+            "status": "known",
+            "summary": "咳嗽两天，晚上明显，想整理给医生看",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01"
+            ],
+            "context_ids": []
+          },
+          "onset_course": {
+            "status": "known",
+            "summary": "咳嗽已两天",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01"
+            ],
+            "context_ids": []
+          },
+          "symptom_character": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "aggravating_relieving": {
+            "status": "known",
+            "summary": "晚上咳嗽明显",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01"
+            ],
+            "context_ids": []
+          },
+          "associated_symptoms": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "functional_impact": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "relevant_history": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "prior_actions_results": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          }
+        },
+        "relevant_context_ids": [],
+        "unknowns": [],
+        "contradictions": [],
+        "risk_candidates": []
+      },
+      "profile": {
+        "kind": "llm",
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "url": "https://api.deepseek.com/chat/completions",
+        "source_sha256": "9fe50811883cf8f79e2dface00ed281a3928f9d78c8984a538bd06864256162e",
+        "request_sha256": "e1cb2b2cd541d3799f24e58c05b6c7cd24590367cf55060b83319f556915b10f",
+        "wire_bytes": 7676,
+        "max_output_tokens": 2048,
+        "max_thinking_tokens": 0
+      }
+    },
+    {
+      "job_id": "dialoguecorrection2",
+      "engine": "conversation",
+      "native_input": {
+        "turns": [
+          {
+            "turn_id": "turn_texttrial_patient01",
+            "text": "以下内容完全虚构。我咳嗽两天了，晚上明显，想整理给医生看。",
+            "version": 1
+          },
+          {
+            "turn_id": "turn_texttrial_correct02",
+            "text": "以下内容完全虚构。刚才说错了，不是两天，是三天。我担心把时间讲错，能先帮我把原话记清楚吗？",
+            "version": 2
+          }
+        ],
+        "health_context": [],
+        "controller": {}
+      },
+      "draft": {
+        "user_intent": "correction",
+        "latest_turn_adds_fact": true,
+        "reply_text": "您更正了咳嗽的起始时间，从两天改为三天，我会按三天记录，并保留您担心讲错时间的说明。",
+        "suggested_action": "ask",
+        "question_category": "symptom_character",
+        "question_importance": "useful",
+        "candidate_question": "咳嗽时有没有痰，还是以干咳为主？",
+        "clinical_state": {
+          "main_complaint": {
+            "status": "known",
+            "summary": "咳嗽，想整理给医生看",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01"
+            ],
+            "context_ids": []
+          },
+          "onset_course": {
+            "status": "known",
+            "summary": "咳嗽三天",
+            "evidence_turn_ids": [
+              "turn_texttrial_correct02"
+            ],
+            "context_ids": []
+          },
+          "symptom_character": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "aggravating_relieving": {
+            "status": "known",
+            "summary": "晚上明显",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01"
+            ],
+            "context_ids": []
+          },
+          "associated_symptoms": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "functional_impact": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "relevant_history": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          },
+          "prior_actions_results": {
+            "status": "missing",
+            "summary": "",
+            "evidence_turn_ids": [],
+            "context_ids": []
+          }
+        },
+        "relevant_context_ids": [],
+        "unknowns": [],
+        "contradictions": [
+          {
+            "text": "咳嗽起始时间先称两天，后更正为三天",
+            "evidence_turn_ids": [
+              "turn_texttrial_patient01",
+              "turn_texttrial_correct02"
+            ],
+            "context_ids": []
+          }
+        ],
+        "risk_candidates": []
+      },
+      "profile": {
+        "kind": "llm",
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "url": "https://api.deepseek.com/chat/completions",
+        "source_sha256": "941dce9c0f0926797221c28b45d92b81572caee7281a8fa1eda05ade6bc684bc",
+        "request_sha256": "5a352dd4362f3209754b59644684810df6e093154087d4c84171b2c3ecfef9af",
+        "wire_bytes": 7888,
+        "max_output_tokens": 2048,
+        "max_thinking_tokens": 0
+      }
+    }
+  ]
+}
