@@ -68,10 +68,11 @@ test('pre-caches only the declared shell and activation preserves unrelated orig
   const markup = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
   const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
   const resources = [...markup.matchAll(/\?v=([^"'&\s]+)/g)].map(match => match[1]);
-  assert.equal(source.match(/const CACHE = '([^']+)'/)?.[1], 'bingli-beta-shell-v136-crossday-source-20261019');
+  assert.equal(source.match(/const CACHE = '([^']+)'/)?.[1], 'bingli-beta-shell-v171-media-original-delete-20261023');
   assert.equal(resources.length, 15);
-  assert.deepEqual([...new Set(resources)], ['v136-crossday-source-20261019']);
-  assert.match(app, /service-worker\.js\?build=v136-crossday-source-20261019/);
+  assert.deepEqual([...new Set(resources)], ['v171-media-original-delete-20261023']);
+  assert.match(app, /service-worker\.js\?build=v171-media-original-delete-20261023/);
+  assert.match(markup, /<script src="safety\.js\?v=v171-media-original-delete-20261023"><\/script>\s*<script src="local-store\.js\?v=v171-media-original-delete-20261023"><\/script>[\s\S]*?<script src="app\.js\?v=v171-media-original-delete-20261023"><\/script>/);
   const worker = createWorker({ cacheNames: ['bingli-beta-shell-v21-old', 'other-app-cache', 'bingli-beta-shell-v22-record-trash', 'bingli-beta-shell-v23-audit'] });
   await worker.dispatch('install', undefined).lifetime;
   assert.deepEqual(worker.precached(), [

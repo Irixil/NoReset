@@ -67,3 +67,23 @@ test('saved legacy report sections pass through pure display normalization', () 
   assert.match(html, /同源摘要 · 只显示一次/);
   assert.equal(JSON.stringify(original.sections[0].lines[0].text), JSON.stringify('同源摘要'));
 });
+
+test('report refresh explains that an unbound current source still needs conversation organization', async () => {
+  const refreshHandler = source.slice(source.indexOf('let reportRefreshBusy=false;'), source.indexOf('function reportSubjectLabel('));
+  const elements = new Map([['refreshConversationReportStatus', { textContent: '' }],
+    ['refreshConversationReportBtn', { disabled: true, focus() {} }]]);
+  const calls = [];
+  const context = vm.createContext({ activeConversation: { conversation_id: 'conversation_synthetic', subject_id: 'subject_self', version: 4,
+      report: { version: 2 } }, activeHealthSubjectId: 'subject_self', healthSubjectsVersion: 1,
+    $: id => elements.get(id), renderConversationReport() {}, syncConversation() {},
+    HealthLocal: { request: async (path, options) => {
+      calls.push(path);
+      if (path === '/api/health-memory') return { r: { ok: true }, j: { health_context: { version: 0 } } };
+      assert.equal(options.method, 'POST');
+      return { r: { ok: false, status: 409 }, j: { error: 'report_sources_not_current' } };
+    } } });
+  await vm.runInContext(`${refreshHandler}\nrefreshConversationReport()`, context);
+  assert.deepEqual(calls, ['/api/health-memory', '/api/conversations/conversation_synthetic/refresh-report']);
+  assert.equal(elements.get('refreshConversationReportStatus').textContent,
+    '当前原话还没有对应的整理结果；原话和本机报告已保留。请先完成对话整理，再更新报告。');
+});

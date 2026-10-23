@@ -1,41 +1,91 @@
 [简体中文](README.md) · [English](README.en.md)
 
 <div align="center">
-  <img src="frontend/assets/brand-mascot.png" width="100" alt="Xiao Ling, the NoReset mascot">
+  <img src="frontend/assets/brand-mascot.png" width="92" alt="Xiao Ling, the NoReset mascot">
   <h1>NoReset · 病历不归零</h1>
-  <p><strong>A local-first AI health journal for personal health records and visit preparation.</strong></p>
-  <p>Voice and text conversations · Medical document organization · Traceable sources · Encrypted browser storage</p>
-  <p><a href="#see-the-workflow">See the workflow</a> · <a href="#run-locally">Run locally</a> · <a href="#how-it-works">How it works</a> · <a href="https://github.com/Irixil/NoReset/issues">Feedback</a></p>
+  <p><strong>Keep your health story going, without starting over at every appointment.</strong></p>
+  <p>Voice and text conversations · Quoted follow-ups · Medical records · Encrypted local storage</p>
+  <p><a href="#run-locally">Run locally</a> · <a href="#how-to-use-it">How to use it</a> · <a href="#data-and-privacy">Data and privacy</a> · <a href="https://github.com/Irixil/NoReset/issues">Feedback</a></p>
 </div>
 
-Preparing for another appointment often means telling the same story again: what changed, when it started, and which earlier records matter. NoReset helps individuals and family caregivers keep that information together, using everyday conversations and the original documents.
+NoReset helps individuals and family caregivers record health changes through everyday conversations. Keep spoken words, documents and corrections together, then open a visit summary with links back to its sources.
 
-Describe how you feel by voice or text. Review and correct the original words, select relevant health background, and organize the information into a source-linked visit summary. The interface and current examples are primarily in Simplified Chinese.
-
-## See the workflow
+Return to the same conversation tomorrow and continue. New details stay in that conversation, and its report updates as the record grows. The current interface is primarily in Simplified Chinese.
 
 <p align="center">
-  <img src="docs/readme/walkthrough.gif" width="360" alt="NoReset walkthrough: home, conversation, and source-linked visit summary">
+  <img src="docs/readme/walkthrough.gif" width="360" alt="NoReset walkthrough: voice chat, message menu, quoted follow-up and history">
+  <br><sub>Current UI with fictional text and synthetic audio. This demonstrates interaction, not model accuracy.</sub>
 </p>
-
-<p align="center"><sub>Actual application screens with fictional conversation and health information.</sub></p>
 
 ## What you can do
 
 | Your task | NoReset workflow |
 | --- | --- |
-| Describe changes in your health | Talk or type, add details, ask questions, and correct earlier statements. |
-| Keep medical documents together | Save original photos, reports, medication packaging, and recordings; review recognized text against the original. |
-| Bring relevant background | Save confirmed health background and choose up to five relevant items for a conversation. |
-| Prepare for a visit | Review a summary with original statements, sources, and information to clarify. |
-| Return to earlier records | Reopen conversations and search records by keyword, type, status, or date. |
-| Move your records | Export an encrypted `.bingli` backup and restore it with the matching passphrase. |
+| Describe a health change | Type or record; an audio bubble keeps the recording, with its transcript underneath and an AI response after recognition |
+| Ask about an earlier message | Long-press it and choose the first action, “追问” (follow up); ask by text or voice, or send an explanation shortcut |
+| Continue days later | Open the original chat from “我的记录” (My records), with its messages, recordings and report intact |
+| Correct what you just said | Edit your latest message while retaining the previous wording; clarify older messages with a new reply or quote |
+| Organize documents | Upload a photo, compare the recognized text with the original, then use it in a record |
+| Prepare for a visit | Review the report, missing information and original sources |
+| Keep family records separate | Select the person, maintain their health background and choose relevant context for each chat |
+| Manage your data | Export an encrypted backup; confirm a deletion to remove the selected local record and its linked originals |
+
+## How to use it
+
+### 1. Set up your local vault
+
+On first launch, create a recovery passphrase of at least 10 characters. Select yourself or a family member before recording.
+
+Keep the passphrase safe: it unlocks the vault and its backups. Moving to a different browser or device requires a backup import; there is no automatic synchronization.
+
+### 2. Start a conversation
+
+Open “和小零聊聊”, type a message, or tap the microphone. Tap “结束这句话” to finish; browsers with silence detection can also finish after a pause.
+
+The saved recording appears as an audio bubble with a processing state. Its transcript appears below, followed by the AI response after successful recognition. No extra confirmation checkbox is required. Tap the bubble to play or pause the original audio.
+
+If recognition fails after the original was saved, the original remains available to replay or process again. The page shows the current status.
+
+### 3. Follow up on a specific message
+
+Long-press your message or an AI reply; on desktop, use the context menu. “追问” is the first action. A quote appears above the input, where you can expand or cancel it.
+
+- **解释一下 — Explain this:** immediately sends the quoted message with an explanation request.
+- **详细展开 — Tell me more:** immediately sends a request for more detail about the quote.
+- **Your own question:** type or record, then send.
+
+The new question and reply appear at the bottom of the same conversation. No branch is created and earlier messages remain in place.
+
+<p align="center">
+  <img src="docs/readme/conversation.png" width="320" alt="Audio bubble and transcript">
+  <img src="docs/readme/quote.png" width="320" alt="Quoted follow-up and explanation shortcuts">
+</p>
+
+### 4. Correct, save and return
+
+Only your latest message can be edited, even after an AI reply. To clarify older wording, quote it or add a new message, preserving the meaning of later exchanges.
+
+Records save locally. “我的记录” lists short titles and dates; opening one takes you directly back to that chat. The report is available in the upper-right corner and updates in place, retaining earlier versions and the dates of new details.
+
+<p align="center">
+  <img src="docs/readme/records.png" width="320" alt="Record titles and dates">
+</p>
+
+<p align="center">
+  <img src="docs/readme/report.png" width="680" alt="Visit summary with original sources">
+</p>
+
+### 5. Add documents and make a backup
+
+Use “看病资料” to upload document photos and compare recognized text against the originals. Select relevant documents for a chat. Confirm health background yourself before deciding whether it should be used in later conversations.
+
+Export a `.bingli` encrypted backup in settings. To restore, select the file, enter its passphrase and follow the confirmation steps.
+
+Deletion opens a clear confirmation dialog. Confirming removes the selected local record or conversation and its linked originals, then refreshes the lists. **Previously downloaded backups are separate files and are not deleted automatically.**
 
 ## Run locally
 
-You need **Python 3.12** and your own service credentials. The example configuration uses DeepSeek for text conversations and AIHubMix for audio transcription and image text recognition. Provider usage is billed by the corresponding service.
-
-### 1. Get the source
+This repository provides source for a locally hosted application. Install **Python 3.12**. Live conversation, speech recognition and image recognition require API credentials; providers charge according to usage.
 
 ```bash
 git clone https://github.com/Irixil/NoReset.git
@@ -46,77 +96,40 @@ python -m pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-<details>
-<summary>Windows PowerShell environment setup</summary>
+On Windows, use `py -3.12 -m venv .venv`, activate with `.venv\Scripts\Activate.ps1`, and copy `.env.example` to `.env`.
 
-After cloning the repository, run these commands from its directory:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
-Copy-Item .env.example .env
-```
-
-</details>
-
-### 2. Configure your services
-
-Edit the local `.env` file and fill in your own keys:
+Set your credentials in the local `.env` file:
 
 ```dotenv
-DEEPSEEK_API_KEY=your_text_service_key
-AIHUBMIX_API_KEY=your_audio_and_image_service_key
+DEEPSEEK_API_KEY=your_conversation_api_key
+AIHUBMIX_API_KEY=your_speech_and_image_api_key
 ```
 
-Keep `.env` private. See [model configuration](docs/MODEL-CONNECTION.md) for the supported provider adapters.
-
-### 3. Start the application
+Keep or adjust the model settings from `.env.example`, then run:
 
 ```bash
 python -m scripts.start_app --check-config
 python -m scripts.start_dev
 ```
 
-Open **[http://127.0.0.1:5173/](http://127.0.0.1:5173/)**. The frontend uses port `5173` and the backend uses port `18768`; the command starts both.
+Open **[http://127.0.0.1:5173/](http://127.0.0.1:5173/)**. The default backend port is `18768`. Recording requires browser microphone permission; remote microphone access requires a secure connection.
 
-## How it works
+See [model connection instructions](docs/MODEL-CONNECTION.md) for configuration. Never commit `.env` or API keys.
 
-1. **Create a local record vault.** Choose a recovery passphrase of at least ten characters and confirm it. Keep the passphrase and download backups regularly.
-2. **Start a conversation.** Open “说给我听” from the home screen. Type a message or use the microphone. Add relevant background when needed and correct any misheard words.
-3. **Review documents.** Save an original photo or recording, then compare the recognized text with the original, especially dates, numbers, units, and medication names.
-4. **Prepare for a visit.** Open “我的记录” to review earlier conversations or select records for visit preparation. Check the original words and sources before sharing the material with a clinician.
+## Data and privacy
 
-<table>
-  <tr>
-    <td width="50%" align="center"><strong>Conversation and corrections</strong></td>
-    <td width="50%" align="center"><strong>Visit summary with sources</strong></td>
-  </tr>
-  <tr>
-    <td><img src="docs/readme/conversation.png" width="100%" alt="NoReset conversation with original statements and correction controls"></td>
-    <td><img src="docs/readme/report.png" width="100%" alt="NoReset visit summary with source-linked statements"></td>
-  </tr>
-</table>
+- **Local storage:** conversations, health background, audio and document originals are stored in an encrypted vault in the current browser. Export a backup before clearing site data.
+- **Online processing:** AI requests send the text and selected context needed for the current turn to your configured provider. Speech and image recognition send the relevant file. The recovery passphrase is not sent.
+- **Traceable sources:** original words, files and correction history support review. Automatic transcription does not mean the user has verified it, and AI replies are not patient statements.
+- **Communication support:** reports organize information for a visit. They do not provide diagnoses, prescriptions or treatment plans, or replace a clinician’s judgment.
 
-## Your data and AI services
+## Documentation and feedback
 
-Records and confirmed health background are encrypted in the current browser on the current device. Records do not automatically synchronize between devices. Before clearing browser data or moving devices, export an encrypted backup and keep its matching passphrase. The server cannot recover a forgotten passphrase.
-
-Online AI features send the text needed for the current conversation, selected background, or the audio or image being recognized to the configured provider. Selected background remains attached to subsequent messages until you deselect it. The recovery passphrase is not uploaded. AI conversations, transcription, and image text recognition require network access and configured services.
-
-NoReset is for health record keeping and communication with clinicians. Review the content against its sources. Diagnosis, treatment, and medication decisions belong with a qualified clinician.
-
-## Explore the source
-
-- [Architecture and project layout](docs/ARCHITECTURE.md)
+- [Architecture and data flow](docs/ARCHITECTURE.md)
 - [API documentation](docs/API.md)
-- [Model configuration](docs/MODEL-CONNECTION.md)
-- [Detailed Chinese user guide](README.md)
+- [Model connection and configuration](docs/MODEL-CONNECTION.md)
+- [Report an issue or suggest a change](https://github.com/Irixil/NoReset/issues)
 
-## Feedback
+Describe the steps, expected result and actual result using fictional examples. Do not post real medical records, recovery passphrases or API keys in public issues.
 
-Use [GitHub Issues](https://github.com/Irixil/NoReset/issues) for questions, suggestions, or reproducible problems. Include the steps, expected result, and actual behavior. Use fictional examples and remove personal health information, recordings, passphrases, and API keys before posting.
-
-## License
-
-The code currently has no general open-source license grant. Public sample materials retain their own licenses and provenance; see [sample data notes](data/public_cases/README.md).
+This repository currently has no general open-source license. Public source availability does not grant unrestricted use, modification or redistribution. See [public case provenance and licenses](data/public_cases/README.md) for the sample data.

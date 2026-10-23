@@ -19,6 +19,14 @@ async function completed(h){
 }
 async function add(h,c,key='synthetic-text-second'){return h.request('/api/conversations/'+c.conversation_id+'/turns',{text:secondText,source_kind:'elder',expected_version:c.version},{'Idempotency-Key':key});}
 async function edit(h,c,t,text){return h.request('/api/conversations/'+c.conversation_id+'/turns/'+t.turn_id,{text,expected_version:t.version,expected_conversation_version:c.version});}
+async function ordinaryReviewedAudioTurn(h){
+ let c=await h.start();const event=(await h.request('/api/events',{raw_text:firstText,source_kind:'audio_transcript'})).j.event,mediaId='media_'+webcrypto.randomUUID().replaceAll('-','');
+ const media={media_id:mediaId,subject_id:'subject_self',kind:'audio',content_type:'audio/wav',original_filename:'ordinary-synthetic.wav',save_status:'saved',recognition_status:'succeeded',recognition:{text:firstText,is_mock:false},event_link:{record_id:event.record_id},record_id:event.record_id,version:1};
+ await h.api.vault.put('media:'+mediaId,media);await h.api.vault.putBinary('media-binary:'+mediaId,new Uint8Array([1,2,3,4]).buffer);
+ const reviewed=(await h.request('/api/events/'+event.record_id+'/source-review',{expected_version:event.version,compared_with_original:true})).j.event,currentMedia=(await h.request('/api/media/'+mediaId)).j.media;
+ const linked=await h.request('/api/conversations/'+c.conversation_id+'/turns',{text:firstText,source_kind:'audio_transcript',record_id:event.record_id,media_id:mediaId,source_version:reviewed.version,media_version:currentMedia.version,expected_version:c.version,keep_media_until_pause:true},{'Idempotency-Key':'synthetic-ordinary-audio:'+mediaId});
+ assert.equal(linked.r.ok,true,JSON.stringify(linked.j));c=linked.j.conversation;return{c,turn:c.turns.find(turn=>turn.role==='elder'),mediaId,event,sourceVersion:reviewed.version};
+}
 test('completed same-owner second text saves encrypted sources and review state without a model; replay is unique',async()=>{
  const h=await harness(),{c,media_id}=await completed(h),before=cloudCount(h),oldMedia=await h.api.vault.get('media:'+media_id),oldBinary=await h.api.vault.get('media-binary:'+media_id);const saved=await add(h,c);assert.equal(saved.r.status,201);const next=saved.j.conversation,turn=next.turns.filter(t=>t.role==='elder').at(-1);assert.equal(next.trial_control.state,'review_required');assert.equal(next.trial_control.media_id,null);assert.equal(next.trial_control.turn_id,turn.turn_id);assert.equal(next.trial_control.turn_version,1);assert.equal(turn.source_kind,'elder');assert.equal(turn.text,secondText);assert.equal(turn.media_id,null);assert.equal(cloudCount(h),before);assert.equal(next.report.status,'auto_unreviewed');assert.deepEqual(Array.from(next.report.source_versions,s=>s.quote),[firstText,secondText]);const replay=await add(h,c);assert.equal(replay.j.created,false);assert.equal((await h.get(c)).turns.filter(t=>t.role==='elder').length,2);assert.equal((await h.api.vault.list('event:')).length,2);assert.equal(JSON.stringify(await h.driver.listDocs()).includes(secondText),false);assert.deepEqual(await h.api.vault.get('media:'+media_id),oldMedia);assert.deepEqual(await h.api.vault.get('media-binary:'+media_id),oldBinary);
 });
@@ -34,6 +42,22 @@ test('different global owner blocks text save and correction without replacing s
 test('local correction never unlocks stopped or continuing and wrong owner cannot manually continue',async()=>{
  for(const state of ['stopped','continuing']){const h=await harness(),{c}=await completed(h),control={...c.trial_control,state},changed={...c,trial_control:control};await h.api.vault.mutate({puts:[{key:'conversation:'+c.conversation_id,value:changed},{key:'trial-control:voice',value:control}]});const t=changed.turns.find(t=>t.role==='elder'),r=await edit(h,changed,t,'咳嗽三天，晚上明显。');assert.equal(r.r.status,409,'ASR-derived dialogue text remains locked for correction');assert.equal((await h.api.trialVoiceState()).state,state);assert.equal((await add(h,changed)).r.status,409);assert.equal(cloudCount(h),1);}
  const h=await harness(),{c}=await completed(h);const saved=await add(h,c);assert.equal(saved.r.status,201);await h.api.vault.put('trial-control:voice',{...saved.j.conversation.trial_control,conversation_id:'synthetic-other-conversation'});assert.equal((await h.request('/api/conversations/'+c.conversation_id+'/trial-continue',continueBody(saved.j.conversation))).r.status,409);assert.equal((await h.get(c)).trial_control.state,'review_required');assert.equal(cloudCount(h),1);
+});
+test('ordinary conversation can edit an audio transcript in chat and keeps the original source revision',async()=>{
+ const h=await harness(),{c,turn,mediaId,event,sourceVersion}=await ordinaryReviewedAudioTurn(h),editedText='不是两天，是三天，晚上明显。';
+ assert.equal(c.trial_control,undefined);assert.equal(c.saved_audio_trial,undefined);
+ const result=await edit(h,c,turn,editedText);assert.equal(result.r.status,200,JSON.stringify(result.j));
+ const edited=result.j.conversation.turns.find(item=>item.turn_id===turn.turn_id),savedEvent=(await h.request('/api/events/'+event.record_id)).j.event;
+ assert.equal(edited.text,editedText);assert.equal(edited.version,2);assert.equal(edited.audio_source_reviewed,false);assert.equal(edited.audio_source_status,'user_edited');
+ assert.equal(savedEvent.raw_text,editedText);assert.equal(savedEvent.version,sourceVersion+1);assert.equal(savedEvent.source_review,null);
+ assert.ok(edited.versions.some(version=>version.version===1&&version.text===firstText));assert.ok(await h.api.vault.get('media-binary:'+mediaId));
+});
+test('saved-audio trial ASR cannot be edited through the ordinary chat-turn route',async()=>{
+ const h=await harness(),{c,turn,event}=await ordinaryReviewedAudioTurn(h),savedAudio={...c,saved_audio_trial:{state:'completed',record_id:event.record_id,media_id:turn.media_id,source_version:turn.audio_source_version}};
+ await h.api.vault.put('conversation:'+c.conversation_id,savedAudio);
+ const before=await h.api.vault.get('event:'+event.record_id),result=await edit(h,savedAudio,turn,'不应进入单次录音试验的修改。');
+ assert.equal(result.r.status,409);assert.equal(result.j.error,'audio_source_review_required');
+ assert.deepEqual(await h.api.vault.get('event:'+event.record_id),before);assert.equal((await h.get(c)).turns.find(item=>item.turn_id===turn.turn_id).text,firstText);
 });
 test('text stop point uses source-neutral UI and local save label instead of claiming a new audio',()=>{
  const elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{value:'三天。',disabled:false,textContent:''});return elements.get(id)},context=vm.createContext({activeConversation:{trial_control:{state:'completed',source_kind:'elder',media_id:null}},pendingAudioReview:null,$:el});const source=fs.readFileSync(require.resolve('../frontend/app.js'),'utf8');vm.runInContext(source.slice(source.indexOf('function setVoiceComposerEnabled('),source.indexOf('async function continueTrialVoice(')),context);vm.runInContext('setVoiceComposerEnabled(true)',context);assert.equal(el('voiceTextSend').textContent,'保存原话');assert.equal(el('voiceTextInput').disabled,false);const message=vm.runInContext('trialVoiceMessage({state:"review_required",source_kind:"elder",media_id:null})',context);assert.match(message,/原话.*保存在本机/);assert.doesNotMatch(message,/语音已转|原话和录音/);

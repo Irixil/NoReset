@@ -86,6 +86,9 @@ def _media_error_code(error):
  }
  return code if code in known else 'media_request_failed'
 
+def _conversation_error_status(code):
+ return {'quote_context_invalid':400,'quote_context_stale':409,'subject_mismatch':403}.get(code,422)
+
 def _positive_env(name):
  value=os.getenv(name)
  return int(value) if value and value.isdigit() and int(value)>0 else None
@@ -185,6 +188,7 @@ def local_first_model_evidence(body):
 
 class Handler(BaseHTTPRequestHandler):
  product_execution_enabled=False
+ ordinary_runtime_enabled=False
  def _provider_execution_scope(self):
   return product_execution_scope() if self.product_execution_enabled else nullcontext()
  def _asr_trial_config(self):
@@ -328,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
   if app_access.local_first_enabled() and p=='/':return self.send_json(200,{'ok':True,'service':'bingli-beta-api','kind':'api','frontend_hosted':False})
   if p=='/api/app/config':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
-   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive','reviewed_risk_rules':reviewed_risk_manifest(),'asr_trial':self._asr_trial_config(),'text_trial':text_trial.available_grant(),'text_trial_required':text_trial.is_installed(),**local_first_capabilities(product_execution_enabled=self.product_execution_enabled)})
+   return self.send_json(200,{'ok':True,'mode':'local_first','access_configured':app_access.session_configured(),'cloud_backup_configured':cloud_backup.configured(),'product_name':'NoReset·内测版','data_location':'this_device','backup_mode':'encrypted_archive','reviewed_risk_rules':reviewed_risk_manifest(),'asr_trial':self._asr_trial_config(),'text_trial':None if self.ordinary_runtime_enabled else text_trial.available_grant(),'text_trial_required':False if self.ordinary_runtime_enabled else text_trial.is_installed(),**local_first_capabilities(product_execution_enabled=self.product_execution_enabled)})
   if p=='/api/app/saved-audio-trial':
    if not app_access.local_first_enabled():return self.send_json(404,{'ok':False,'error':'not_found'})
    _,rejection=self._require_ai_access(limit=False)
@@ -506,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
       if text_grant_id is not None:
        if grant_id is not None:raise trial_gate.TrialGateError()
        r=text_trial.run_turn(text_grant_id,b,conversation_turn)
+      elif self.ordinary_runtime_enabled and grant_id is None:
+       r=conversation_turn(b)
       elif text_trial.is_installed() and grant_id is None:
        raise trial_gate.TrialGateError()
       else:
@@ -513,7 +519,8 @@ class Handler(BaseHTTPRequestHandler):
     except trial_gate.TrialGateError as ex:
      return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'raw_text_preserved_on_device':True})
     except ConversationError as ex:
-     return self.send_json(422,{'ok':False,'ai_failed':True,'error':ex.code,'trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**trial_failure_control(ex)})
+     status=_conversation_error_status(ex.code)
+     return self.send_json(status,{'ok':False,'ai_failed':True,'error':ex.code,'trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**trial_failure_control(ex)})
     except Exception as ex:
      return self.send_json(422,{'ok':False,'ai_failed':True,'error':'ai_conversation_failed','trace_id':'ctr_'+secrets.token_hex(16),'input_sha256':conversation_payload_sha256(b),'raw_text_preserved_on_device':True,**configured_model_metadata(),**model_failure_details(ex),**trial_failure_control(ex)})
     if r.get('stop_reason')=='model_output_blocked':
@@ -683,5 +690,9 @@ class Handler(BaseHTTPRequestHandler):
 class ProductHandler(Handler):
  product_execution_enabled=True
 
-def serve(host=None,port=None): ThreadingHTTPServer((host or os.getenv('API_HOST','127.0.0.1'),int(os.getenv('API_PORT',os.getenv('PORT',port or 18768)))),ProductHandler).serve_forever()
+class OrdinaryHandler(Handler):
+ product_execution_enabled=True
+ ordinary_runtime_enabled=True
+
+def serve(host=None,port=None): ThreadingHTTPServer((host or os.getenv('API_HOST','127.0.0.1'),int(os.getenv('API_PORT',os.getenv('PORT',port or 18768)))),OrdinaryHandler).serve_forever()
 if __name__=='__main__':serve()

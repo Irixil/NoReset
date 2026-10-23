@@ -39,7 +39,7 @@ function appHarness(savedState){
   const oldAsrTrial={state:'review_required',source_kind:'audio_transcript',media_id:'media_old_asr_control'};
   const apiCalls=[],statusMessages=[],composerStates=[];let globalTrialReads=0;
   const elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{value:'',disabled:false,classList:{add(){},remove(){},toggle(){}}});return elements.get(id)};
-  const context=vm.createContext({activeConversation:null,conversationLoading:false,conversationEditingTurnId:null,pendingAudioReview:null,pendingAudioReviewCandidates:[],
+  const context=vm.createContext({activeConversation:null,conversationLoading:false,conversationLoadSequence:0,conversationEditingTurnId:null,pendingAudioReview:null,pendingAudioReviewCandidates:[],
     saveBusy:false,HealthLocal:{trialVoiceState:async()=>{globalTrialReads++;return oldAsrTrial}},HealthSafety:safety,localMode:false,
     healthSubjectUiEpoch:0,activeHealthSubjectId:'subject_self',healthSubjectsVersion:1,healthSubjectSwitchBusy:false,healthSubjectChanged:false,
     document:{querySelector:()=>null},$:el,api:async path=>{apiCalls.push(path);return{r:{ok:true},j:{conversation}}},localDateValue:()=> '2026-10-13',
@@ -48,7 +48,8 @@ function appHarness(savedState){
     conversationHasPendingReply:()=>true,findPendingAudioReviewCandidates:async()=>({ok:true,candidates:[]}),startConversation(){throw Error('unexpected auto start')}});
   const trialStart=appSource.indexOf('function trialVoiceMessage('),trialEnd=appSource.indexOf('function voiceTurnHtml(',trialStart);
   const loadStart=appSource.indexOf('async function loadConversation('),loadEnd=appSource.indexOf('async function pauseConversation(',loadStart);
-  vm.runInContext(appSource.slice(trialStart,trialEnd)+appSource.slice(loadStart,loadEnd),context);
+  const audioStart=appSource.indexOf('function audioDurationLabel('),audioEnd=appSource.indexOf('function naturalCorrectionTargets(',audioStart);
+  vm.runInContext(appSource.slice(trialStart,trialEnd)+appSource.slice(loadStart,loadEnd)+appSource.slice(audioStart,audioEnd),context);
   return{context,apiCalls,statusMessages,composerStates,globalReads:()=>globalTrialReads,run:()=>vm.runInContext('loadConversation()',context)};
 }
 
@@ -65,3 +66,31 @@ for(const [state,message] of [
     assert.equal(h.composerStates.at(-1),false);
   });
 }
+
+function startHarness(conversation){
+  const statuses=[],calls=[],elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{classList:{add(){},remove(){},toggle(){}}});return elements.get(id)};
+  const context=vm.createContext({activeConversation:null,pendingAudioRecoveryRequestId:0,pendingAudioReview:null,pendingAudioReviewCandidates:[],$:el,
+    api:async(path,options)=>{calls.push({path,options});return{r:{ok:true},j:{conversation}}},
+    localDateValue:()=> '2026-10-19',syncConversation:value=>{context.activeConversation=value},
+    findPendingAudioReviewCandidates:async()=>({ok:true,candidates:[]}),renderVoiceConversation(){},
+    setVoiceStatus:(message,tone)=>statuses.push({message,tone})});
+  const statusStart=appSource.indexOf('function savedAudioTrialMessage('),statusEnd=appSource.indexOf('async function continueTrialVoice(',statusStart);
+  const start=appSource.indexOf('async function startConversation('),end=appSource.indexOf('async function startSeparateConversation(',start);
+  vm.runInContext(appSource.slice(statusStart,statusEnd)+appSource.slice(start,end),context);
+  return{context,statuses,calls,run:()=>context.startConversation('continue')};
+}
+
+test('continuing a conversation with a completed saved-audio trial shows the ended status',async()=>{
+  const h=startHarness({conversation_id:'conversation_saved_audio_done',saved_audio_trial:{state:'completed'},turns:[]});
+  assert.equal(await h.run(),true);
+  assert.match(h.statuses.at(-1).message,/本次单次测试已结束/);
+  assert.doesNotMatch(h.statuses.at(-1).message,/您慢慢说/);
+  assert.equal(h.calls.length,1);
+});
+
+test('manual-correction pending status keeps priority over saved-audio trial status',async()=>{
+  const h=startHarness({conversation_id:'conversation_saved_audio_corrected',saved_audio_trial:{state:'completed'},manual_correction_analysis_pending:true,turns:[]});
+  assert.equal(await h.run(),true);
+  assert.match(h.statuses.at(-1).message,/原话已更正；报告待重新整理/);
+  assert.doesNotMatch(h.statuses.at(-1).message,/单次测试已结束/);
+});

@@ -47,14 +47,15 @@ function harness() {
     healthSubjects: registry('subject_self').subjects, healthMemoryVersion: 4, healthMemoryEntries: [],
     healthMemoryEditingId: null, healthMemoryBusy: false, healthSubjectUiEpoch: 0, healthSubjectsRequestId: 0, healthSubjectsLoadPromise: null, healthSubjectSwitchBusy: false,
     healthSubjectLoaded: true, healthSubjectChanged: false,
-    activeConversation: null, currentConversationDetail: null, pendingLegacyReorganizationReview: null,
+    activeConversation: null, currentConversationDetail: null, pendingLegacyReorganizationReview: null, pendingRecordDelete: null,
     events: [], conversations: [], current: null, detailRequestSerial: 0,
     contextDraftSelection: new Set(), healthContextEntries: [], contextPickerRequestId: 0,
     contextPickerLoading: false, contextPickerLoadError: false, contextSelectionSaving: false,
     contextReturnFocus: null, contextInertTargets: [], reportReturnFocus: null, reportInertTargets: [],
     conversationLoading: false, conversationEditingTurnId: null, pendingConversationTurn: null,
     pendingMediaRetry: null, pendingAudioReview: null, pendingAudioReviewCandidates: [], pendingAudioRecoveryRequestId: 0,
-    lastSpokenTurnId: null, handoffSelection: new Set(), knownHandoffEvents: new Set(),
+    lastSpokenTurnId: null, voiceCaptureIntent: null, handoffSelection: new Set(), knownHandoffEvents: new Set(), visibleHandoffRecordIds: new Set(), handoffPreviewGeneration: 0,
+    recordDataGeneration: 0,
     saveBusy: false, voicePermissionPending: false, voiceUploadPending: false, voicePermissionGeneration: 0, mediaRecorder: null,
     mediaItems: [], selectedPhoto: null, pendingRecordingBlob: null, uploadBusy: false, recognitionBusy: new Set(),
     isMockContent(value) { return value?.is_mock === true; }, mockText() { return false; },
@@ -113,6 +114,22 @@ function harness() {
       assert.ok(legacyStart>=0&&legacyEnd>legacyStart,'Legacy-output review helpers must exist');
       vm.runInContext(source.slice(legacyStart,legacyEnd)+'\n'+source.slice(reportStart, reportEnd) + '\n' + source.slice(detailStart, detailEnd)
         + '\n' + source.slice(handoffStart, handoffEnd), context);
+      this.loadHandoffSelectionUi();
+    },
+    loadHandoffSelectionUi() {
+      const archiveStart=source.indexOf('function liveArchiveTurns('),archiveEnd=source.indexOf('function conversationDateLabel(',archiveStart);
+      const linkedStart=source.indexOf('function conversationLinkedRecordIds('),linkedEnd=source.indexOf('function recentRecordItems(',linkedStart);
+      const listStart=source.indexOf('function latestFirst('),listEnd=source.indexOf('function renderFilterStatus(',listStart);
+      const filtersStart=source.indexOf('function applyRecordFilters('),filtersEnd=source.indexOf('async function loadEvents(',filtersStart);
+      assert.ok(archiveStart>=0&&archiveEnd>archiveStart&&linkedStart>=0&&linkedEnd>linkedStart&&listStart>=0&&listEnd>listStart&&filtersStart>=0&&filtersEnd>filtersStart,
+        'Actual filtered record and selection functions must exist');
+      vm.runInContext(source.slice(archiveStart,archiveEnd)+'\n'+source.slice(linkedStart,linkedEnd)+'\n'+source.slice(listStart,listEnd)
+        +'\n'+source.slice(filtersStart,filtersEnd)+'\nrenderList = () => { visibleHandoffRecordIds = filteredHandoffRecordIds(); }; renderHome = () => {}; renderArchive = () => {};',context);
+    },
+    loadEventsUi() {
+      const start=source.indexOf('function showEventsLoadFailure('),end=source.indexOf('function setVoiceStatus(',start);
+      assert.ok(start>=0&&end>start,'Actual event and conversation list read functions must exist');
+      vm.runInContext(source.slice(start,end)+'\nsetModeLabel = () => {}; ensureHealthSubjectReady = async () => true;',context);
     },
     setApi(handler) { apiHandler = handler; } };
 }
@@ -190,8 +207,12 @@ test('conversation and handoff report DOM resolve each owner by its own ID after
     sections: [{ key: 'background_actions', title: '相关背景与已做处理', lines: [{ kind: 'context', text: '去年冬天膝盖疼，休息后缓解。', tags: ['历史背景'], source_label: '家属确认 · 家属转述 · 发生日期 2025-12-10' }] }] };
   h.setState({ healthSubjects: [...registry('subject_self').subjects.filter(subject => subject.subject_id !== momId), { subject_id: momId, label: '妈妈', relationship: 'family' }],
     healthSubjectLoaded: true, healthSubjectChanged: false, activeHealthSubjectId: momId,
-    activeConversation: { conversation_id: 'conversation_mom', subject_id: momId, report } });
+    activeConversation: { conversation_id: 'conversation_mom', subject_id: momId, report },
+    conversations:[{conversation_id:'conversation_mom',subject_id:momId,status:'paused',local_date:'2026-10-14',turns:[{turn_id:'turn_mom',record_id:'record_mom',role:'elder',text:'我以前膝盖疼过吗？'}]},
+      {conversation_id:'conversation_self',subject_id:'subject_self',status:'paused',local_date:'2026-10-14',turns:[{turn_id:'turn_self',record_id:'record_self',role:'elder',text:'本人合成问题'}]}],
+    handoffSelection:['record_mom','record_self'] });
   h.loadReportUi();
+  h.run('renderList()');
   h.run('renderConversationReport()');
   assert.match(h.element('conversationReportBody').innerHTML, /就诊对象：<\/strong>妈妈/);
   assert.match(h.element('conversationReportBody').innerHTML, /家属确认 · 家属转述 · 发生日期 2025-12-10/);
@@ -234,8 +255,10 @@ test('standalone and attachment-only handoffs show the top-level owner; archived
     { subject_id: momId, label: '妈妈', relationship: 'family' }], healthSubjectLoaded: true,
     healthSubjectChanged: false, activeHealthSubjectId: 'subject_self', activeConversation: {
       subject_id: momId, status: 'paused', turns: [{ role: 'elder', text: '合成原话' }], report: null,
-    } });
+    },events:[{record_id:'record_family_standalone',state:'inbox',recorded_at:'2026-10-14T00:00:00Z',raw_text:'单独保存的合成记录'}],
+    handoffSelection:['record_family_standalone'] });
   h.loadReportUi();
+  h.run('renderList()');
   h.run('renderConversationDetail(activeConversation)');
   assert.match(h.element('detail').innerHTML, /就诊对象：<\/strong>妈妈/);
   assert.match(h.element('detail').innerHTML, /妈妈的合成记录/);
@@ -259,6 +282,116 @@ test('standalone and attachment-only handoffs show the top-level owner; archived
   await h.run('handoff()');
   assert.match(h.element('handoff').innerHTML, /就诊对象：<\/strong>妈妈/);
   assert.match(h.element('handoff').innerHTML, /媒体原件与待处理状态/);
+});
+
+test('handoff only submits checked source IDs from visible filtered records and preserves complete conversations', async () => {
+  const h=harness();h.loadReportUi();
+  h.setState({conversations:[
+    {conversation_id:'conversation_visible',status:'paused',local_date:'2026-10-19',last_local_date:'2026-10-19',turns:[
+      {turn_id:'turn_visible_1',record_id:'record_visible_1',role:'elder',text:'咳嗽三天，虚构记录'},
+      {turn_id:'turn_visible_2',record_id:'record_visible_2',role:'elder',text:'今天仍然不舒服'},
+      {turn_id:'turn_superseded',record_id:'record_superseded',role:'elder',text:'咳嗽三天旧版本',superseded:true},
+      {turn_id:'turn_mock',record_id:'record_mock',role:'elder',text:'咳嗽三天模拟文字',is_mock:true},
+      {turn_id:'turn_assistant',record_id:'record_assistant',role:'assistant',text:'请描述一下'}]},
+    {conversation_id:'conversation_hidden',status:'paused',local_date:'2026-10-19',last_local_date:'2026-10-19',turns:[
+      {turn_id:'turn_hidden',record_id:'record_hidden',role:'elder',text:'头痛，虚构记录'}]},
+    {conversation_id:'conversation_outside_date',status:'paused',local_date:'2026-10-21',last_local_date:'2026-10-21',turns:[
+      {turn_id:'turn_outside',record_id:'record_outside',role:'elder',text:'咳嗽三天，虚构记录'}]},
+  ],events:[
+    {record_id:'record_standalone',state:'inbox',recorded_at:'2026-10-19T08:00:00Z',raw_text:'咳嗽三天，单独虚构记录'},
+    {record_id:'record_mock_standalone',state:'inbox',recorded_at:'2026-10-19T08:00:00Z',raw_text:'咳嗽三天模拟文字',is_mock:true},
+    {record_id:'record_visible_1',state:'inbox',recorded_at:'2026-10-19T08:00:00Z',raw_text:'linked event is not standalone'},
+  ]});
+  h.run('handoffSelection = new Set(["record_visible_1","record_visible_2","record_hidden","record_outside","record_standalone","record_mock_standalone"])');
+  h.element('filterKeyword').value='咳嗽三天';h.element('filterStart').value='2026-10-18';h.element('filterEnd').value='2026-10-20';
+  h.run('renderList()');
+  const visible=h.run('[...filteredHandoffRecordIds()].sort()');
+  assert.deepEqual(plain(visible),['record_standalone','record_visible_1','record_visible_2']);
+  h.element('handoff').innerHTML='previous preview';h.element('handoff').classList.remove('hidden');
+  h.setApi((path,options)=>{assert.equal(path,'/api/handoffs');assert.equal(options.method,'POST');return response({error:'offline'},503)});
+  await h.run('handoff()');
+  const request=h.calls.find(call=>call.path==='/api/handoffs');
+  assert.deepEqual(request.body.record_ids,['record_visible_1','record_visible_2','record_standalone']);
+
+  h.element('handoff').innerHTML='previous preview';h.element('handoff').classList.remove('hidden');
+  h.run('setHandoffSelection(["record_visible_2"], false)');
+  assert.deepEqual(plain([...h.run('handoffSelection')]),['record_visible_1','record_hidden','record_outside','record_standalone','record_mock_standalone']);
+  assert.equal(h.element('handoff').classList.contains('hidden'),true);
+  assert.equal(h.element('handoff').innerHTML,'');
+  await h.run('handoff()');
+  assert.deepEqual(h.calls.findLast(call=>call.path==='/api/handoffs').body.record_ids,['record_visible_1','record_standalone']);
+
+  h.element('handoff').innerHTML='previous preview';h.element('handoff').classList.remove('hidden');
+  h.run('applyRecordFilters({preventDefault(){}})');
+  assert.equal(h.element('handoff').classList.contains('hidden'),true);
+  assert.equal(h.element('handoff').innerHTML,'');
+  h.element('filterKeyword').value='无匹配';
+  h.run('applyRecordFilters({preventDefault(){}})');
+  const before=h.calls.filter(call=>call.path==='/api/handoffs').length;
+  await h.run('handoff()');
+  assert.equal(h.calls.filter(call=>call.path==='/api/handoffs').length,before,'empty search does not request a handoff');
+  assert.match(h.effects.filter(effect=>effect.startsWith('toast:')).at(-1),/没有已勾选的有效记录/);
+
+  const selectionBefore=plain(Array.from(h.run('handoffSelection'))).sort();
+  h.element('recordFilters').reset=()=>{for(const id of ['filterKeyword','filterKind','filterState','filterStart','filterEnd'])h.element(id).value=''};
+  h.run('clearRecordFilters()');
+  assert.deepEqual(plain(Array.from(h.run('handoffSelection'))).sort(),selectionBefore,'clearing filters keeps user selection');
+});
+
+test('actual loadEvents requires valid event and conversation reads, clears stale views on failure, and succeeds with both lists', async () => {
+  for(const failure of ['conversation_http','conversation_throw','invalid_shape']){
+    const h=harness();h.loadReportUi();h.loadEventsUi();
+    h.setState({events:[{record_id:'stale_event'}],conversations:[{conversation_id:'stale_conversation'}],demoMode:false});
+    h.run('handoffSelection = new Set(["stale_event"]); visibleHandoffRecordIds = new Set(["stale_event"])');
+    h.element('handoff').innerHTML='old preview';h.element('handoff').classList.remove('hidden');
+    h.setApi(async path=>{
+      if(path==='/api/events')return response({events:[{record_id:'fresh_event'}]});
+      if(path==='/api/conversations'){
+        if(failure==='conversation_throw')throw new Error('temporarily unavailable');
+        if(failure==='conversation_http')return response({error:'temporarily_unavailable'},503);
+        return response({conversations:'invalid'});
+      }
+      throw new Error('unexpected request '+path);
+    });
+    assert.equal(await h.run('loadEvents()'),false,failure);
+    assert.deepEqual(plain(h.run('events')),[],failure);
+    assert.deepEqual(plain(h.run('conversations')),[],failure);
+    assert.deepEqual(plain(Array.from(h.run('visibleHandoffRecordIds'))),[],failure);
+    assert.equal(h.element('handoff').classList.contains('hidden'),true,failure);
+    assert.equal(h.element('handoff').innerHTML,'',failure);
+    for(const id of ['homeRecent','eventsList','archiveEvents'])assert.match(h.element(id).innerHTML,/记录暂时无法读取/,`${failure}/${id}`);
+    await h.run('handoff()');
+    assert.equal(h.calls.filter(call=>call.path==='/api/handoffs').length,0,`${failure}: stale handoff prevented`);
+    assert.match(h.effects.filter(effect=>effect.startsWith('toast:')).at(-1),/没有已勾选的有效记录/,failure);
+  }
+  const h=harness();h.loadHandoffSelectionUi();h.loadEventsUi();
+  h.run('renderList = () => { $("eventsList").textContent="fresh records"; }; renderHome = () => { $("homeRecent").textContent="fresh home"; }; renderArchive = () => { $("archiveEvents").textContent="fresh archive"; }');
+  h.setApi(path=>path==='/api/events'?response({events:[{record_id:'fresh_event'}]}):response({conversations:[{conversation_id:'fresh_conversation'}]}));
+  const loaded=await h.run('loadEvents()');assert.equal(loaded,true,JSON.stringify({calls:h.calls,events:plain(h.run('events')),conversations:plain(h.run('conversations')),toast:h.effects}));
+  assert.equal(h.run('events[0].record_id'),'fresh_event');
+  assert.equal(h.run('conversations[0].conversation_id'),'fresh_conversation');
+  assert.equal(h.element('eventsList').textContent,'fresh records');
+  assert.equal(h.element('homeRecent').textContent,'fresh home');
+  assert.equal(h.element('archiveEvents').textContent,'fresh archive');
+});
+
+test('a delayed handoff response cannot restore a preview after selection or filters invalidate it', async () => {
+  for(const change of ['selection','filter']){
+    const h=harness();h.loadReportUi();
+    h.setState({events:[{record_id:'record_visible',state:'inbox',recorded_at:'2026-10-19T08:00:00Z',raw_text:'合成交接原话'}]});
+    h.run('handoffSelection = new Set(["record_visible"])');h.run('renderList()');
+    let resolveRequest;h.setApi(()=>new Promise(resolve=>{resolveRequest=resolve}));
+    const pending=h.run('handoff()');assert.equal(typeof resolveRequest,'function');
+    if(change==='selection')h.run('setHandoffSelection(["record_visible"],false)');
+    else{h.element('filterKeyword').value='没有匹配';h.run('applyRecordFilters({preventDefault(){}})')}
+    assert.equal(h.element('handoff').classList.contains('hidden'),true,change);
+    assert.equal(h.element('handoff').innerHTML,'',change);
+    resolveRequest(response({handoff:{subject_id:'subject_self',created_at:'2026-10-19T09:00:00Z',unresolved_count:0,
+      conversation_reports:[],items:[],pending_documents:[],pending_audio:[],media_attachments:[]}}));
+    assert.equal(await pending,false,change);
+    assert.equal(h.element('handoff').classList.contains('hidden'),true,change);
+    assert.equal(h.element('handoff').innerHTML,'',change);
+  }
 });
 
 test('new form retains uncertain/unconfirmed defaults and only explicit confirmed clear-time entries can be remembered', () => {
@@ -307,6 +440,35 @@ test('uncertain saved input sends current collection version and never silently 
   assert.equal(h.run('healthMemoryVersion'), 5);
   assert.equal(h.element('healthMemoryText').value, '');
   assert.equal(h.element('healthMemoryConfirmed').checked, false);
+});
+
+test('successful health-memory writes are not reported as failed when readback returns false or throws', async () => {
+  for(const operation of ['save','remember','delete'])for(const readMode of ['false','throw']){
+    const h=harness(),original=entry();
+    h.setState({healthMemoryEntries:[original],healthMemoryVersion:4});
+    if(operation==='save')h.element('healthMemoryText').value='虚构甲：补充的一项健康背景';
+    h.setApi((path,options,call)=>{
+      if(path==='/api/health-subjects')return response(registry('subject_self'));
+      if(path==='/api/health-memory'&&call.method==='GET'){
+        if(readMode==='throw')throw new Error('read unavailable');
+        return response({error:'temporarily_unavailable'},503);
+      }
+      if(path==='/api/health-memory')return response(memory([entry(call.body.entry)],5),201);
+      assert.equal(path,'/api/health-memory/context_fictional_1');
+      return response(memory([],5));
+    });
+    if(operation==='delete')h.run('editHealthMemoryEntry("context_fictional_1")');
+    const result=operation==='save'?await h.run('saveHealthMemory()'):
+      await h.run('mutateHealthMemoryEntry("context_fictional_1", '+JSON.stringify(operation)+')');
+    assert.equal(result,true,`${operation}/${readMode}: write succeeded`);
+    assert.equal(h.calls.filter(call=>['POST','PATCH','DELETE'].includes(call.method)).length,1,`${operation}/${readMode}: no write retry`);
+    assert.equal(h.run('healthMemoryEntries.length'),0,`${operation}/${readMode}: stale entries cleared`);
+    assert.equal(h.run('healthMemoryVersion'),0,`${operation}/${readMode}: stale version cleared`);
+    assert.match(h.element('healthMemoryList').innerHTML,/暂时无法读取/,`${operation}/${readMode}`);
+    assert.match(h.element('healthMemoryStatus').textContent,/已保存.*重新打开设置读取/,`${operation}/${readMode}`);
+    assert.doesNotMatch(h.element('healthMemoryStatus').textContent,/保存没有完成|操作没有完成|可以重试/,`${operation}/${readMode}`);
+    assert.ok(h.effects.includes('closeReport'),`${operation}/${readMode}: conversation summary invalidated`);
+  }
 });
 
 test('entry correction preserves identity and sends current CAS version with source, temporal state and explicit confirmation', async () => {
@@ -610,4 +772,56 @@ test('legacy background saving also binds the displayed owner and keeps raw inpu
   assert.equal(h.run('activeHealthSubjectId'),'subject_self');
   assert.equal(h.run('healthSubjectChanged'),true);
   assert.match(h.element('healthContextStatus').textContent,/没有保存.*保留/);
+});
+
+function loadActualPause(h) {
+  const start = source.indexOf('async function pauseConversation(');
+  const end = source.indexOf('async function submitConversationText(', start);
+  assert.ok(start >= 0 && end > start, 'extract the actual pause-save function');
+  h.run(source.slice(start, end));
+  h.setState({ activeConversation: { conversation_id: 'conversation_synthetic_pause', turns: [
+    { turn_id: 'elder_synthetic', role: 'elder', text: '完全虚构：保存失败反馈测试原话' },
+  ] } });
+}
+
+test('pause HTTP failure gives visible feedback without retrying or replacing the original turn', async () => {
+  const h = harness(); loadActualPause(h);
+  h.setApi((path, options) => {
+    assert.equal(path, '/api/conversations/conversation_synthetic_pause/pause');
+    assert.equal(options.method, 'POST');
+    return response({ error: 'synthetic_save_failed' }, 503);
+  });
+
+  await h.run('pauseConversation()');
+
+  assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+  assert.match(h.effects.join('\n'), /退出时未能确认保存结果，请重新打开对话核对/);
+  assert.equal(h.run('activeConversation.turns[0].text'), '完全虚构：保存失败反馈测试原话');
+});
+
+test('pause request exception gives visible feedback without retrying or replacing the original turn', async () => {
+  const h = harness(); loadActualPause(h);
+  h.setApi(() => { throw new Error('synthetic_transport_failure'); });
+
+  await h.run('pauseConversation()');
+
+  assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+  assert.match(h.effects.join('\n'), /退出时未能确认保存结果，请重新打开对话核对/);
+  assert.equal(h.run('activeConversation.turns[0].text'), '完全虚构：保存失败反馈测试原话');
+});
+
+test('successful pause updates the conversation and does not show failure feedback', async () => {
+  const h = harness(); loadActualPause(h);
+  h.setApi((path, options) => {
+    assert.equal(path, '/api/conversations/conversation_synthetic_pause/pause');
+    assert.equal(options.method, 'POST');
+    return response({ conversation: { conversation_id: 'conversation_synthetic_pause', status: 'paused', turns: [
+      { turn_id: 'elder_synthetic', role: 'elder', text: '完全虚构：保存失败反馈测试原话' },
+    ] } });
+  });
+
+  await h.run('pauseConversation()');
+
+  assert.equal(h.run('activeConversation.status'), 'paused');
+  assert.doesNotMatch(h.effects.join('\n'), /退出时未能确认保存结果/);
 });

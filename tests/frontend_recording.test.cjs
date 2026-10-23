@@ -256,6 +256,21 @@ test('a second microphone tap ends the current utterance instead of opening a sa
   assert.equal(h.element('finishVoiceBtn').disabled, true);
 });
 
+test('a recording started in a paused conversation captures its exact scope and pause invalidates it', async () => {
+  const h = harness();
+  h.run("activeConversation={conversation_id:'conversation_paused_fixture',version:7,status:'paused',subject_id:'subject_self'}");
+  const starting = h.click('recordBtn'); h.allow(); await starting;
+  const intent = h.run('voiceCaptureIntent');
+  assert.deepEqual({conversationId:intent.conversationId,conversationVersion:intent.conversationVersion,conversationStatus:intent.conversationStatus},
+    {conversationId:'conversation_paused_fixture',conversationVersion:7,conversationStatus:'paused'});
+  assert.equal(intent.subjectId,'subject_self');
+  assert.equal(intent.subjectVersion,h.run('healthSubjectsVersion'));
+  assert.equal(intent.epoch,h.run('healthSubjectUiEpoch'));
+  assert.equal(intent.invalidated,false);
+  await h.run('pauseConversation()');
+  assert.equal(intent.invalidated,true,'leaving the conversation invalidates any ASR result still in flight');
+});
+
 test('recording safely falls back to a manual end when Web Audio silence detection is unavailable', async () => {
   const h = harness(); const start = h.click('recordBtn'); h.allow(); await start;
   h.advance(12000);
@@ -563,5 +578,17 @@ test('failed assistant reply offers one manual retry without repeating the saved
     h.run(`activeConversation={conversation_id:'saved_audio_${state}',version:3,selected_context_ids:[],report:null,saved_audio_trial:{state:'${state}'},turns:[{turn_id:'elder_saved',role:'elder',text:'虚构录音原话',version:1},{turn_id:'assistant_saved',role:'assistant',text:'',ai_failed:true,error_code:'model_timeout',version:1}]}; renderVoiceConversation()`);
     assert.match(h.element('voiceConversationTurns').innerHTML, /模型响应超时/);
     assert.doesNotMatch(h.element('voiceConversationTurns').innerHTML, /data-voice-retry/);
+  }
+});
+
+test('provider access and rate-limit failures keep a plain explanation and no exhausted-trial retry', () => {
+  const h = harness();
+  for (const [status, expected] of [[401, /拒绝访问/], [403, /拒绝访问/], [429, /请求较多或受到限制/]]) {
+    h.run(`activeConversation={conversation_id:'conversation_http_${status}',version:2,selected_context_ids:[],report:null,
+      saved_audio_trial:{state:'stopped'},turns:[{turn_id:'elder_http',role:'elder',text:'合成原话',version:1},
+      {turn_id:'assistant_http',role:'assistant',text:'',ai_failed:true,error_code:'model_http_error',provider_http_status:${status},version:1}]}; renderVoiceConversation()`);
+    assert.match(h.element('voiceConversationTurns').innerHTML, expected);
+    assert.doesNotMatch(h.element('voiceConversationTurns').innerHTML, /data-voice-retry/);
+    assert.doesNotMatch(h.element('voiceConversationTurns').innerHTML, /429|401|403|余额|额度已用尽/);
   }
 });

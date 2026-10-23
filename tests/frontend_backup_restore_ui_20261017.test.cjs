@@ -60,6 +60,20 @@ test('explicit preview then confirm restores once and refreshes local views',asy
   assert.match(h.$('backupStatus').textContent,/恢复完成/);
 });
 
+test('successful restore does not claim refreshed lists when memory reread returns false or throws',async()=>{
+  for(const mode of ['false','throw']){
+    const h=makeHarness();h.context.loadHealthMemory=async()=>{h.updates.push('memory');if(mode==='throw')throw new Error('read unavailable');return false;};
+    const input=h.$('restoreBackupInput'),form=h.$('restoreBackupForm');
+    input.files=[{name:'fictional-backup.bingli',size:1}];input.onchange({target:input});
+    h.$('restoreBackupPassphrase').value='fictional recovery phrase';await form.onsubmit({preventDefault(){}});
+    await h.$('restoreBackupConfirm').onclick();
+    assert.equal(h.calls.filter(call=>call[0]==='restore').length,1,mode);
+    assert.deepEqual(h.updates,['clear','memory','events'],mode);
+    assert.match(h.$('backupStatus').textContent,/已恢复.*重新打开设置读取/,mode);
+    assert.doesNotMatch(h.$('backupStatus').textContent,/记录已重新读取/,mode);
+  }
+});
+
 test('cancel and file change discard the prior password and preview',async()=>{
   const h=makeHarness(),input=h.$('restoreBackupInput'),form=h.$('restoreBackupForm'),pass=h.$('restoreBackupPassphrase');
   input.files=[{name:'first.bingli',size:1}];input.onchange({target:input});pass.value='fictional secret';

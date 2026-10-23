@@ -90,8 +90,12 @@ test('photo and uploaded audio start recognition immediately after the original 
   assert.match(media, /audioUploadInput[\s\S]*?uploadMedia\(f,'audio'\)[\s\S]*?recognizeMedia\(m\.media_id\)/);
 });
 
-test('conversation edits the visible elder turn and regenerates the grounded report', () => {
-  assert.match(app, /data-voice-turn-edit/);
+test('conversation edits and replays from the long-press message menu', () => {
+  assert.doesNotMatch(app, /data-voice-turn-edit|data-voice-replay/);
+  assert.match(app, /data-turn-menu-action="\$\{action\}"/);
+  assert.match(app, /if\(action==='edit'\)beginVoiceTurnEdit\(turn\.turn_id\)/);
+  assert.match(app, /if\(action==='replay'\)speakAssistant\(turn,true\)/);
+  assert.doesNotMatch(app, /我还想继续聊刚才的话题/);
   assert.match(app, /saveVoiceTurnEdit/);
   assert.doesNotMatch(app, /data-voice-summary-edit|saveVoiceSummaryCorrection/);
   assert.match(localStore, /parts\[3\] === 'turns'/);
@@ -112,21 +116,27 @@ test('conversation report is a keyboard-contained modal and mobile actions stay 
   assert.match(app, /setReportBackgroundInert\(true\)/);
   assert.match(app, /setAttribute\('inert'/);
   assert.match(app, /removeAttribute\('inert'/);
-  assert.match(styles, /\.chat-edit-link\s*\{[\s\S]*?min-height:\s*44px/);
+  assert.match(styles, /\.voice-turn-menu button\s*\{[^}]*min-height:\s*48px/);
   assert.match(styles, /\.chat-inline-actions button\s*\{[\s\S]*?min-height:\s*44px/);
   assert.match(styles, /\.report-transcript summary\s*\{[^}]*min-height:\s*(?:44|52)px/);
 });
 
-test('record search has an explicit action and mobile record text keeps the full row', () => {
+test('record search keeps explicit actions, current-owner scope and the single-column record layout', () => {
   assert.match(markup, /<form id="recordFilters"[\s\S]*?id="applyFilters"[\s\S]*?>搜索记录</);
   assert.match(markup, /id="filterResultsStatus"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(markup, /id="eventsList"[^>]*tabindex="-1"/);
   assert.match(app, /recordFilters'[)]\?\.addEventListener\('submit',applyRecordFilters\)/);
   assert.match(app, /scrollIntoView\?\.\(\{behavior:'smooth',block:'start'\}\)/);
   assert.match(app, /找到 \$\{count\} 份符合条件的记录/);
-  assert.match(styles, /\.handoff-choice\s*\{[^}]*width:\s*auto[^}]*flex:\s*none/);
-  assert.match(styles, /@media \(max-width: 620px\)[\s\S]*?\.event-item\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/);
-  assert.match(styles, /\.event-item \.event-main\s*\{[^}]*grid-column:\s*1 \/ -1/);
+  const conversationList = localStore.match(/async function listConversations\([\s\S]*?function subjectOf\(/)?.[0] || '';
+  assert.match(conversationList, /subjectOf\(item\) === currentContext\.subject_id/);
+  const eventReader = localStore.match(/async function readEvent\([\s\S]*?async function listEvents\(/)?.[0] || '';
+  assert.match(eventReader, /subjectOf\(event\) !== await activeSubjectId\(\)/);
+  assert.match(styles, /\.event-item\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(styles, /@media \(max-width: 620px\)[\s\S]*?\.event-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(styles, /\.event-item \.event-main\s*\{[^}]*grid-column:\s*1(?:;|\s)/);
+  assert.match(app, /id="conversationHandoffSelect"/);
+  assert.match(app, /id="eventHandoffSelect"/);
 });
 
 test('record view opens a real detail page instead of scrolling to a preview below the list', () => {
@@ -138,6 +148,20 @@ test('record view opens a real detail page instead of scrolling to a preview bel
   assert.match(app, /function closeDetail\(\)\{showView\('recordsView'\)\}/);
   const detailRenderer = app.match(/function renderDetail[\s\S]*?async function loadRelatedHistory/)?.[0] || '';
   assert.doesNotMatch(detailRenderer, /reveal\(d/);
+});
+
+test('record deletion uses an accessible native confirmation dialog with an explicit irreversible action', () => {
+  assert.match(markup, /<dialog id="recordDeleteDialog"[^>]*aria-labelledby="recordDeleteTitle"[^>]*aria-describedby="recordDeleteExplanation"/);
+  assert.match(markup, /id="recordDeleteTitle"[^>]*>确认删除这条记录？</);
+  assert.match(markup, /id="recordDeleteCancelBtn"[^>]*autofocus[^>]*>取消</);
+  assert.match(markup, /id="recordDeleteConfirmBtn"[^>]*>确认删除</);
+  assert.match(app, /dialog\.showModal\(\)/);
+  assert.match(app, /dialog\.addEventListener\('cancel'/);
+  assert.match(app, /event\.target===dialog\)cancelRecordDelete\(\)/);
+  assert.match(app, /expected_version:snapshot\.version/);
+  assert.match(app, /error==='stale_version'.*请取消后重新打开再删除/s);
+  assert.match(styles, /\.record-delete-dialog::backdrop/);
+  assert.match(styles, /\.record-delete-actions button\s*\{[^}]*min-height:\s*56px/);
 });
 
 test('conversation has automatic exit report, resume choice and bounded pause-to-send recording', () => {
@@ -202,31 +226,54 @@ test('reports use doctor handoff sections with sources and retain raw transcript
 });
 
 test('records group one conversation into one dated summary and keep both sides of the transcript', () => {
-  assert.match(markup, /id="conversationRecordTpl"[\s\S]*?>查看完整对话</);
+  assert.match(markup, /id="conversationRecordTpl"[\s\S]*class="conversation-record-title"[\s\S]*class="badges"/);
   assert.match(markup, /完整对话、单独记录、录音和照片按当前所选所属人分开显示/);
   assert.match(app, /api\('\/api\/conversations'\)/);
   assert.match(app, /function conversationLinkedRecordIds/);
   assert.match(app, /function standaloneEvents/);
-  assert.match(app, /showConversationDetail\(conversation\.conversation_id\)/);
+  assert.match(app, /showHistoricalConversation\(conversation\.conversation_id\)/);
+  assert.match(markup, /id="openConversationDetailBtn"[^>]*>记录详情/);
+  assert.match(app, /setAttribute\('role','link'\)/);
+  assert.match(app, /打开完整对话/);
+  assert.match(app, /event\.key==='Enter'\|\|event\.key===' '/);
   assert.match(app, /function conversationDetailHtml/);
+  assert.match(app, /class="archive-conversation-stream"/);
+  assert.match(app, /turns\.map\(conversationTranscriptTurnHtml\)/);
   assert.match(app, /speaker=assistant\?'\u5c0f\u96f6':'\u6211'/);
   assert.match(localStore, /transcript: reportableConversationTurns\(conversation\)\.filter\(turn => !mockSource\(turn\)\)\.map/);
-  assert.match(localStore, /transcript: liveConversationTurns\(item\)\.filter\(turn => !mockSource\(turn\) && \(turn\.source_kind !== 'audio_transcript' \|\| turn\.audio_source_reviewed === true\)/);
+  const reportableTurns = localStore.match(/function reportableConversationTurns\([\s\S]*?function explicitNaturalCorrection/)?.[0] || '';
+  assert.match(reportableTurns, /audio_source_invalidated !== true/);
+  assert.match(reportableTurns, /audio_source_status/);
+  const reportTranscript = localStore.match(/transcript: reportableConversationTurns\(conversation\)[\s\S]*?body: bodyParts/)?.[0] || '';
+  assert.match(reportTranscript, /source_status: turn\.audio_source_reviewed === true \? 'original_comparison' : turn\.audio_source_status/);
+  assert.match(reportTranscript, /source_verified_by_user: turn\.audio_source_reviewed === true/);
+  const currentAudioSources = localStore.match(/function audioConversationSourcesCurrent\([\s\S]*?function reconcileConversationAudioReview/)?.[0] || '';
+  assert.match(currentAudioSources, /audioConversationSourceCurrent\(/);
+  assert.match(currentAudioSources, /audioReviewCurrent\(/);
+  const handoffReports = localStore.match(/const conversationReports = \(await listConversations\(\)\)[\s\S]*?const pending =/)?.[0] || '';
+  assert.match(handoffReports, /sourcesCurrent: audioConversationSourcesCurrent/);
+  assert.match(handoffReports, /return sourcesCurrent/);
+  assert.match(handoffReports, /status: turn\.audio_source_reviewed === true \? 'original_comparison' : turn\.audio_source_status/);
+  assert.match(handoffReports, /verified_by_user: turn\.audio_source_reviewed === true/);
   assert.match(localStore, /pathname === '\/api\/conversations' && method === 'GET'/);
 });
 
-test('every record card exposes a bottom-right confirmed delete action', () => {
+test('record actions live in details and deletion remains confirmed, scoped and version-checked', () => {
   assert.doesNotMatch(app, /id="deleteConversationBtn"/);
-  assert.match(markup, /id="conversationRecordTpl"[\s\S]*?class="record-delete-btn"[\s\S]*?aria-label="删除这条完整对话"/);
-  assert.match(markup, /id="eventTpl"[\s\S]*?class="record-delete-btn"[\s\S]*?aria-label="删除这条记录"/);
+  assert.doesNotMatch(markup, /class="record-delete-btn"/);
+  assert.match(app, /id="deleteConversationDetailBtn"/);
+  assert.match(app, /id="deleteEventDetailBtn"/);
+  assert.match(app, /id="conversationHandoffSelect"/);
+  assert.match(app, /id="eventHandoffSelect"/);
   assert.match(app, /deleteConversation\(conversation,deleteButton\)/);
-  assert.match(app, /deleteRecord\(event,deleteButton\)/);
-  assert.match(app, /async function deleteConversation\(conversation,button=null\)/);
-  assert.match(app, /method:'DELETE'[\s\S]*?delete_scope_confirmed:true,expected_version:conversation\.version/);
-  assert.match(app, /确定删除这条完整对话吗/);
-  assert.match(styles, /\.record-actions\s*\{[^}]*align-self:\s*flex-end/);
-  assert.match(styles, /\.record-delete-btn\s*\{[^}]*width:\s*48px[^}]*height:\s*48px/);
-  assert.match(styles, /@media \(max-width: 620px\)[\s\S]*?\.event-item > \.record-actions\s*\{[^}]*grid-row:\s*3[^}]*justify-self:\s*end/);
+  assert.match(app, /routeRecordDeleteEntry\(e,deleteButton\)/);
+  assert.match(app, /function deleteConversation\(conversation,button=null\)/);
+  assert.match(app, /function deleteRecord\(e,button=null\)/);
+  assert.match(app, /const body=\{delete_scope_confirmed:true,expected_version:snapshot\.version\}/);
+  assert.match(app, /api\(path,\{method:'DELETE',body:JSON\.stringify\(body\)\}\)/);
+  assert.match(app, /function finishRecordDelete\([\s\S]*?showView\(snapshot\.kind==='media'\?'archiveView':'recordsView'\)/);
+  assert.match(app, /function finishRecordDelete\([\s\S]*?void loadMedia\(\)/);
+  assert.match(styles, /\.record-detail-actions label\s*\{[^}]*min-height:\s*48px/);
   const conversationRequest = localStore.match(/async function conversationRequest[\s\S]*?async function processRecognition/)?.[0] || '';
   assert.match(conversationRequest, /method === 'DELETE'/);
   assert.match(conversationRequest, /delete_scope_confirmed/);

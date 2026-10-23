@@ -143,7 +143,10 @@ export type ModelTrace = {
   safety_guard_applied?: boolean;
 };
 
-/** The complete event object returned by the core HTTP routes. */
+/** The complete event object returned by the core HTTP routes.
+ * In local_first, edits/deletes are resolved by HealthLocal in the encrypted
+ * browser store; this shape does not imply a persistent backend endpoint.
+ */
 export type Event = {
   record_id: string;
   raw_text: string;
@@ -285,6 +288,22 @@ export type ConfiguredCapability = {
 
 export type ConversationAction = "ask" | "reply" | "finish" | "urgent" | "soon_evaluation";
 
+/** Allowlisted diagnostics persisted with a failed assistant turn; never remote text. */
+export type ConversationFailureMetadata = {
+  error_code?: "ai_conversation_failed" | "model_timeout" | "model_network_error"
+    | "model_configuration_invalid" | "model_redirect_rejected" | "model_response_too_large"
+    | "model_output_truncated" | "model_response_invalid" | "model_mock_unavailable"
+    | "model_http_error" | "model_account_binding_required" | "model_schema_invalid"
+    | "model_evidence_invalid" | "model_reply_unsafe" | "reviewed_risk_invalid"
+    | "trial_authorization_required" | "trial_budget_exhausted" | "trial_stopped" | "trial_review_required"
+    | "saved_audio_trial_source_changed" | "saved_audio_trial_not_authorized" | "audio_source_review_required"
+    | "session_unavailable" | "authentication_required" | "access_not_configured" | "ai_rate_limited"
+    | "network_unavailable" | "subject_mismatch" | "conversation_not_found" | "conversation_version_conflict"
+    | "http_401" | "http_403" | "http_408" | "http_409" | "http_422" | "http_429"
+    | "http_500" | "http_502" | "http_503" | "http_504" | null;
+  provider_http_status?: 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504;
+};
+
 /** Local encrypted-store operation; confirmation never sends an AI request. */
 export type ConfirmConversationCorrectionRequest = {
   expected_conversation_version: number;
@@ -339,12 +358,154 @@ export type ReviewedRiskAssessment = Omit<ReviewedRiskManifest, "rules"> & {
   rejected_candidates: number;
 };
 
+export type AudioTranscriptStatus = "machine_transcribed" | "user_edited" | "original_comparison";
+
+/** Client-local conversation fields used to bind an audio transcript to its
+ * current local record, media item, and conversation version. */
+export type ConversationTurn = {
+  turn_id: string;
+  role: "elder" | "assistant";
+  text: string;
+  version?: number;
+  source_kind?: SourceKind;
+  record_id?: string | null;
+  media_id?: string | null;
+  responding_to?: { turn_id: string; text: string };
+  responding_to_version?: number;
+  /** A quoted message is contextual metadata, never a clinical fact or answer binding. */
+  quote_context?: ConversationQuoteContext;
+  audio_source_reviewed?: boolean;
+  audio_source_status?: AudioTranscriptStatus | null;
+  audio_source_version?: number | null;
+  audio_source_media_version?: number | null;
+  audio_source_conversation_id?: string | null;
+  audio_source_conversation_version?: number | null;
+  audio_source_invalidated?: boolean;
+};
+
+export type ConversationQuoteRef = {
+  turn_id: string;
+  version: number;
+};
+
+/** Verified locally from the encrypted conversation before the model request.
+ * This is separate from responding_to and must never be used as patient evidence. */
+export type ConversationQuoteContext = {
+  conversation_id: string;
+  turn_id: string;
+  role: "elder" | "assistant";
+  version: number;
+  text: string;
+  source: {
+    source_kind: SourceKind | "assistant_message";
+    record_id: string | null;
+    record_version: number | null;
+    media_id: string | null;
+    media_version: number | null;
+  };
+};
+
+/** Optional request binding for a newly appended local conversation turn.
+ * The version is checked against the actual assistant turn locally, then
+ * stored separately as responding_to_version. */
+export type ConversationRespondingToRequest = {
+  turn_id: string;
+  version: number;
+  text: string;
+};
+
+/** HealthLocal append input; local turn editing is limited to the latest valid
+ * elder turn and must re-check its version at save time. Confirmed conversation
+ * deletion is a local cascade, not a backend DELETE contract.
+ */
+export type ConversationTurnAppendRequest = {
+  text: string;
+  expected_version: number;
+  source_kind?: SourceKind;
+  record_id?: string;
+  media_id?: string;
+  source_version?: number;
+  media_version?: number;
+  audio_source_status?: AudioTranscriptStatus;
+  audio_duration_seconds?: number;
+  explicit_source_reuse?: boolean;
+  keep_media_until_pause?: boolean;
+  /** Local resolver validates this ref and stores a provenance snapshot separately from responding_to. */
+  quote_ref?: ConversationQuoteRef;
+  /** Omit only when the user did not select a question; a stale explicit
+   * binding must fail closed and preserve the unsent input. */
+  responding_to?: ConversationRespondingToRequest;
+};
+
+export type ConversationReportTranscriptEntry = {
+  turn_id: string;
+  role: "elder" | "assistant";
+  text: string;
+  source_kind: SourceKind;
+  source_status?: AudioTranscriptStatus | "legacy_unclassified";
+  source_record_id?: string | null;
+  source_record_version?: number | null;
+  source_media_id?: string | null;
+  source_media_version?: number | null;
+  source_verified_by_user?: boolean;
+  created_at: string;
+  version: number;
+};
+
+/** Current local report transcript; audio provenance is descriptive and does
+ * not assert medical confirmation. Historical reports may omit transcript. */
+export type ConversationReport = {
+  transcript?: ConversationReportTranscriptEntry[];
+} & JsonObject;
+
+export type HandoffConversationTranscriptEntry = {
+  turn_id: string;
+  role: "elder" | "assistant";
+  text: string;
+  original_text?: string;
+  created_at: string;
+  version: number;
+  versions: JsonObject[];
+  record_id: string | null;
+  source?: {
+    kind: "audio_transcript";
+    status: AudioTranscriptStatus | "legacy_unclassified";
+    record_id: string | null;
+    record_version: number | null;
+    media_id: string | null;
+    media_version: number | null;
+    verified_by_user: boolean;
+  };
+};
+
+/** Transcript shape used by the local encrypted handoff export. */
+export type HandoffConversationReportExport = {
+  conversation_id: string;
+  subject_id: string;
+  local_date: string;
+  last_local_date: string;
+  status: string;
+  report: ConversationReport;
+  completeness: JsonValue | null;
+  transcript: HandoffConversationTranscriptEntry[];
+};
+
 export type ConversationModelTurn = {
   turn_id: string;
   text: string;
   version?: number;
   // Previous assistant question or response; context only, never patient evidence.
   responding_to?: { turn_id: string; text: string };
+  // Untrusted client provenance. These values do not authenticate a source or
+  // confirm a clinical fact; the browser verifies its local record/media binding.
+  source?: {
+    kind: "audio_transcript";
+    status: AudioTranscriptStatus;
+    record_id: string;
+    record_version: number;
+    media_id: string;
+    media_version: number;
+  };
 };
 
 /** Backend-managed continuity markers. Session binding is a stale-state guard,
@@ -442,6 +603,8 @@ export type ConversationHealthMemoryRequest = {
   health_context: Array<Omit<HealthMemoryEntry, "temporal_status"> & {
     temporal_status?: "current" | "historical";
   }>;
+  /** Quoted message context stays outside patient turns and clinical evidence. */
+  quote_context?: ConversationQuoteContext;
 };
 
 export type AppSessionResponse =
@@ -859,6 +1022,16 @@ export type MediaListResponse = {
 export type MediaDetailResponse = {
   ok: true;
   media: Media;
+};
+
+/** HealthLocal-only deletion of an unreferenced local media original.
+ * The current version and explicit confirmation are required. Linked media,
+ * active recognition, and uploads in progress are rejected. This does not
+ * describe a persistent backend DELETE endpoint.
+ */
+export type DeleteLocalMediaRequest = {
+  delete_scope_confirmed: true;
+  expected_version: number;
 };
 
 export type StartMediaRecognitionRequest = {

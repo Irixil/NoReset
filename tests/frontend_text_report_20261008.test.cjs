@@ -134,8 +134,9 @@ test('explicit report refresh is source-only, version-bound, idempotent and reta
   assert.equal(conversation.saved_audio_trial.state, 'completed', 'closed saved-audio trial marker remains present to keep composer gated');
   assert.equal(conversation.trial_control.state, 'stopped');
   let saved = await h.api.vault.get('conversation:' + conversation.conversation_id);
-  assert.equal(saved.report_history.length, 1);
-  assert.equal(JSON.stringify(saved.report_history[0]), JSON.stringify(initialReport));
+  assert.equal(saved.report_history.length, 2,'both replaced report versions are retained');
+  assert.equal(JSON.stringify(saved.report_history.at(-1)), JSON.stringify(initialReport));
+  assert.equal(new Set(saved.report_history.map(item=>item.version)).size,saved.report_history.length);
   assert.deepEqual(conversation.turns, result.j.conversation.turns);
   const savedVersion = conversation.version, savedReportVersion = conversation.report.version;
   result = await h.request(`/api/conversations/${conversation.conversation_id}/refresh-report`, {
@@ -147,7 +148,7 @@ test('explicit report refresh is source-only, version-bound, idempotent and reta
   for (const key of ['saved_audio_trial', 'trial_control', 'controller', 'completeness', 'health_context', 'selected_context_ids']) {
     assert.equal(JSON.stringify(result.j.conversation[key]), JSON.stringify(saved[key]), `${key} survives unchanged response`);
   }
-  assert.equal(saved.report_history.length, 1);
+  assert.equal(saved.report_history.length, 2);
   assert.equal(h.calls.filter(path => path === '/api/reports/reground').length, 2);
   assert.equal(h.calls.slice(initialCalls).some(path => path === '/api/ai/conversation-turn'), false);
 });
@@ -167,7 +168,24 @@ test('report refresh rejects stale conversation or subject bindings before conta
   assert.equal(result.r.status, 409); assert.equal(result.j.error, 'report_source_changed');
   assert.equal(h.calls.includes('/api/reports/reground'), false);
   const saved = await h.api.vault.get('conversation:' + conversation.conversation_id);
-  assert.equal(JSON.stringify(saved.report), JSON.stringify(conversation.report)); assert.equal(saved.report_history, undefined);
+  assert.equal(JSON.stringify(saved.report), JSON.stringify(conversation.report)); assert.equal(JSON.stringify(saved.report_history||[]),JSON.stringify(conversation.report_history||[]));
+});
+test('saved local conversation with an unbound current source returns report_sources_not_current without changing its report', async () => {
+  const h = await harness();
+  h.setResponse(() => ({ provider: 'SyntheticReportFixture', action: 'reply', assistant_text: '合成回复，没有来源整理。' }));
+  const conversation = await h.say(await h.start(), '纯虚构：近来睡得不太好。');
+  assert.equal(conversation.analysis_sources, null);
+  h.setReground(() => { throw new Error('an unbound source must not contact the re-ground endpoint'); });
+  const result = await h.request(`/api/conversations/${conversation.conversation_id}/refresh-report`, {
+    expected_conversation_version: conversation.version, expected_subject_id: conversation.subject_id,
+    expected_subject_version: 1, expected_context_version: 0,
+  });
+  assert.equal(result.r.status, 409);
+  assert.equal(result.j.error, 'report_sources_not_current');
+  assert.equal(h.calls.includes('/api/reports/reground'), false);
+  const saved = await h.api.vault.get(`conversation:${conversation.conversation_id}`);
+  assert.equal(JSON.stringify(saved.report), JSON.stringify(conversation.report));
+  assert.equal(JSON.stringify(saved.report_history||[]),JSON.stringify(conversation.report_history||[]));
 });
 test('report refresh rejects a response that changes source bindings or loses a source during the request', async () => {
   const h = await harness();
@@ -189,7 +207,7 @@ test('report refresh rejects a response that changes source bindings or loses a 
   });
   assert.equal(result.r.status, 409); assert.equal(result.j.error, 'report_source_changed');
   const after = await h.api.vault.get('conversation:' + conversation.conversation_id);
-  assert.equal(JSON.stringify(after.report), JSON.stringify(before.report)); assert.equal(after.report_history, undefined);
+  assert.equal(JSON.stringify(after.report), JSON.stringify(before.report)); assert.equal(JSON.stringify(after.report_history||[]),JSON.stringify(before.report_history||[]));
 });
 test('report refresh rejects a changed status or evidence ID even when the proposed summary sounds plausible', async () => {
   const h = await harness();
@@ -210,7 +228,84 @@ test('report refresh rejects a changed status or evidence ID even when the propo
   });
   assert.equal(result.r.status, 422); assert.equal(result.j.error, 'report_update_rejected');
   const saved = await h.api.vault.get('conversation:' + conversation.conversation_id);
-  assert.equal(saved.version, conversation.version); assert.equal(saved.report_history, undefined);
+  assert.equal(saved.version, conversation.version); assert.equal(JSON.stringify(saved.report_history||[]),JSON.stringify(conversation.report_history||[]));
+});
+test('a rejected category summary leaves its bound patient quote unclassified and associated symptoms unknown', async () => {
+  const h = await harness();
+  h.setResponse(payload => ({ provider: 'SyntheticReportFixture', action: 'reply', assistant_text: '已保留原话。', completeness: {
+    clinical_state: Object.fromEntries(CLINICAL_CATEGORIES.map(category => [category,
+      category === 'associated_symptoms' ? known('另有胸痛', [payload.turns[0].turn_id])
+        : { status: 'missing', summary: '', evidence_turn_ids: [], context_ids: [] }])),
+    contradictions: [], relevant_context_ids: [],
+  } }));
+  const c = await h.say(await h.start(), '我咳嗽两天了，晚上明显些。');
+  const source = c.turns.find(turn => turn.role === 'elder');
+  const sourceRecord = sections(c, 'source_record');
+  assert.equal(c.analysis_sources.turns[0].turn_id, source.turn_id);
+  assert.equal(sections(c, 'symptoms_impact').some(line => line.tags?.includes('同时出现')), false);
+  assert.ok(sourceRecord.some(line => line.kind === 'quote' && line.text === source.text
+    && line.tags.includes('未分类 · 待整理')));
+  assert.ok(sections(c, 'verification').some(line => line.text.includes('是否同时出现其他身体变化')));
+});
+test('a bound empty clinical state keeps source words unclassified instead of keyword-labeling them', async () => {
+  const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+  let c = await h.say(await h.start(), '我咳嗽两天了，晚上明显些。');
+  const source = c.turns.find(turn => turn.role === 'elder');
+  c = { ...c, completeness: { clinical_state: {}, contradictions: [], relevant_context_ids: [] },
+    analysis_sources: { turns: [{ turn_id: source.turn_id, version: source.version, quote: source.text }],
+      selected_context_ids: [], context_version: 0, context: [] } };
+  await h.api.vault.put(`conversation:${c.conversation_id}`, c);
+  const current = (await h.request(`/api/conversations/${c.conversation_id}`)).j.conversation;
+  assert.ok(sections(current, 'source_record').some(line => line.text === source.text
+    && line.tags.includes('未分类 · 待整理')));
+  assert.equal(sections(current, 'symptoms_impact').some(line => line.tags?.includes('同时出现')), false);
+  assert.match(sections(current, 'verification').map(line => line.text).join('\n'), /是否同时出现其他身体变化/);
+});
+test('a rejected-category legacy report cache is repaired once and remains idempotent on reopen', async () => {
+  const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+  let c = await h.say(await h.start(), '我咳嗽两天了，晚上明显些。');
+  const source = c.turns.find(turn => turn.role === 'elder');
+  const state = Object.fromEntries(CLINICAL_CATEGORIES.map(category => [category,
+    category === 'associated_symptoms' ? known('另有胸痛', [source.turn_id])
+      : { status: 'missing', summary: '', evidence_turn_ids: [], context_ids: [] }]));
+  const badLine = { kind: 'quote', text: source.text, tags: ['同时出现'], source_turn_ids: [source.turn_id],
+    source_versions: [{ turn_id: source.turn_id, version: source.version, quote: source.text }],
+    source_label: '患者原话历史 1 · 待核对' };
+  const legacy = { ...c, completeness: { clinical_state: state, contradictions: [], relevant_context_ids: [] },
+    analysis_sources: { turns: [{ turn_id: source.turn_id, version: source.version, quote: source.text }],
+      selected_context_ids: [], context_version: 0, context: [] },
+    report: { ...c.report, format_version: 5, version: 2, sections: [
+      { key: 'symptoms_impact', title: '症状特点与生活影响（原话历史 · 待核对）', lines: [badLine] },
+      { key: 'verification', title: '尚待医生核实', lines: [{ kind: 'check', text: '尚未问清：最主要的不舒服和具体部位。', tags: ['信息未完整'] }] },
+    ] } };
+  await h.api.vault.put(`conversation:${c.conversation_id}`, legacy);
+  const read = async () => (await h.request(`/api/conversations/${c.conversation_id}`)).j.conversation;
+  const repaired = await read(), reopened = await read();
+  assert.equal(repaired.report.version, legacy.report.version + 1);
+  assert.equal(reopened.report.version, repaired.report.version);
+  assert.equal(sections(repaired, 'symptoms_impact').some(line => line.tags?.includes('同时出现')), false);
+  assert.ok(sections(repaired, 'source_record').some(line => line.text === source.text
+    && line.tags.includes('未分类 · 待整理')));
+  assert.match(sections(repaired, 'verification').map(line => line.text).join('\n'), /是否同时出现其他身体变化/);
+  assert.equal(JSON.stringify(repaired.turns), JSON.stringify(legacy.turns));
+  assert.equal((await h.api.vault.get(`conversation:${c.conversation_id}`)).report.version, legacy.report.version,
+    'projection repair must not mutate encrypted storage');
+});
+test('a valid grounded summary keeps its existing category and does not create an unclassified source section', async () => {
+  const h = await harness(); h.setResponse(() => { throw new Error('synthetic model unavailable'); });
+  let c = await h.say(await h.start(), '我咳嗽两天了，晚上明显些。');
+  const source = c.turns.find(turn => turn.role === 'elder');
+  const state = Object.fromEntries(CLINICAL_CATEGORIES.map(category => [category,
+    category === 'main_complaint' ? known('我咳嗽两天了', [source.turn_id])
+      : { status: 'missing', summary: '', evidence_turn_ids: [], context_ids: [] }]));
+  c = { ...c, completeness: { clinical_state: state, contradictions: [], relevant_context_ids: [] },
+    analysis_sources: { turns: [{ turn_id: source.turn_id, version: source.version, quote: source.text }],
+      selected_context_ids: [], context_version: 0, context: [] } };
+  await h.api.vault.put(`conversation:${c.conversation_id}`, c);
+  const current = (await h.request(`/api/conversations/${c.conversation_id}`)).j.conversation;
+  assert.ok(sections(current, 'chief_complaint').some(line => line.kind === 'summary' && line.text === '我咳嗽两天了'));
+  assert.equal(sections(current, 'source_record').length, 0);
+  assert.ok(sections(current, 'verification').some(line => line.text.includes('是否同时出现其他身体变化')));
 });
 test('saved actual N03 cached report relabels historical-only sources without touching originals or calling a provider', async () => {
   const h = await harness(), before = await savedSynthetic(h, 'N03'), calls = h.calls.length;
@@ -513,7 +608,7 @@ test('stale analysis after a bound short answer does not relabel the original sy
 test('unbound report source projections are idempotent across conversation, current and list reads', async () => {
   async function assertStable(h, conversation, label) {
     const readConversation = () => h.request(`/api/conversations/${conversation.conversation_id}`, undefined, 'GET');
-    const readCurrent = () => h.request('/api/conversations/current?local_date=2026-10-08', undefined, 'GET');
+    const readCurrent = () => h.request(`/api/conversations/current?local_date=${conversation.last_local_date||conversation.local_date}`, undefined, 'GET');
     const readList = () => h.request('/api/conversations', undefined, 'GET');
     const first = (await readConversation()).j.conversation.report;
     for (const [name, read] of [['conversation', readConversation], ['current', readCurrent], ['list', readList]]) {

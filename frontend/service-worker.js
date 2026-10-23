@@ -1,4 +1,4 @@
-const CACHE = 'bingli-beta-shell-v136-crossday-source-20261019';
+const CACHE = 'bingli-beta-shell-v171-media-original-delete-20261023';
 const CACHE_PREFIX = 'bingli-beta-shell-';
 const SHELL = ['/', '/styles.css', '/ios.css', '/splash.css', '/config.js', '/local-store-core.js', '/safety.js', '/local-store.js', '/app.js', '/media.js', '/splash.js', '/assets/brand-mascot.png', '/manifest.webmanifest'];
 const SHELL_PATHS = new Set(SHELL);

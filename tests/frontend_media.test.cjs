@@ -11,7 +11,7 @@ const safety = require('../frontend/safety.js');
 function harness({ healthLocal = null, captureBootstrap = false } = {}) {
   const elements = new Map(), storage = new Map(), recorders = [], views = [], requests = [], windowListeners = {}, confirmMessages = [];
   let response = async route => ({ r: { ok: true, status: 200 }, j: route === '/api/events' ? { ok: true, events: [] } : { ok: true, media: [] } });
-  let nextId = 1, waits = 0;
+  let nextId = 1, waits = 0, activeElement = null;
   function element(id) {
     if (!elements.has(id)) {
       const classes = new Set();
@@ -23,11 +23,16 @@ function harness({ healthLocal = null, captureBootstrap = false } = {}) {
           toggle(name, on) { if (on ?? !classes.has(name)) classes.add(name); else classes.delete(name); },
         },
         querySelector(selector) { return element(id + ':' + selector); }, querySelectorAll() { return []; },
-        addEventListener() {}, scrollIntoView() {}, append(child) { this.children.push(child); },
+        listeners: new Map(), open: false, focused: false,
+        addEventListener(name, callback) { const callbacks=this.listeners.get(name)||[];callbacks.push(callback);this.listeners.set(name,callbacks); },
+        dispatchEvent(event) { const dispatched={defaultPrevented:false,preventDefault(){this.defaultPrevented=true},...event};for(const callback of this.listeners.get(dispatched.type)||[])callback(dispatched);if(dispatched.type==='cancel'&&!dispatched.defaultPrevented)this.open=false;return !dispatched.defaultPrevented; },
+        showModal() { this.open=true; }, close(returnValue='') { this.open=false;this.returnValue=returnValue; }, focus() { this.focused=true;activeElement=this; },
+        scrollIntoView() {}, append(child) { this.children.push(child); },
         replaceChildren(...children) { this.children = children; },
         setAttribute(name, value) { attributes.set(name, String(value)); },
         getAttribute(name) { return attributes.get(name) ?? null; },
         removeAttribute(name) { attributes.delete(name); },
+        insertAdjacentHTML(position, html) { assert.equal(position,'beforeend');this.innerHTML+=html; },
       });
     }
     return elements.get(id);
@@ -50,15 +55,17 @@ function harness({ healthLocal = null, captureBootstrap = false } = {}) {
     console, Blob, FormData, URL, crypto: { subtle: webcrypto.subtle, randomUUID }, MediaRecorder: Recorder, HealthLocal: healthLocal,
     location: { hostname: 'localhost', port: '5173' },
     navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } },
-    document: { getElementById: element, querySelectorAll: () => [], createElement: tag => element('new-' + tag + nextId++) },
+    document: { get activeElement() { return activeElement; }, getElementById: element, querySelectorAll: () => [], createElement: tag => element('new-' + tag + nextId++) },
     window: { scrollTo() {}, addEventListener(name, callback) { windowListeners[name] = callback; } }, confirm: message => { confirmMessages.push(message); return true; },
-    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
+    localStorage: { get length() { return storage.size; }, key: index => [...storage.keys()][index] ?? null,
+      getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     fetch: async () => ({ ok: true, json: async () => ({ ok: true, session_token: 'test', provider: 'mock', events: [] }) }),
     setInterval() { return nextId++; }, clearInterval() {}, clearTimeout() {},
     setTimeout(callback, milliseconds) { if (milliseconds === 1000) { waits++; queueMicrotask(callback); } return nextId++; },
   });
   function run(code) { return vm.runInContext(code, context); }
   run(fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8'));
+  context.testOriginalLoadEvents = context.loadEvents;
   context.productionApi = context.api;
   context.testApi = async (route, options = {}) => {
     requests.push({ route, options });
@@ -66,7 +73,8 @@ function harness({ healthLocal = null, captureBootstrap = false } = {}) {
     if (route === '/api/conversations') return { r: { ok: true }, j: { conversations: [] } };
     return response(route, options);
   };
-  context.testShowView = id => views.push(id);
+  context.testOriginalShowView = context.showView;
+  context.testShowView = id => { views.push(id); return context.testOriginalShowView(id); };
   const bootstrapCalls = [], bootstrapObservers = [];
   context.captureBootstrap = (label, promise) => {
     const call = { label, promise }; bootstrapCalls.push(call);
@@ -181,7 +189,7 @@ test('app and media bootstrap share the real local owner read before loading rec
   const familyVersion = selected.j.version;
 
   const originalRequest = local.request.bind(local), firstGate = deferred(), secondGate = deferred();
-  const firstReadReady = deferred(), secondReadReady = deferred(), eventsRead = deferred(), trace = [];
+  const firstReadReady = deferred(), secondReadReady = deferred(), eventsRead = deferred(), capabilitiesRead = deferred(), trace = [];
   let subjectReads = 0;
   local.request = async (path, options = {}) => {
     const method = options.method || 'GET', headers = options.headers || {};
@@ -197,6 +205,7 @@ test('app and media bootstrap share the real local owner read before loading rec
     const result = await originalRequest(path, options);
     trace.push({ ...entry, status: result.r.status, error: result.j.error || '' });
     if (path === '/api/events' && method === 'GET') eventsRead.resolve(trace.at(-1));
+    if (path === '/api/media/capabilities' && method === 'GET') capabilitiesRead.resolve(trace.at(-1));
     return result;
   };
 
@@ -210,8 +219,7 @@ test('app and media bootstrap share the real local owner read before loading rec
     await Promise.all([bothSubjectCallers.promise, capabilityBootstrap.promise, firstReadReady.promise]);
     if (subjectReads > 1) await secondReadReady.promise;
     firstGate.resolve();
-    const events = await eventsRead.promise;
-    await new Promise(setImmediate);
+    const [events, capability] = await Promise.all([eventsRead.promise, capabilitiesRead.promise]);
     assert.equal(events.subjectId, familyId, 'app waits for the family owner before loading records');
     assert.equal(events.version, String(familyVersion));
     assert.equal(events.status, 200);
@@ -219,7 +227,8 @@ test('app and media bootstrap share the real local owner read before loading rec
     assert.equal(h.run('activeHealthSubjectId'), familyId);
     assert.equal(h.run('healthSubjectsVersion'), familyVersion);
     assert.equal(h.run('healthSubjectChanged'), false);
-    assert.ok(trace.some(item => item.path === '/api/media/capabilities' && item.subjectId === familyId && item.version === String(familyVersion)));
+    assert.equal(capability.subjectId, familyId, 'media capability request uses the synchronized family owner');
+    assert.equal(capability.version, String(familyVersion));
   } finally {
     firstGate.resolve(); secondGate.resolve();
     await settleBootstrap(h);
@@ -352,7 +361,7 @@ test('subject switch clears stale archive status and ignores a delayed old-owner
   assert.equal(h.run('activeHealthSubjectId'), familyId);
   assert.equal(h.element('archiveEventCount').textContent, 0);
   assert.equal(h.element('archivePhotoCount').textContent, 0);
-  assert.deepEqual(h.run('mediaItems'), []);
+  assert.equal(h.run('mediaItems.length'), 0);
   assert.doesNotMatch(h.element('archiveEvents').innerHTML, /虚构本人记录/);
 });
 
@@ -488,6 +497,15 @@ test('shared Mock recognition error uses neutral media wording', async () => {
   assert.equal(error.message, '识别服务尚未接通；原件已保存，可直接打字记录。');
 });
 
+test('audio recognition already in progress explains that the original is saved', async () => {
+  const h = harness();
+  h.setApi(async () => ({ r: { ok: false, status: 409 }, j: { error: 'audio_recognition_in_progress' } }));
+  const error = await h.run("mediaRequest('/api/media/media_test/recognize',{method:'POST'}).catch(error=>error)");
+  assert.equal(error.code, 'audio_recognition_in_progress');
+  assert.equal(error.message, '另一段录音正在识别，请等它完成；这段原录音已保存。');
+  assert.equal(error.retryable, false);
+});
+
 test('archive media distinguishes unreadable from silent audio and keeps originals without futile retry', async () => {
   const h = harness(), failures = new Map();
   for (const [index, code] of ['invalid_media', 'no_text_detected'].entries()) {
@@ -570,14 +588,21 @@ test('conversation card deletion confirms once and sends the exact scoped reques
     return { r: { ok: true }, j: { deleted: { local_media_count: 1 } } };
   });
   h.context.testDeleteButton = button;
-  await h.run('deleteConversation({conversation_id:"conversation_test",version:7},testDeleteButton)');
+  h.run('localMode=false;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=3;healthSubjectUiEpoch=4;detailRequestSerial=9;current={conversation_id:"conversation_test",version:7,subject_id:"subject_self"};currentConversationDetail=current');
+  h.run('deleteConversation({conversation_id:"conversation_test",version:7,subject_id:"subject_self"},testDeleteButton)');
+  assert.equal(h.element('recordDeleteDialog').open, true);
+  assert.equal(deleteRequest, undefined, 'opening the dialog does not delete');
+  assert.equal(h.element('recordDeleteTitle').textContent, '确认删除这段对话？');
+  assert.match(h.element('recordDeleteExplanation').textContent, /本机.*将被删除.*无法撤销.*旧备份不受影响/);
+  await h.run('confirmRecordDelete()');
   assert.equal(deleteRequest.route, '/api/conversations/conversation_test');
   assert.equal(deleteRequest.options.method, 'DELETE');
   assert.deepEqual(JSON.parse(deleteRequest.options.body), { delete_scope_confirmed: true, expected_version: 7 });
-  assert.equal(h.confirmMessages.length, 1);
-  assert.match(h.confirmMessages[0], /确定删除这条完整对话吗/);
-  assert.equal(button.disabled, true);
-  assert.equal(button.getAttribute('aria-label'), '正在删除这条完整对话');
+  assert.equal(h.confirmMessages.length, 0, 'native confirmation replaces browser confirm');
+  assert.equal(h.element('recordDeleteConfirmBtn').disabled, false);
+  assert.equal(h.element('recordDeleteDialog').open, false);
+  assert.equal(h.run('currentConversationDetail'), null, 'deleted detail context is cleared');
+  assert.deepEqual(h.views, ['recordsView'], 'successful deletion returns to My Records');
 });
 
 test('standalone record deletion uses one confirmation and its own endpoint', async () => {
@@ -591,13 +616,380 @@ test('standalone record deletion uses one confirmation and its own endpoint', as
     return { r: { ok: true }, j: { deleted: { local_media_count: 0 } } };
   });
   h.context.testDeleteButton = button;
-  await h.run('deleteRecord({record_id:"record_test"},testDeleteButton)');
+  h.run('localMode=false;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=3;healthSubjectUiEpoch=4;detailRequestSerial=9;current={record_id:"record_test",version:2,subject_id:"subject_self"};currentConversationDetail=null');
+  h.run('deleteRecord({record_id:"record_test",version:2,subject_id:"subject_self"},testDeleteButton)');
+  assert.equal(h.element('recordDeleteDialog').open, true);
+  assert.equal(deleteRequest, undefined, 'opening the dialog does not delete');
+  assert.equal(h.element('recordDeleteTitle').textContent, '确认删除这条记录？');
+  const heading=h.element('recordsTitle');
+  h.context.testRecordsView={id:'recordsView',classList:{toggle(){}},setAttribute(){},querySelector:selector=>selector==='h1'?heading:null};
+  h.run('views.push(testRecordsView)');
+  await h.run('confirmRecordDelete()');
   assert.equal(deleteRequest.route, '/api/events/record_test');
   assert.equal(deleteRequest.options.method, 'DELETE');
-  assert.deepEqual(JSON.parse(deleteRequest.options.body), { delete_scope_confirmed: true });
-  assert.equal(h.confirmMessages.length, 1);
-  assert.match(h.confirmMessages[0], /确定删除这条记录吗/);
-  assert.equal(button.disabled, true);
+  assert.deepEqual(JSON.parse(deleteRequest.options.body), { delete_scope_confirmed: true, expected_version: 2 });
+  assert.equal(h.confirmMessages.length, 0, 'native confirmation replaces browser confirm');
+  assert.equal(h.element('recordDeleteConfirmBtn').disabled, false);
+  assert.equal(h.element('recordDeleteDialog').open, false);
+  assert.equal(h.run('current'), null, 'deleted detail context is cleared');
+  assert.deepEqual(h.views, ['recordsView']);
+  assert.equal(h.context.document.activeElement,heading,'success focuses the records page heading, not the deleted trigger');
+});
+
+function renderDeleteEntry(h,event,{relationshipsLoaded=true,owners=[]}={}){
+  h.context.deleteEventFixture=event;
+  h.context.deleteOwnersFixture=owners;
+  h.run(`localMode=true;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current=deleteEventFixture;events=[current];conversations=deleteOwnersFixture;currentConversationDetail=null;recordRelationshipsSubjectId=${relationshipsLoaded?'"subject_self"':'null'};ensureHealthSubjectReady=async()=>true;renderList=()=>{};renderHome=()=>{};renderArchive=()=>{};setModeLabel=()=>{};releaseOriginalsIn=()=>{};renderDetail(current)`);
+  h.requests.length=0;
+  const button=h.element('detail:#deleteEventDetailBtn');button.textContent=h.run('recordDeleteEntryLabel(recordDeleteEntryMode(current))');
+  return {button,status:h.element('recordDeleteScopeStatus')};
+}
+function setDeleteUiApi(h,respond){h.context.testApi=async(route,options={})=>{h.requests.push({route,options});if(route==='/api/media')return {r:{ok:true},j:{media:[]}};if(route==='/api/media/capabilities')return {r:{ok:true},j:{capabilities:{enabled:false}}};return respond(route,options)};h.run(`api=testApi;localMode=false;loadEvents=async()=>{const [eventResult,conversationResult]=await Promise.all([api('/api/events'),api('/api/conversations')]);if(!eventResult.r.ok||!conversationResult.r.ok){recordRelationshipsSubjectId=null;return false}events=eventResult.j.events;conversations=conversationResult.j.conversations;recordRelationshipsSubjectId=activeHealthSubjectId;return true}`)}
+
+test('linked record entry opens its owning conversation without deleting; whole-chat delete still needs its own confirmation', async () => {
+  const h=harness(),event={record_id:'rec_linked_ui',version:2,subject_id:'subject_self',source_conversation_id:'conversation_owner',source_kind:'audio_transcript',raw_text:'合成原话',state:'inbox'};
+  const owner={conversation_id:'conversation_owner',version:4,subject_id:'subject_self',status:'paused',turns:[]};
+  const {button}=renderDeleteEntry(h,event,{owners:[owner]});
+  setDeleteUiApi(h,async(route,options={})=>{
+    if(route==='/api/events')return {r:{ok:true},j:{events:[event]}};
+    if(route==='/api/conversations')return {r:{ok:true},j:{conversations:[owner]}};
+    if(route==='/api/conversations/conversation_owner')return {r:{ok:true},j:{conversation:owner}};
+    if(options.method==='DELETE')throw new Error('no delete should happen before the full-chat confirmation');
+    throw new Error('unexpected route '+route);
+  });
+  assert.equal(button.textContent,'查看所属完整对话');
+  await button.onclick();
+  assert.equal(h.run('currentConversationDetail?.conversation_id'),'conversation_owner');
+  assert.equal(h.element('recordDeleteDialog').open,false);
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+  const fullChatDelete=h.element('detail:#deleteConversationDetailBtn');
+  fullChatDelete.onclick();
+  assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.equal(h.element('recordDeleteTitle').textContent,'确认删除这段对话？');
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+});
+
+test('multiple owning conversations require an explicit choice and never pick one for deletion', async () => {
+  const h=harness(),event={record_id:'rec_multi_owner',version:1,subject_id:'subject_self',source_kind:'audio_transcript',raw_text:'合成原话',state:'inbox'};
+  const owners=['conversation_first','conversation_second'].map((conversation_id,index)=>({conversation_id,version:2,subject_id:'subject_self',status:'paused',turns:[{role:'elder',record_id:event.record_id,text:`合成回答${index+1}`}]}));
+  const {button,status}=renderDeleteEntry(h,event,{owners});
+  setDeleteUiApi(h,async(route,options={})=>{
+    if(route==='/api/events')return {r:{ok:true},j:{events:[event]}};
+    if(route==='/api/conversations')return {r:{ok:true},j:{conversations:owners}};
+    const owner=owners.find(item=>route===`/api/conversations/${item.conversation_id}`);
+    if(owner)return {r:{ok:true},j:{conversation:owner}};
+    if(options.method==='DELETE')throw new Error('ambiguous ownership must not delete');
+    throw new Error('unexpected route '+route);
+  });
+  await button.onclick();
+  assert.equal(h.element('recordDeleteDialog').open,false);
+  assert.match(status.children[0].textContent,/多段完整对话引用/);
+  assert.equal(status.children.length,3,'both owners remain explicit clickable choices');
+  assert.equal(h.requests.filter(request=>request.route.includes('/api/conversations/')&&!request.route.endsWith('/api/conversations')).length,0,'no owner is selected automatically');
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+  await status.children[2].onclick();
+  await new Promise(setImmediate);
+  assert.equal(h.run('currentConversationDetail.conversation_id'),'conversation_second');
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false,'choosing a conversation only navigates');
+});
+
+test('unknown or unreadable ownership never falls through to single-record deletion', async () => {
+  for(const failure of ['read_failed','orphaned_source']){
+    const h=harness(),event={record_id:`rec_${failure}`,version:1,subject_id:'subject_self',source_conversation_id:failure==='orphaned_source'?'missing_conversation':undefined,source_kind:'audio_transcript',raw_text:'合成原话',state:'inbox'};
+    const {button,status}=renderDeleteEntry(h,event,{relationshipsLoaded:failure==='orphaned_source'});
+    setDeleteUiApi(h,async(route,options={})=>{
+      if(route==='/api/events')return failure==='read_failed'?{r:{ok:false,status:503},j:{}}:{r:{ok:true},j:{events:[event]}};
+      if(route==='/api/conversations')return {r:{ok:true},j:{conversations:[]}};
+      if(options.method==='DELETE')throw new Error('unknown ownership must never delete');
+      throw new Error('unexpected route '+route);
+    });
+    await button.onclick();
+    assert.equal(h.element('recordDeleteDialog').open,false,failure);
+    assert.match(status.children[0].textContent,/没有删除/,failure);
+    assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false,failure);
+  }
+});
+
+test('a verified independent record keeps the existing single-record confirmation', async () => {
+  const h=harness(),event={record_id:'rec_independent_route',version:3,subject_id:'subject_self',source_kind:'elder',raw_text:'合成独立原话',state:'inbox'};
+  const {button}=renderDeleteEntry(h,event,{relationshipsLoaded:false});
+  let deletes=0;
+  setDeleteUiApi(h,async(route,options={})=>{
+    if(route==='/api/events')return {r:{ok:true},j:{events:[event]}};
+    if(route==='/api/conversations')return {r:{ok:true},j:{conversations:[]}};
+    if(route==='/api/events/rec_independent_route'&&options.method==='DELETE'){deletes++;return {r:{ok:true,status:200},j:{deleted:{local_media_count:0}}}}
+    throw new Error('unexpected route '+route);
+  });
+  await button.onclick();
+  assert.equal(deletes,0,'resolving ownership does not submit deletion');
+  assert.equal(h.element('recordDeleteDialog').open,false);
+  assert.equal(button.textContent,'删除这条记录');
+  await button.onclick();
+  assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.equal(deletes,0,'the single-record confirmation remains explicit');
+  await h.run('confirmRecordDelete()');
+  assert.equal(deletes,1);
+});
+
+test('revision ancestry finds the owning conversation that cites the superseded record', async () => {
+  const h=harness(),parent={record_id:'rec_revision_parent',version:1,subject_id:'subject_self',source_kind:'audio_transcript',raw_text:'原句',state:'inbox'},
+    event={record_id:'rec_revision_child',version:2,subject_id:'subject_self',supersedes_id:parent.record_id,source_kind:'elder',raw_text:'更正句',state:'inbox'},
+    owner={conversation_id:'conversation_revision_owner',version:3,subject_id:'subject_self',status:'paused',turns:[{role:'elder',record_id:parent.record_id,text:'原句'}]};
+  const {button}=renderDeleteEntry(h,event,{owners:[owner]});
+  setDeleteUiApi(h,async(route,options={})=>{
+    if(route==='/api/events')return {r:{ok:true},j:{events:[event,parent]}};
+    if(route==='/api/conversations')return {r:{ok:true},j:{conversations:[owner]}};
+    if(route==='/api/conversations/conversation_revision_owner')return {r:{ok:true},j:{conversation:owner}};
+    if(options.method==='DELETE')throw new Error('revision-linked record must not delete independently');
+    throw new Error('unexpected route '+route);
+  });
+  await button.onclick();
+  assert.equal(h.run('currentConversationDetail'),null,'initially unresolved ownership requires a second explicit navigation click');
+  await button.onclick();
+  await new Promise(setImmediate);
+  assert.equal(h.run('currentConversationDetail.conversation_id'),owner.conversation_id);
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+});
+
+test('missing revision ancestor offers read-original route and never deletes', async () => {
+  const h=harness(),event={record_id:'rec_missing_child',version:2,subject_id:'subject_self',supersedes_id:'rec_missing_parent',source_kind:'elder',raw_text:'更正句',state:'inbox'};
+  const {button,status}=renderDeleteEntry(h,event);
+  setDeleteUiApi(h,async(route,options={})=>{
+    if(route==='/api/events')return {r:{ok:true},j:{events:[event]}};
+    if(route==='/api/events/rec_missing_parent')return {r:{ok:false,status:404},j:{error:'not_found'}};
+    if(route==='/api/conversations')return {r:{ok:true},j:{conversations:[]}};
+    if(options.method==='DELETE')throw new Error('missing ancestry must never delete');
+    throw new Error('unexpected route '+route);
+  });
+  await button.onclick();
+  assert.equal(button.textContent,'读取修订前原文');
+  assert.equal(status.children[1].textContent,'读取修订前原文');
+  await status.children[1].onclick();
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+  assert.deepEqual(h.views,['recordDetailView']);
+});
+
+test('record deletion can be cancelled by button, Escape, or backdrop without a request', async () => {
+  for (const cancel of ['button', 'escape', 'backdrop']) {
+    const h=harness();h.context.testDeleteButton=h.element('record-delete-trigger');
+    h.run('localMode=false;healthSubjectLoaded=true;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_cancel",version:1,subject_id:"subject_self"}');
+    h.run('deleteRecord(current,testDeleteButton)');
+    const dialog=h.element('recordDeleteDialog');assert.equal(dialog.open,true,cancel);
+    if(cancel==='button')h.element('recordDeleteCancelBtn').onclick();
+    else if(cancel==='escape')dialog.dispatchEvent({type:'cancel'});
+    else dialog.dispatchEvent({type:'click',target:dialog});
+    assert.equal(dialog.open,false,cancel);
+    assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false,cancel);
+  }
+});
+
+test('delete dialog traps Tab in its actions and handles Escape from focused controls', () => {
+  const h=harness(),trigger=h.element('record-delete-trigger');h.context.testDeleteButton=trigger;
+  h.run('localMode=false;healthSubjectLoaded=true;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_keys",version:1,subject_id:"subject_self"}');
+  h.run('deleteRecord(current,testDeleteButton)');
+  const dialog=h.element('recordDeleteDialog'),cancel=h.element('recordDeleteCancelBtn'),confirm=h.element('recordDeleteConfirmBtn');
+  assert.equal(h.context.document.activeElement,cancel,'cancel receives default focus');
+  dialog.dispatchEvent({type:'keydown',key:'Tab',target:cancel,shiftKey:false});
+  assert.equal(h.context.document.activeElement,confirm);
+  dialog.dispatchEvent({type:'keydown',key:'Tab',target:confirm,shiftKey:false});
+  assert.equal(h.context.document.activeElement,cancel,'Tab wraps from confirm to cancel');
+  dialog.dispatchEvent({type:'keydown',key:'Tab',target:cancel,shiftKey:true});
+  assert.equal(h.context.document.activeElement,confirm,'Shift+Tab wraps from cancel to confirm');
+  dialog.dispatchEvent({type:'keydown',key:'Escape',target:confirm});
+  assert.equal(dialog.open,false);
+  assert.equal(h.context.document.activeElement,trigger,'cancel restores focus to the invoking delete button');
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+});
+
+test('delete confirmation rejects a changed owner, detail epoch, id, or version before sending', async () => {
+  for (const mutation of ['owner','epoch','id','version']) {
+    const h=harness();h.context.testDeleteButton=h.element('record-delete-trigger');
+    h.run('localMode=false;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_bound",version:4,subject_id:"subject_self"}');
+    h.run('deleteRecord(current,testDeleteButton)');
+    if(mutation==='owner')h.run('activeHealthSubjectId="subject_family";healthSubjectUiEpoch++');
+    if(mutation==='epoch')h.run('detailRequestSerial++');
+    if(mutation==='id')h.run('current={record_id:"rec_other",version:4,subject_id:"subject_self"}');
+    if(mutation==='version')h.run('current={record_id:"rec_bound",version:5,subject_id:"subject_self"}');
+    await h.run('confirmRecordDelete()');
+    assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false,mutation);
+    assert.equal(h.element('recordDeleteDialog').open,false,mutation);
+    assert.equal(h.run('current.record_id'),mutation==='id'?'rec_other':'rec_bound',mutation);
+  }
+});
+
+test('standalone media uses the shared confirmation; cancel keeps it and all local state unchanged', async () => {
+  const h=harness();let deletes=0;
+  const media={media_id:'media_synthetic_standalone_ui',subject_id:'subject_self',kind:'audio',save_status:'saved',
+    recognition_status:'failed',link_status:'not_linked',conversation_id:'conversation_synthetic_stale_ui',version:2,
+    delete_eligibility:{allowed:true,reason:'eligible'}};
+  h.setApi(async route=>{if(route==='/api/media')return {r:{ok:true},j:{media:[media]}};if(route==='/api/events')return {r:{ok:true},j:{events:[]}};return {r:{ok:true},j:{}}});
+  h.run('localMode=false;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;mediaItems=[JSON.parse('+JSON.stringify(JSON.stringify(media))+')];current=null;currentConversationDetail=null');
+  h.run('renderMedia([])');
+  assert.match(h.element('archivePhotos').innerHTML,/data-delete-media="media_synthetic_standalone_ui"/);
+  h.run('deleteMedia(mediaItems[0],document.getElementById("media-delete-trigger"))');
+  assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.equal(h.element('recordDeleteTitle').textContent,'确认删除这份未关联原件？');
+  assert.match(h.element('recordDeleteExplanation').textContent,/已关联记录或对话，请从对应记录统一删除/);
+  h.run('cancelRecordDelete()');
+  assert.equal(h.element('recordDeleteDialog').open,false);
+  assert.equal(h.run('mediaItems.length'),1);
+  assert.equal(deletes,0);
+  assert.equal(h.requests.some(request=>request.options?.method==='DELETE'),false);
+});
+
+test('standalone media failure keeps the confirmation open and success uses exact media version then refreshes archive', async () => {
+  const h=harness();let deletes=0;
+  const media={media_id:'media_synthetic_delete_ui',subject_id:'subject_self',kind:'audio',save_status:'saved',
+    recognition_status:'interrupted',link_status:'not_linked',version:4,delete_eligibility:{allowed:true,reason:'eligible'}};
+  h.setApi(async (route,options={})=>{
+    if(route==='/api/media')return {r:{ok:true},j:{media:[media]}};
+    if(route==='/api/events')return {r:{ok:true},j:{events:[]}};
+    if(options.method==='DELETE'){deletes++;return deletes===1?{r:{ok:false,status:409},j:{error:'media_linked'}}:{r:{ok:true,status:200},j:{deleted:{media_id:media.media_id,local_media_count:1}}}}
+    return {r:{ok:true},j:{}};
+  });
+  h.run('localMode=false;healthSubjectLoaded=true;healthSubjectChanged=false;healthSubjectSwitchBusy=false;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;mediaItems=[JSON.parse('+JSON.stringify(JSON.stringify(media))+')];current=null;currentConversationDetail=null');
+  h.run('deleteMedia(mediaItems[0],document.getElementById("media-delete-trigger"))');
+  await h.run('confirmRecordDelete()');
+  assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.match(h.element('recordDeleteError').textContent,/对应记录统一删除/);
+  assert.equal(h.run('mediaItems.length'),1);
+  await h.run('confirmRecordDelete()');
+  const request=h.requests.find(item=>item.options?.method==='DELETE');
+  assert.equal(request.route,'/api/media/media_synthetic_delete_ui');
+  assert.deepEqual(JSON.parse(request.options.body),{delete_scope_confirmed:true,expected_version:4});
+  assert.equal(h.element('recordDeleteDialog').open,false);
+  assert.deepEqual(h.views,['archiveView']);
+  assert.equal(h.run('mediaItems.length'),0);
+});
+
+test('archive shows why a retained original cannot be deleted when its conversation still references it', () => {
+  const h=harness();
+  const media={media_id:'media_synthetic_blocked_delete_ui',subject_id:'subject_self',kind:'audio',save_status:'saved',
+    recognition_status:'failed',link_status:'not_linked',version:1,delete_eligibility:{allowed:false,reason:'linked'}};
+  h.run('mediaItems=[JSON.parse('+JSON.stringify(JSON.stringify(media))+')];renderMedia([])');
+  const markup=h.element('archivePhotos').innerHTML;
+  assert.match(markup,/仍被记录或对话引用，不能单独删除/);
+  assert.doesNotMatch(markup,/data-delete-media=/);
+});
+
+test('archive explains that an in-progress conversation link blocks standalone deletion', () => {
+  const h=harness();
+  const media={media_id:'media_synthetic_link_pending_delete_ui',subject_id:'subject_self',kind:'audio',save_status:'saved',
+    recognition_status:'not_started',link_status:'pending',version:1,delete_eligibility:{allowed:false,reason:'link_pending'}};
+  h.run('mediaItems=[JSON.parse('+JSON.stringify(JSON.stringify(media))+')];renderMedia([])');
+  assert.match(h.element('archivePhotos').innerHTML,/仍在关联处理中，暂不能删除/);
+  assert.doesNotMatch(h.element('archivePhotos').innerHTML,/data-delete-media=/);
+});
+
+test('late record and media list reads cannot repopulate caches after deletion invalidation', async () => {
+  const h=harness();await new Promise(setImmediate);let resolveEvents,resolveConversations,resolveMedia;
+  h.context.testDeferApi=route=>{
+    if(route==='/api/events')return new Promise(resolve=>{resolveEvents=resolve});
+    if(route==='/api/conversations')return new Promise(resolve=>{resolveConversations=resolve});
+    if(route==='/api/media')return new Promise(resolve=>{resolveMedia=resolve});
+    return Promise.resolve({r:{ok:true},j:{}});
+  };
+  h.run('api=testDeferApi');
+  h.run('localMode=false;events=[];conversations=[];mediaItems=[];globalThis.recordDataGeneration=0');
+  const eventsRead=h.run('testOriginalLoadEvents()'),mediaRead=h.run('loadMedia()');
+  await new Promise(setImmediate);
+  assert.equal(typeof resolveEvents,'function');assert.equal(typeof resolveConversations,'function');assert.equal(typeof resolveMedia,'function');
+  h.run('globalThis.recordDataGeneration++');h.run('invalidateMediaAfterDelete("media_synthetic_deleted")');
+  resolveEvents({r:{ok:true},j:{events:[{record_id:'rec_synthetic_late'}]}});
+  resolveConversations({r:{ok:true},j:{conversations:[]}});
+  resolveMedia({r:{ok:true},j:{media:[{media_id:'media_synthetic_deleted',kind:'audio',save_status:'saved',version:1}]}});
+  assert.equal(await eventsRead,false);
+  assert.equal(await mediaRead,false);
+  assert.equal(h.run('events.length'),0);
+  assert.equal(h.run('mediaItems.length'),0);
+});
+
+test('cascade cache invalidation removes only upload jobs for the deleted media IDs', () => {
+  const h=harness();
+  const deleted='media_synthetic_deleted',kept='media_synthetic_kept';
+  h.storage.set('elder_media_upload_v2:deleted',JSON.stringify({mediaId:deleted}));
+  h.storage.set('elder_media_upload_v2:kept',JSON.stringify({mediaId:kept}));
+  h.run(`mediaItems=[{media_id:'${deleted}'},{media_id:'${kept}'}];mediaEventsForDisplay=[];localMediaJobs.set('deleted',{mediaId:'${deleted}'});localMediaJobs.set('kept',{mediaId:'${kept}'})`);
+  h.run(`invalidateMediaAfterDelete(['${deleted}'])`);
+  assert.equal(h.storage.has('elder_media_upload_v2:deleted'),false);
+  assert.equal(h.storage.has('elder_media_upload_v2:kept'),true);
+  assert.equal(h.run('localMediaJobs.has("deleted")'),false);
+  assert.equal(h.run('localMediaJobs.has("kept")'),true);
+  assert.deepEqual(Array.from(h.run('mediaItems.map(item=>item.media_id)')),[kept]);
+});
+
+test('an older pending recording does not hide the newest own text from edit eligibility', () => {
+  const h=harness();
+  const conversation={conversation_id:'conversation_synthetic_pending_audio',turns:[
+    {turn_id:'turn_old_audio',role:'elder',source_kind:'audio_transcript',audio_source_reviewed:false,text:'旧的待核对录音。',version:1},
+    {turn_id:'turn_new_text',role:'elder',source_kind:'elder',text:'后来补充的原话。',version:1},
+  ]};
+  h.run(`activeConversation=${JSON.stringify(conversation)}`);
+  assert.equal(h.run('latestEditableOwnTurn(activeConversation)?.turn_id'),'turn_new_text');
+  assert.doesNotMatch(h.run("voiceTurnHtml(turnById('turn_old_audio'))"),/data-voice-turn-save/);
+});
+
+test('an edit window opened on the latest turn cannot save after a newer own message arrives', async () => {
+  const h=harness();let mutations=0;
+  h.setApi(async route=>{if(route.startsWith('/api/conversations/'))mutations++;return {r:{ok:true},j:{events:[],conversations:[],media:[]}}});
+  const conversation={conversation_id:'conversation_synthetic_latest_guard',version:4,turns:[
+    {turn_id:'turn_synthetic_edit_target',role:'elder',source_kind:'elder',text:'虚构原话。',version:1},
+    {turn_id:'turn_synthetic_assistant_reply',role:'assistant',text:'合成回复。',version:1},
+  ]};
+  h.run(`activeConversation=${JSON.stringify(conversation)};beginVoiceTurnEdit('turn_synthetic_edit_target')`);
+  h.run("activeConversation.turns.push({turn_id:'turn_synthetic_newer',role:'elder',source_kind:'elder',text:'后来补充的虚构原话。',version:1});activeConversation.version++");
+  assert.equal(await h.run("saveVoiceTurnEdit('turn_synthetic_edit_target','试图改写旧消息')"),false);
+  assert.equal(mutations,0);
+  assert.match(h.element('voiceConversationStatus').textContent,/这已不是最新一条原话/);
+});
+
+test('delete failure stays on detail with an inline error and permits a retry', async () => {
+  const h=harness();h.context.testDeleteButton=h.element('record-delete-trigger');let deletes=0;
+  h.setApi(async route=>{if(route==='/api/events/rec_retry'){deletes++;return deletes===1?{r:{ok:false,status:500},j:{error:'internal_server_error'}}:{r:{ok:true,status:200},j:{deleted:{local_media_count:0}}}};return {r:{ok:true},j:{events:[],conversations:[]}}});
+  h.run('localMode=false;healthSubjectLoaded=true;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_retry",version:1,subject_id:"subject_self"}');
+  h.run('deleteRecord(current,testDeleteButton)');
+  await h.run('confirmRecordDelete()');
+  assert.equal(deletes,1);assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.match(h.element('recordDeleteError').textContent,/删除没有完成|暂时无法确认/);
+  assert.equal(h.views.length,0);assert.equal(h.run('current.record_id'),'rec_retry');
+  await h.run('confirmRecordDelete()');
+  assert.equal(deletes,2);assert.deepEqual(h.views,['recordsView']);
+});
+
+test('a stale record version keeps the confirmation open and requires reopening before deletion', async () => {
+  const h=harness();h.context.testDeleteButton=h.element('record-delete-trigger');let request;
+  h.setApi(async (route,options={})=>{
+    if(route==='/api/media/capabilities')return {r:{ok:true},j:{capabilities:{enabled:false}}};
+    if(route==='/api/media')return {r:{ok:true},j:{media:[]}};
+    request={route,options};return {r:{ok:false,status:409},j:{error:'stale_version'}};
+  });
+  h.run('localMode=false;healthSubjectLoaded=true;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_stale",version:4,subject_id:"subject_self"}');
+  h.run('deleteRecord(current,testDeleteButton)');
+  await h.run('confirmRecordDelete()');
+  assert.deepEqual(JSON.parse(request.options.body),{delete_scope_confirmed:true,expected_version:4});
+  assert.equal(h.element('recordDeleteDialog').open,true);
+  assert.equal(h.element('recordDeleteError').textContent,'这条记录刚有更新，请取消后重新打开再删除。');
+  assert.deepEqual(h.views,[],'stale response does not navigate or adopt the newer version');
+});
+
+test('delete submission is single-flight and returns to records even when list refresh fails', async () => {
+  const h=harness();h.context.testDeleteButton=h.element('record-delete-trigger');let resolveDelete,deleteCalls=0;
+  h.setApi(async route=>{if(route==='/api/events/rec_busy'){deleteCalls++;return new Promise(resolve=>{resolveDelete=resolve})};return {r:{ok:false,status:503},j:{}}});
+  h.run('localMode=false;healthSubjectLoaded=true;activeHealthSubjectId="subject_self";healthSubjectsVersion=1;healthSubjectUiEpoch=1;detailRequestSerial=2;current={record_id:"rec_busy",version:1,subject_id:"subject_self"};loadEvents=async()=>false');
+  h.run('deleteRecord(current,testDeleteButton)');
+  const pending=h.run('confirmRecordDelete()');
+  await Promise.resolve();
+  assert.equal(h.element('recordDeleteProgress').textContent,'正在删除本机记录和关联原件…');
+  await h.run('confirmRecordDelete()');
+  assert.equal(deleteCalls,1);assert.equal(h.element('recordDeleteConfirmBtn').disabled,true);
+  const dialog=h.element('recordDeleteDialog');
+  const escapeAllowed=dialog.dispatchEvent({type:'keydown',key:'Escape',target:dialog});
+  assert.equal(escapeAllowed,false,'Escape cannot dismiss while deletion is in flight');
+  assert.equal(dialog.open,true);
+  resolveDelete({r:{ok:true,status:200},j:{deleted:{local_media_count:1}}});
+  await pending;
+  assert.deepEqual(h.views,['recordsView']);assert.equal(h.run('current'),null);
+  assert.equal(h.element('recordDeleteDialog').open,false);
 });
 
 test('selected video/webm recording is declared audio/webm while its original bytes stay unchanged', async () => {
@@ -759,6 +1151,30 @@ test('failed multipart upload keeps original Blob and retry identity; success au
   assert.equal(h.element('recordBtn').disabled, false);
 });
 
+test('a new microphone recording carries the paused conversation capture intent through save and recognition', async () => {
+  const h = harness(), sent = {};
+  h.run("activeConversation={conversation_id:'conversation_paused_capture_fixture',version:5,status:'paused',subject_id:'subject_self'}");
+  h.context.uploadMedia = async (blob, kind, options) => {
+    sent.upload = { blob, kind, options };
+    return { media_id:'media_paused_capture_fixture', kind:'audio', temporary:true, conversation_id:options.conversationId,
+      recognition_status:'succeeded', recognition:{text:'合成录音内容',is_mock:false} };
+  };
+  h.context.recognizeMedia = async () => ({ media_id:'media_paused_capture_fixture', kind:'audio', temporary:true,
+    conversation_id:'conversation_paused_capture_fixture', recognition_status:'succeeded', recognition:{text:'合成录音内容',is_mock:false} });
+  h.context.showVoiceMediaSaved = () => {};
+  h.context.showVoiceMediaResult = async (media, options) => { sent.result = { media, options }; };
+  await h.click('recordBtn');
+  h.recorders[0].emit('synthetic utterance');
+  h.click('finishVoiceBtn');
+  await h.recorders[0].finish();
+  assert.equal(sent.upload.options.conversationId,'conversation_paused_capture_fixture');
+  assert.equal(sent.result.options.newRecording,true);
+  assert.equal(sent.result.options.captureIntent.conversationId,'conversation_paused_capture_fixture');
+  assert.equal(sent.result.options.captureIntent.conversationVersion,5);
+  assert.equal(sent.result.options.captureIntent.conversationStatus,'paused');
+  assert.equal(sent.result.options.captureIntent.invalidated,false);
+});
+
 test('successful recognition waits through safety and event linking, then renders top-level safety', async () => {
   const h = harness();h.context.HealthSafety=safety;
   const safetyResult = { danger_detected: true, danger_reminder: '顶层危险提醒：请联系专业人员。' };
@@ -812,33 +1228,36 @@ test('successful temporary recognition keeps polling while the conversation turn
   assert.match(h.element('mediaStatus').textContent, /识别文字已保留/);
 });
 
-test('legacy pending or already-linked audio always opens source review instead of reposting a turn', async () => {
+test('legacy pending audio avoids the review card and an already-linked result is never reposted', async () => {
   const h = harness();
   const pending = { ...saved(), kind:'audio',media_id:'media_test',record_id:'record_test',temporary: true, conversation_id: 'conversation_test',
     recognition_status: 'succeeded', link_pending_reason: 'conversation_link_pending',
     recognition: { text: '今天有些头晕。', is_mock: false } };
-  const reviewedPanel=[];h.context.presentAudioReview=async media=>{reviewedPanel.push(media.media_id);h.context.pendingAudioReview={media_id:media.media_id};return true};
+  const reviewedPanel=[];h.context.presentAudioReview=async media=>{reviewedPanel.push(media.media_id);return true};
+  h.context.findPendingAudioReviewCandidates=async()=>({ok:true,candidates:[pending]});h.context.renderVoiceConversation=()=>{};
   h.run("activeConversation={conversation_id:'conversation_test',version:2,turns:[]}");
   h.context.testPending=pending;h.context.testLinked={...pending,conversation_turn_id:'turn_00000001',link_pending_reason:null};
   await h.run('showVoiceMediaResult(testPending)');
-  await h.run('showVoiceMediaResult(testLinked)');
-  assert.deepEqual(reviewedPanel,['media_test','media_test']);
+  h.context.findPendingAudioReviewCandidates=async()=>({ok:true,candidates:[]});
+  await h.run('showVoiceMediaResult(testLinked,{newRecording:true})');
+  assert.deepEqual(reviewedPanel,[]);
   assert.equal(h.requests.filter(request => request.route.endsWith('/turns')).length, 0);
-  assert.equal(h.requests.filter(request => request.route.endsWith('/pause')).length, 0, 'showing ASR text leaves time to compare the original before explicit pause');
-  assert.equal(h.context.pendingAudioReview.media_id,'media_test');
+  assert.equal(h.requests.filter(request => request.route.endsWith('/pause')).length, 0);
+  assert.equal(h.context.pendingAudioReview,undefined);
 });
 
-test('legacy terminal conversation-link failure is held for source review rather than retried automatically', async () => {
+test('legacy terminal conversation-link failure remains saved without opening the source-review card or sending', async () => {
   const h = harness();
   const failedLink = { ...saved(), kind:'audio',media_id:'media_test',temporary: true, conversation_id: 'conversation_test', record_id: 'record_test',
     recognition_status: 'succeeded', conversation_link_error: 'conversation_link_interrupted',
     recognition: { text: '今天有些头晕。', is_mock: false } };
   let shown=false;h.context.presentAudioReview=async()=>{shown=true;return true};
+  h.context.findPendingAudioReviewCandidates=async()=>({ok:true,candidates:[failedLink]});h.context.renderVoiceConversation=()=>{};
   h.run("activeConversation={conversation_id:'conversation_test',version:3,turns:[]}");
   h.element('voiceTextInput').value = '';
   h.context.failedLink = failedLink;
   await h.run('showVoiceMediaResult(failedLink)');
-  assert.equal(shown,true);assert.equal(h.element('voiceTextInput').value,'');
+  assert.equal(shown,false);assert.equal(h.element('voiceTextInput').value,'');
   assert.equal(h.requests.some(request=>request.route.endsWith('/turns')),false);
 });
 
@@ -939,9 +1358,9 @@ test('audio review status fails closed for unreviewed, branched, missing, read-f
   assert.match(h.element('archivePhotos').innerHTML,/状态暂不可确认/);
 });
 
-test('an elder turn can be corrected in its own chat bubble and updates the report', async () => {
+test('the latest reviewed audio turn can be corrected in its own chat bubble and updates the report', async () => {
   const h = harness();
-  const originalTurn = { turn_id: 'turn_00000001', role: 'elder', original_text: '鸡天坏豆腐说我坏的', text: '鸡天坏豆腐说我坏的', source_kind: 'audio_transcript', record_id: 'rec_original', version: 1, versions: [] };
+  const originalTurn = { turn_id: 'turn_00000001', role: 'elder', original_text: '鸡天坏豆腐说我坏的', text: '鸡天坏豆腐说我坏的', source_kind: 'audio_transcript', audio_source_status: 'user_edited', audio_source_reviewed: true, record_id: 'rec_original', version: 1, versions: [] };
   const conversation = { conversation_id: 'conversation_test', turns: [{ turn_id: 'turn_assistant1', role: 'assistant', text: '请慢慢说。' }, originalTurn], report: { title: '就诊沟通记录', status_label: '自动整理 · 本人未核对', version: 1, source_turn_ids: [originalTurn.turn_id], body: '老人原话\n1. 鸡天坏豆腐说我坏的' } };
   const correctedTurn = { ...originalTurn, text: '今天吃豆腐后胃不舒服。', version: 2, versions: [{ version: 1, text: originalTurn.text }] };
   const corrected = { ...conversation, turns: [conversation.turns[0], correctedTurn], report: { ...conversation.report, version: 2, body: '老人原话\n1. 今天吃豆腐后胃不舒服。' } };
@@ -965,9 +1384,31 @@ test('an elder turn can be corrected in its own chat bubble and updates the repo
   assert.match(h.element('voiceConversationStatus').textContent, /原话和报告都已更新/);
 });
 
-test('failed turn correction keeps the newly typed text in the same bubble', async () => {
+test('a saved correction with an invalidated quote shows success and the existing invalid-reference message', async () => {
   const h = harness();
-  const conversation = { conversation_id: 'conversation_test', turns: [{ turn_id: 'turn_00000001', role: 'elder', original_text: '错误的识别', text: '错误的识别', source_kind: 'audio_transcript', version: 1, versions: [] }], report: { version: 1, body: '错误的识别', source_turn_ids: ['turn_00000001'] } };
+  const source={turn_id:'turn_source',role:'elder',text:'旧的合成原话',original_text:'旧的合成原话',source_kind:'elder',record_id:'rec_source',version:1,versions:[]};
+  const assistant={turn_id:'turn_assistant',role:'assistant',text:'合成回复',version:1,superseded:true};
+  const latest={turn_id:'turn_latest',role:'elder',text:'合成追问',source_kind:'audio_transcript',audio_source_status:'user_edited',audio_source_reviewed:true,version:1,
+    quote_context:{turn_id:assistant.turn_id,role:'assistant',version:assistant.version,text:assistant.text},quote_context_valid:false};
+  const conversation={conversation_id:'conversation_test',version:4,turns:[source,assistant,latest],report:{version:1,body:'历史报告'},report_history:[{version:1}]};
+  const corrected={...conversation,version:5,turns:[source,assistant,{...latest,text:'更正后的合成追问',original_text:'更正后的合成追问',version:2,
+    versions:[{version:1,text:latest.text}] }],report:{version:2,body:'更新后的历史报告'},report_history:[{version:1},{version:2}]};
+  h.setApi(async route => {
+    if (route === '/api/media') return { r: { ok: true, status: 200 }, j: { media: [] } };
+    if (route === '/api/media/capabilities') return { r: { ok: true, status: 200 }, j: { capabilities: { enabled: true } } };
+    if (route === '/api/conversations/conversation_test/turns/turn_latest') return { r: { ok: true, status: 200 }, j: { ok:true,quote_context_invalidated:true,conversation:corrected } };
+    throw new Error('unexpected test route ' + route);
+  });
+  h.run(`activeConversation=${JSON.stringify(conversation)};beginVoiceTurnEdit('turn_latest')`);
+  assert.equal(await h.run("saveVoiceTurnEdit('turn_latest','更正后的合成追问')"),true);
+  assert.match(h.element('voiceConversationStatus').textContent,/原话和报告已更新；原引用已失效/);
+  assert.match(h.run("voiceTurnHtml(turnById('turn_latest'))"),/原消息已变化，引用已失效/);
+  assert.equal(h.run("turnById('turn_latest').quote_context.turn_id"),assistant.turn_id,'the UI keeps the historical quote target and does not rebind it');
+});
+
+test('failed latest reviewed audio correction keeps the newly typed text in the same bubble', async () => {
+  const h = harness();
+  const conversation = { conversation_id: 'conversation_test', turns: [{ turn_id: 'turn_00000001', role: 'elder', original_text: '错误的识别', text: '错误的识别', source_kind: 'audio_transcript', audio_source_status: 'user_edited', audio_source_reviewed: true, version: 1, versions: [] }], report: { version: 1, body: '错误的识别', source_turn_ids: ['turn_00000001'] } };
   h.setApi(async (route, options = {}) => {
     if (route === '/api/media') return { r: { ok: true, status: 200 }, j: { media: [] } };
     if (route === '/api/media/capabilities') return { r: { ok: true, status: 200 }, j: { capabilities: { enabled: true } } };

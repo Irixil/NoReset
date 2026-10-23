@@ -99,7 +99,7 @@ test('confirmation needs an existing original and an explicit declaration; it ne
 test('actual media and composer functions persist only the confirmed current version through the real local API',async()=>{
   const h=await harness(),{event:root,media}=await h.create();let event=(await h.revise(root)).j.event;event=(await h.confirm(event)).j.event;
   const mediaSource=fs.readFileSync(require.resolve('../frontend/media.js'),'utf8'),appSource=fs.readFileSync(require.resolve('../frontend/app.js'),'utf8');
-  const ctx=vm.createContext({HealthSafety:safety,crypto:webcrypto,Error,activeConversation:null,saveBusy:false,pendingConversationTurn:null,
+  const ctx=vm.createContext({HealthSafety:safety,crypto:webcrypto,Error,activeConversation:null,saveBusy:false,pendingConversationTurn:null,pendingFollowupTarget:null,handoffSelection:new Set(),
     api:(path,options)=>h.api.request(path,options),mediaRequest:async path=>{const x=await h.api.request(path);if(!x.r.ok)throw Error(x.j.error);return x.j},isMockMedia:()=>false,isMockContent:()=>false,mockText:()=>false,
     startSeparateConversation:async()=>{ctx.activeConversation=await h.start();return true},showView(){},setVoiceStatus(){},setVoiceComposerEnabled(){},renderVoiceConversation(){},syncConversation:c=>{ctx.activeConversation=c},loadEvents:async()=>{},loadConversation:async()=>{},trialVoiceMessage:()=>''});
   vm.runInContext(mediaSource.slice(mediaSource.indexOf('async function currentSavedAudioSource('),mediaSource.indexOf('function showRecognition(')),ctx);
@@ -109,9 +109,9 @@ test('actual media and composer functions persist only the confirmed current ver
   const turn=saved.turns.find(t=>t.role==='elder');assert.equal(turn.text,event.raw_text);assert.equal(turn.record_id,event.record_id);assert.equal(turn.media_id,media.media_id);assert.equal(h.calls.some(c=>c.path.startsWith('/api/ai/')),false);
 });
 test('actual confirmation UI requires checkbox and leaves failed saves unconfirmed without duplicate clicks',async()=>{
-  const app=fs.readFileSync(require.resolve('../frontend/app.js'),'utf8'),elements=new Map();const el=id=>{if(!elements.has(id))elements.set(id,{checked:false,disabled:false,textContent:'',innerHTML:'',classList:{remove(){}}});return elements.get(id)};
+  const app=fs.readFileSync(require.resolve('../frontend/app.js'),'utf8'),elements=new Map();const el=id=>{if(!elements.has(id))elements.set(id,{checked:false,disabled:false,textContent:'',innerHTML:'',querySelector:()=>null,classList:{remove(){}}});return elements.get(id)};
   let resolve,calls=0;const e={record_id:'rec_ui',source_kind:'audio_transcript',state:'inbox',version:1,raw_text:'虚构当前录音文字'};
-  const ctx=vm.createContext({HealthSafety:safety,current:null,activeConversation:null,detailRequestSerial:1,$:el,isMockContent:()=>false,documentNeedsReview:()=>false,audioNeedsReview:safety.audioNeedsReview,safetyBanner(){},detailHtml:()=>'',showAudioOriginals(){},showDocumentOriginals(){},organize(){},review(){},revise(){},historyView(){},toast(){},loadEvents:async()=>{},showDetail:async()=>{},api:async()=>{calls++;return new Promise(r=>resolve=r)}});
+  const ctx=vm.createContext({HealthSafety:safety,current:null,activeConversation:null,detailRequestSerial:1,handoffSelection:new Set(),localMode:true,recordRelationshipsSubjectId:null,activeHealthSubjectId:'subject_self',$:el,isMockContent:()=>false,documentNeedsReview:()=>false,audioNeedsReview:safety.audioNeedsReview,safetyBanner(){},detailHtml:()=>'',showAudioOriginals(){},showDocumentOriginals(){},organize(){},review(){},revise(){},historyView(){},toast(){},loadEvents:async()=>{},showDetail:async()=>{},api:async()=>{calls++;return new Promise(r=>resolve=r)}});
   vm.runInContext(app.slice(app.indexOf('function renderDetail('),app.indexOf('async function loadRelatedHistory(')),ctx);ctx.renderDetail(e);
   await el('audioSourceReviewBtn').onclick();assert.equal(calls,0);
   el('audioSourceReviewCheck').checked=true;el('audioSourceReviewCheck').onchange();const pending=el('audioSourceReviewBtn').onclick();assert.equal(el('audioSourceReviewCheck').disabled,true);

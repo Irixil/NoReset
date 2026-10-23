@@ -235,6 +235,31 @@ test('failed reply persists only an allowlisted failure code, never remote reaso
   assert.equal(JSON.stringify(stopped).includes('untrusted'), false);
 });
 
+test('provider HTTP status is allowlisted and survives conversation reopen', async () => {
+  for (const status of [401, 403, 429]) {
+    const h = await harness();
+    h.setResponse('/api/ai/conversation-turn', { __status: 422, error: 'ai_conversation_failed',
+      failure_code: 'model_http_error', provider_http_status: status,
+      failure_reason: 'do not persist remote explanation', remote_body: 'do not persist remote body' });
+    const conversation = await h.say(await h.start(), '合成核对：网络错误');
+    assert.equal(conversation.turns.at(-1).provider_http_status, status);
+    h.api.lock(); await h.unlock();
+    const reopened = await h.request(`/api/conversations/${conversation.conversation_id}`);
+    assert.equal(reopened.j.conversation.turns.at(-1).provider_http_status, status);
+    assert.equal(JSON.stringify(reopened).includes('do not persist'), false);
+  }
+  const invalid = await harness();
+  invalid.setResponse('/api/ai/conversation-turn', { __status: 422, error: 'ai_conversation_failed',
+    failure_code: 'model_http_error', provider_http_status: 418, remote_body: 'never keep' });
+  const rejected = await invalid.say(await invalid.start(), '合成核对：无效状态');
+  assert.equal(Object.hasOwn(rejected.turns.at(-1), 'provider_http_status'), false);
+  assert.equal(JSON.stringify(rejected).includes('never keep'), false);
+  const mismatched = await harness();
+  mismatched.setResponse('/api/ai/conversation-turn', { __status: 422, error: 'model_timeout', provider_http_status: 429 });
+  const fallback = await mismatched.say(await mismatched.start(), '合成核对：字段不匹配');
+  assert.equal(Object.hasOwn(fallback.turns.at(-1), 'provider_http_status'), false);
+});
+
 test('locking and unlocking a second time re-enables the submit button and retains records', async () => {
   const h = await harness();
   const c = await h.say(await h.start(), '虚构测试记录');
@@ -309,6 +334,7 @@ test('deleting the newest revision removes its full chain and linked image witho
   const deleted = await remove(event.record_id);
   assert.equal(deleted.r.ok, true);
   assert.equal(deleted.j.deleted.record_count, 3);
+  assert.deepEqual(Array.from(deleted.j.deleted.media_ids), [mediaId]);
   for (const recordId of recordIds) {
     assert.equal((await h.api.vault.get(`event:${recordId}`)), undefined);
     assert.equal((await h.api.vault.list(`history:${recordId}:`)).length, 0);
@@ -865,11 +891,10 @@ test('editing an original turn keeps other turns classification-bound across rea
     text: '我今天开始咳嗽。', expected_version: weather.version,
     expected_conversation_version: editedCough.j.conversation.version,
   });
-  assert.equal(editedWeather.r.status, 200);
-  onset = editedWeather.j.conversation.completeness.clinical_state.onset_course;
-  assert.equal(onset.status, 'known', 'editing the classified source permits fresh backend evaluation');
-  assert.deepEqual(Array.from(onset.evidence_turn_ids), [weather.turn_id]);
-  assert.equal(editedWeather.j.conversation.controller.non_health_sources.some(source => source.turn_id === weather.turn_id), false);
+  assert.equal(editedWeather.r.status, 409);
+  assert.equal(editedWeather.j.error, 'turn_not_latest');
+  assert.equal((await h.request(`/api/conversations/${conversation.conversation_id}`)).j.conversation.turns.find(turn => turn.turn_id === weather.turn_id).text,
+    '今天天气晴，我打算去看电影。');
 
   const fresh = await h.start();
   assert.equal(fresh.controller.non_health_sources, undefined, 'a new conversation starts without another session’s markers');
@@ -933,11 +958,18 @@ test('a worry stays a patient question, while sleep and walking answers use thei
   c = await h.say(c, '是酸痛，不红不肿，晚上睡得还好，平地能走');
   c = await h.say(c, '我有点担心，会不会很严重？');
   const patients = c.turns.filter(turn => turn.role === 'elder');
-  const known = ref => ({ status: 'known', evidence_turn_ids: [ref] });
-  await h.api.vault.put('conversation:' + c.conversation_id, { ...c, report: { ...c.report, format_version: 3 }, completeness: { clinical_state: {
-    main_complaint: known(patients[0].turn_id), onset_course: known(patients[0].turn_id),
-    symptom_character: known(patients[1].turn_id), functional_impact: known(patients[1].turn_id),
-  } }, analysis_sources: { turns: patients.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
+  const missing = () => ({ status: 'missing', summary: '', evidence_turn_ids: [], context_ids: [] });
+  const known = (ref, summary) => ({ status: 'known', summary, evidence_turn_ids: [ref], context_ids: [] });
+  const clinical_state = Object.fromEntries(['main_complaint', 'onset_course', 'symptom_character',
+    'aggravating_relieving', 'associated_symptoms', 'functional_impact', 'relevant_history',
+    'prior_actions_results'].map(category => [category, missing()]));
+  clinical_state.main_complaint = known(patients[0].turn_id, '右膝疼');
+  clinical_state.onset_course = known(patients[0].turn_id, '昨天');
+  clinical_state.symptom_character = known(patients[1].turn_id, '酸痛');
+  clinical_state.functional_impact = known(patients[1].turn_id, '晚上睡得还好；平地能走');
+  await h.api.vault.put('conversation:' + c.conversation_id, { ...c, report: { ...c.report, format_version: 3 }, completeness: {
+    ...c.completeness, complete: false, clinical_state,
+  }, analysis_sources: { turns: patients.map(turn => ({ turn_id: turn.turn_id, version: turn.version, quote: turn.text })),
     selected_context_ids: [], context_version: 0, context: [] } });
   const report = (await h.request(`/api/conversations/${c.conversation_id}`)).j.conversation.report;
   const symptoms = report.sections.find(section => section.key === 'symptoms_impact');
@@ -965,7 +997,7 @@ test('an explanation request cannot become a contradictory patient fact in a mig
   assert.ok(report.transcript.some(turn => turn.text === patients[1].text), 'the original explanation request remains in the full transcript');
 });
 
-test('a confirmed natural correction replaces only the manually selected full sentence locally and removes the correction from later model context', async () => {
+test('confirmed natural correction cannot rewrite an older own turn and remains an appended message', async () => {
   const h = await harness();
   const base = await h.start();
   const original = '左手腕抬高会疼。最近端碗和开门都得慢一点。晚上睡觉暂时还没受什么影响。';
@@ -989,58 +1021,14 @@ test('a confirmed natural correction replaces only the manually selected full se
   const result = await h.request(route, { expected_conversation_version: current.version, expected_correction_version: currentCorrection.version,
     target_turn_id: target.turn_id, expected_target_version: currentTarget.version, expected_event_version: event.version,
     old_quote: '晚上睡觉暂时还没受什么影响。', confirmed: true });
-  assert.equal(result.r.status, 200);
-  assert.equal(result.j.model_called, false);
+  assert.equal(result.r.status, 409);
+  assert.equal(result.j.error, 'correction_target_not_latest');
   assert.equal(h.calls.filter(call => call.path === '/api/ai/conversation-turn').length, beforeAi, 'local correction never calls AI');
-  const saved = result.j.conversation;
-  const savedTarget = saved.turns.find(turn => turn.turn_id === target.turn_id);
-  assert.equal(savedTarget.text, '左手腕抬高会疼。最近端碗和开门都得慢一点。昨晚翻身时左手腕疼醒过一次。');
-  assert.equal(savedTarget.version, currentTarget.version + 1);
-  assert.equal(savedTarget.versions.at(-1).text, original);
-  assert.equal(saved.turns.find(turn => turn.turn_id === correction.turn_id).superseded, true);
-  assert.equal(saved.turns.find(turn => turn.turn_id === 'assistant-pending').superseded, true);
-  assert.equal(saved.completeness, null);
-  assert.equal(saved.manual_correction_analysis_pending, true);
-  assert.equal(saved.report.status_label, '原话已修订 · 自动整理待更新');
-  assert.match(saved.report.body, /自动整理待更新/);
-  assert.match(saved.report.body, /使用者确认的原话修订（不代表医学结论）/);
-  assert.match(saved.report.body, /文字修订，不代表医学判断/);
-  assert.match(saved.report.body, /晚上睡觉暂时还没受什么影响。/);
-  assert.match(saved.report.body, /昨晚翻身时左手腕疼醒过一次。/);
-  assert.match(saved.report.body, /更正一下，刚才说晚上睡觉没受影响不准确/);
-  assert.match(saved.report.body, /端碗和开门都得慢一点/);
-  const updatedEvent = (await h.request(`/api/events/${event.record_id}`)).j.event;
-  assert.equal(updatedEvent.raw_text, savedTarget.text);
-  assert.equal(updatedEvent.version, event.version + 1);
-
-  h.setResponse('/api/ai/conversation-turn', { action: 'reply', assistant_text: '我记下了。', provider: 'SyntheticTestProvider',
-    completeness: { clinical_state: { functional_impact: { status: 'known',
-      summary: '最近端碗和开门都得慢一点；昨晚翻身时左手腕疼醒过一次', evidence_turn_ids: [target.turn_id], context_ids: [] } },
-      relevant_context_ids: [], contradictions: [], unknowns: [] } });
-  const laterEdit = await h.request(`/api/conversations/${base.conversation_id}/turns/${target.turn_id}`, {
-    text: `${savedTarget.text} 后来又补充了一句。`, expected_version: savedTarget.version,
-    expected_conversation_version: saved.version,
-  });
-  assert.equal(laterEdit.r.status, 200);
-  const laterHistory = laterEdit.j.conversation.report.sections.find(section => section.key === 'correction_history').lines[0];
-  assert.match(laterHistory.text, /本次修订后的原句（第 2 版）/);
-  assert.doesNotMatch(laterHistory.text, /本人选择后的当前原话/);
-  assert.match(laterHistory.source_versions.find(version => version.version === 2).quote, /昨晚翻身时左手腕疼醒过一次/);
-
-  const added = await h.say(laterEdit.j.conversation, '还有一点不舒服。');
-  assert.equal(added.report.status_label, '自动整理 · 本人未核对');
-  const impact = added.report.sections.find(section => section.key === 'symptoms_impact').lines.find(line => line.kind === 'summary');
-  assert.match(impact.text, /端碗和开门都得慢一点/);
-  assert.match(impact.text, /昨晚翻身时左手腕疼醒过一次/);
-  assert.doesNotMatch(impact.text, /睡觉暂时还没受什么影响/);
-  assert.equal(impact.source_versions[0].version, 3);
-  const modelCall = h.calls.filter(call => call.path === '/api/ai/conversation-turn').at(-1);
-  const payload = JSON.parse(modelCall.body);
-  assert.ok(payload.turns.some(turn => turn.text.includes('最近端碗和开门都得慢一点')));
-  assert.ok(payload.turns.some(turn => turn.text.includes('昨晚翻身时左手腕疼醒过一次')));
-  assert.ok(payload.turns.some(turn => turn.text === '还有一点不舒服。'));
-  assert.equal(payload.turns.some(turn => turn.text === correctionText), false);
-  assert.ok(added.turns.find(turn => turn.turn_id === correction.turn_id).superseded);
+  const after = (await h.request(`/api/conversations/${base.conversation_id}`)).j.conversation;
+  assert.equal(after.turns.find(turn => turn.turn_id === target.turn_id).text, original);
+  assert.equal(after.turns.find(turn => turn.turn_id === correction.turn_id).text, correctionText);
+  assert.equal(after.turns.find(turn => turn.turn_id === correction.turn_id).superseded, undefined);
+  assert.equal((await h.request(`/api/events/${event.record_id}`)).j.event.raw_text, original);
 });
 
 test('confirmed correction route rejects guessed replacement text, missing confirmation, stale versions, and non-sentence targets', async () => {
@@ -1069,7 +1057,7 @@ test('confirmed correction route rejects guessed replacement text, missing confi
   assert.equal((await h.request(`/api/events/${event.record_id}`)).j.event.raw_text, text);
 });
 
-test('a failed correction transaction is atomic and a different active subject cannot read or apply it', async () => {
+test('an older-turn correction is rejected without writes and a different active subject cannot apply it', async () => {
   const h = await harness();
   const base = await h.start();
   const text = '昨天左手腕疼。';
@@ -1086,13 +1074,10 @@ test('a failed correction transaction is atomic and a different active subject c
     target_turn_id: target.turn_id, expected_target_version: target.version, expected_event_version: event.version,
     old_quote: text, confirmed: true };
   const path = `/api/conversations/${base.conversation_id}/corrections/${correction.turn_id}`;
-  const driver = h.api.vault.driver, mutate = driver.mutateDocs.bind(driver);
-  driver.mutateDocs = async () => { throw Object.assign(new Error('synthetic transaction abort'), { name: 'AbortError' }); };
   const failed = await h.request(path, payload);
-  assert.equal(failed.j.error, 'correction_save_failed');
+  assert.equal(failed.j.error, 'correction_target_not_latest');
   assert.equal((await h.api.vault.get(`conversation:${base.conversation_id}`)).turns.find(turn => turn.turn_id === target.turn_id).text, text);
   assert.equal((await h.api.vault.get(`event:${event.record_id}`)).raw_text, text);
-  driver.mutateDocs = mutate;
 
   const registry = (await h.request('/api/health-subjects')).j;
   const created = await h.request('/api/health-subjects', { label: '虚构家属校验', relationship: 'family', expected_version: registry.version });

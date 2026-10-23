@@ -27,16 +27,22 @@ async function prepared(scenario="N03"){
   if(scenario==='N01')await h.api.vault.put('event:'+event.record_id,reviewed);assert.equal(reviewed.version,sourceVersion);
   const previous=reviewedAsr?{review_required:true,state:'stopped',source_kind:'audio_transcript',conversation_id:null,turn_id:'turn_old_asr',turn_version:1,media_id:'media_'+ 'c'.repeat(32),asr_trial_receipt_id:'old-receipt',asr_trial_receipt_sha256:'c'.repeat(64)}:{review_required:true,state:'review_required',media_id:media.media_id,conversation_id:null};await h.api.vault.put('trial-control:voice',previous);
   const c=(await h.request('/api/conversations/start',{mode:'new',local_date:'2026-10-10'})).j.conversation,gid='a'.repeat(32);
-  const payload={subject_id:'subject_self',turns:[{turn_id:'turn_saved_audio_'+gid,text,version:1,responding_to:{turn_id:'turn_saved_audio_opening_'+gid,text:c.turns[0].text}}],controller:c.controller,health_context:[]};
+  const payload={subject_id:'subject_self',turns:[{turn_id:'turn_saved_audio_'+gid,text,version:1,source:{kind:'audio_transcript',status:'original_comparison',record_id:reviewed.record_id,record_version:sourceVersion,media_id:media.media_id,media_version:media.version},responding_to:{turn_id:'turn_saved_audio_opening_'+gid,text:c.turns[0].text}}],controller:c.controller,health_context:[]};
   control.grant={schema_version:reviewedAsr?'noreset-reviewed-asr-saved-audio-llm-v1':scenario==='N01'?'noreset-n01-saved-audio-llm-v1':scenario==='N01Reviewed'?'noreset-n01-saved-audio-llm-reviewed-v2':scenario==='N03Reviewed'?'noreset-n03-cough-reviewed-saved-audio-llm-v1':'noreset-n03-saved-audio-llm-v1',grant_id:gid,receipt_sha256:'b'.repeat(64),expires_at:new Date(Date.now()+600000).toISOString(),requests:1,retries:0,
     source:{media_id:media.media_id,media_version:media.version,record_id:reviewed.record_id,source_version:sourceVersion,subject_id:'subject_self',text_sha256:sha(text),confirmed_at:reviewed.source_review.confirmed_at,audio_sha256:sha(Buffer.from([1,2,3]))},prior_media_control:media.trial_control,prior_global_control:previous,http_payload_sha256:sha(JSON.stringify(payload))};
   const input={media_id:media.media_id,media_version:media.version,record_id:reviewed.record_id,source_version:sourceVersion,local_date:'2026-10-10'};
   return {...h,media,event:reviewed,previous,input,payload,start:()=>h.request('/api/conversations/saved-audio-trial/start',input)};
 }
+async function assertMediaUnchanged(h){
+  const {delete_eligibility:_derived,...expected}=h.media;
+  assert.deepEqual(await h.api.vault.get('media:'+h.media.media_id),expected,'trial dispatch must not rewrite persisted media');
+  const reread=(await h.request('/api/media/'+h.media.media_id)).j.media;
+  assert.deepEqual(JSON.parse(JSON.stringify(reread.delete_eligibility)),{allowed:false,reason:'trial_controlled'},'read-time deletion eligibility is derived, not persisted');
+}
 test('new independent grant sends only corrected current source once; old stop, ASR, link and original remain intact',async()=>{
   const h=await prepared(),x=await h.start();assert.equal(x.r.status,201,JSON.stringify(x.j));assert.equal(x.j.ai_failed,false);assert.equal(h.ai().length,1);
   assert.deepEqual(JSON.parse(h.ai()[0].body),JSON.parse(JSON.stringify(h.payload)));assert.equal(h.ai()[0].headers['X-NoReset-Saved-Audio-Trial'],h.control.grant.grant_id);
-  assert.deepEqual(await h.api.vault.get('trial-control:voice'),h.previous);assert.deepEqual(JSON.parse(JSON.stringify(await h.api.vault.get('media:'+h.media.media_id))),JSON.parse(JSON.stringify(h.media)));
+  assert.deepEqual(await h.api.vault.get('trial-control:voice'),h.previous);await assertMediaUnchanged(h);
   assert.equal(x.j.conversation.saved_audio_trial.state,'completed');assert.equal((await h.start()).j.created,false);assert.equal(h.ai().length,1);
   const fresh=await realm(h.driver,h.control);assert.equal((await fresh.request('/api/conversations/saved-audio-trial/start',h.input)).j.created,false);assert.equal(fresh.ai().length,0);
   assert.match(x.j.conversation.report.body,/上腹/);assert.doesNotMatch(x.j.conversation.report.body,/上妇/);
@@ -70,7 +76,7 @@ test('reviewed ASR schema dispatches the exact current source while preserving d
     const x=await h.start();assert.equal(x.r.status,201,JSON.stringify(x.j));assert.equal(h.ai().length,1);
     assert.deepEqual(JSON.parse(h.ai()[0].body),JSON.parse(JSON.stringify(h.payload)));
     assert.deepEqual(await h.api.vault.get('event:'+h.event.record_id),before);
-    assert.deepEqual(JSON.parse(JSON.stringify(await h.api.vault.get('media:'+h.media.media_id))),JSON.parse(JSON.stringify(h.media)));
+    await assertMediaUnchanged(h);
     assert.deepEqual(await h.api.vault.get('trial-control:voice'),h.previous);
     assert.equal(await h.api.vault.get('saved-audio-trial:'+h.control.grant.grant_id).then(claim=>claim.state),'completed');
     const restarted=await realm(h.driver,h.control);await restarted.request('/api/conversations/saved-audio-trial/start',h.input);assert.equal(restarted.ai().length,0);
@@ -214,7 +220,7 @@ test('N01 normal source-review advances to v2 and its exact independent grant di
   assert.equal(x.j.conversation.saved_audio_trial.source_version,2);
   assert.deepEqual(await h.api.vault.get('event:'+h.event.record_id),before);
   assert.deepEqual(await h.api.vault.get('trial-control:voice'),h.previous);
-  assert.deepEqual(JSON.parse(JSON.stringify(await h.api.vault.get('media:'+h.media.media_id))),JSON.parse(JSON.stringify(h.media)));
+  await assertMediaUnchanged(h);
   const restarted=await realm(h.driver,h.control);await restarted.request('/api/conversations/saved-audio-trial/start',h.input);assert.equal(restarted.ai().length,0);
 });
 for(const drift of ['version1','version3','schema','confirmation','unreviewed'])test('N01 reviewed v2 '+drift+' cannot dispatch',async()=>{
@@ -318,7 +324,7 @@ test('actual reviewed audio backup restores in isolated memory and reaches only 
     const c=(await h.request('/api/conversations/start',{mode:'new',local_date:'2026-10-18'})).j.conversation;
     const grantId=webcrypto.randomUUID().replaceAll('-','');
     const contexts=(c.health_context||[]).map(item=>{const {legacy_entry,...value}=item;if(legacy_entry&&value.temporal_status==null)delete value.temporal_status;return value});
-    const payload={subject_id:c.subject_id,turns:[{turn_id:'turn_saved_audio_'+grantId,text:event.raw_text,version:1,responding_to:{turn_id:'turn_saved_audio_opening_'+grantId,text:c.turns[0].text}}],controller:c.controller,health_context:contexts};
+    const payload={subject_id:c.subject_id,turns:[{turn_id:'turn_saved_audio_'+grantId,text:event.raw_text,version:1,source:{kind:'audio_transcript',status:'original_comparison',record_id:event.record_id,record_version:event.version,media_id:media.media_id,media_version:media.version},responding_to:{turn_id:'turn_saved_audio_opening_'+grantId,text:c.turns[0].text}}],controller:c.controller,health_context:contexts};
     const original=await h.api.vault.get('media-binary:'+mediaId);
     h.control.grant={schema_version:'noreset-reviewed-asr-saved-audio-llm-v1',grant_id:grantId,receipt_sha256:'b'.repeat(64),expires_at:new Date(Date.now()+600000).toISOString(),requests:1,retries:0,
       source:{media_id:mediaId,media_version:media.version,record_id:recordId,source_version:event.version,subject_id:'subject_self',text_sha256:sha(event.raw_text),confirmed_at:event.source_review.confirmed_at,audio_sha256:sha(Buffer.from(original.bytes))},

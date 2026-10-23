@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const { webcrypto } = require('node:crypto');
 const core = require('../frontend/local-store-core.js');
 const safety = require('../frontend/safety.js');
+const appSource = fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8');
 const password = 'synthetic pending questions vault only';
 const questions = ['这几天有没有发热？', '这几天有没有气短？', '这几天有没有胸口不舒服？'];
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -94,6 +95,265 @@ function assertPending(c, expected) {
     assert.ok(c.report.sections.find(section => section.key === 'verification').lines.includes(line));
   }
 }
+
+test('a selected earlier assistant reply is bound as versioned context without entering the elder utterance', async () => {
+  const h = await harness();
+  h.setResponse(payload => reply(payload, questions, 'ask'));
+  let c = await h.say(await h.start(), '纯虚构：咳嗽三天。');
+  const assistants = c.turns.filter(turn => turn.role === 'assistant' && !turn.superseded);
+  const target = assistants[0];
+  assert.notEqual(target.turn_id, assistants.at(-1).turn_id, 'the selected reply is older than the latest assistant turn');
+  const elderText = '我想追问刚才说的持续时间。';
+  let sent;
+  h.setResponse(payload => { sent = plain(payload); return reply(payload, questions, 'reply'); });
+  const saved = (await h.request(`/api/conversations/${c.conversation_id}/turns`, {
+    text: elderText, expected_version: c.version,
+    responding_to: { turn_id: target.turn_id, version: target.version, text: target.text },
+  })).conversation;
+  const newElderTurn = saved.turns.filter(turn => turn.role === 'elder').at(-1);
+  assert.equal(newElderTurn.text, elderText);
+  assert.equal(newElderTurn.original_text, elderText);
+  assert.deepEqual(plain(newElderTurn.responding_to), { turn_id: target.turn_id, text: target.text });
+  assert.equal(newElderTurn.responding_to_version, target.version);
+  assert.equal(sent.turns.at(-1).text, elderText);
+  assert.equal(sent.turns.at(-1).responding_to.turn_id, target.turn_id);
+  assert.equal(sent.turns.at(-1).responding_to.text, target.text);
+  const event = (await h.request(`/api/events/${newElderTurn.record_id}`)).event;
+  assert.equal(event.raw_text, elderText, 'the assistant quote is context only, not copied into the patient record');
+});
+
+test('a stale or context-invalidated selected reply is rejected before saving a new patient event', async () => {
+  const h = await harness();
+  h.setResponse(payload => reply(payload, questions, 'ask'));
+  let c = await h.say(await h.start(), '纯虚构：咳嗽三天。');
+  const target = c.turns.find(turn => turn.role === 'assistant' && !turn.superseded);
+  const endpoint = `/api/conversations/${c.conversation_id}/turns`;
+  const request = responding_to => h.api.request(endpoint, { method: 'POST',
+    headers: { 'Idempotency-Key': webcrypto.randomUUID() },
+    body: JSON.stringify({ text: '我想再问一次。', expected_version: c.version, responding_to }),
+  });
+  const modelCalls = h.calls.length;
+  let result = await request({ turn_id: target.turn_id, version: target.version + 1, text: target.text });
+  assert.equal(result.r.status, 409);
+  assert.equal(result.j.error, 'followup_target_stale');
+  assert.equal(h.calls.length, modelCalls, 'a stale target does not invoke model processing');
+  await h.api.vault.put(`conversation:${c.conversation_id}`, { ...c, stale_responding_to_turn_ids: [target.turn_id] });
+  result = await request({ turn_id: target.turn_id, version: target.version, text: target.text });
+  assert.equal(result.r.status, 409);
+  assert.equal(result.j.error, 'followup_target_context_changed');
+  assert.equal(h.calls.length, modelCalls, 'an invalidated target is rejected before reply generation');
+  const events = await h.api.request('/api/events');
+  assert.equal(events.j.events.some(event => event.raw_text === '我想再问一次。'), false);
+});
+
+test('selected-reply metadata cannot enter private saved-audio or trial-controlled conversations', async () => {
+  const h = await harness();
+  h.setResponse(payload => reply(payload, questions, 'ask'));
+  const c = await h.say(await h.start(), '纯虚构：咳嗽三天。');
+  const target = c.turns.find(turn => turn.role === 'assistant' && !turn.superseded);
+  const gated = { ...c, saved_audio_trial: { state: 'completed', grant_id: 'synthetic-private-trial' } };
+  await h.api.vault.put(`conversation:${c.conversation_id}`, gated);
+  const before = h.calls.length;
+  const result = await h.api.request(`/api/conversations/${c.conversation_id}/turns`, { method: 'POST',
+    headers: { 'Idempotency-Key': webcrypto.randomUUID() },
+    body: JSON.stringify({ text: '不应进入单次试验的追问。', expected_version: c.version,
+      responding_to: { turn_id: target.turn_id, version: target.version, text: target.text } }),
+  });
+  assert.equal(result.r.status, 409);
+  assert.equal(result.j.error, 'followup_target_not_allowed');
+  assert.equal(h.calls.length, before);
+});
+
+test('message actions keep assistant follow-up separate and make only the elder quote editable', () => {
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { textContent: '', value: '', placeholder: '打字说，或者点麦克风',
+      dataset: {}, focused: false, classList: { add() { this.added = true; }, remove() { this.removed = true; }, toggle() {} },
+      focus() { this.focused = true; }, setSelectionRange(start, end) { this.selection = [start, end]; }, dispatchEvent() {} });
+    return elements.get(id);
+  };
+  const conversation = { conversation_id: 'conversation_synthetic', subject_id: 'subject_self', selected_context_ids: [],
+    health_context: [], turns: [
+      { turn_id: 'assistant_old', role: 'assistant', action: 'reply', version: 2, text: '请告诉我咳嗽从什么时候开始？' },
+      { turn_id: 'elder_old', role: 'elder', source_kind: 'elder', version: 1, text: '刚才说的原话。' },
+      { turn_id: 'assistant_latest', role: 'assistant', action: 'reply', version: 1, text: '我已经记下了。' },
+    ] };
+  const context = vm.createContext({ activeConversation: conversation, pendingFollowupTarget: null, $: element, Event: class Event { constructor(type) { this.type = type; } },
+    isMockContent: turn => turn?.is_mock === true, setVoiceComposerEnabled() {}, setVoiceStatus(text) { element('status').textContent = text; },
+    escapeHtml: value => String(value), innerWidth: 800, innerHeight: 800,
+    document: { addEventListener() {}, querySelector: () => null },
+  });
+  const start = appSource.indexOf('function closeVoiceTurnMenu('), end = appSource.indexOf('function openVoiceTurnMenu(', start);
+  vm.runInContext(appSource.slice(start, end), context);
+  assert.equal(vm.runInContext("selectVoiceFollowupTarget('assistant_old')", context), true);
+  assert.equal(element('voiceTextInput').value, '', 'assistant wording is not inserted into patient input');
+  assert.doesNotMatch(element('voiceFollowupReferenceText').textContent, /第 2 版/);
+  assert.equal(vm.runInContext('pendingFollowupTarget.version', context), 2, 'the selected source version stays bound without a permanent label');
+  assert.equal(element('voiceTextInput').focused, true);
+  assert.equal(vm.runInContext("selectVoiceSupplement('elder_old')", context), true);
+  assert.match(element('voiceTextInput').value, /补充我刚才说的原话：“刚才说的原话。”/);
+  assert.doesNotMatch(element('voiceTextInput').value, /我已经记下了/);
+  assert.equal(element('voiceFollowupReference').classList.added, true);
+});
+
+function voiceFollowupUiHarness(){
+  const elements=new Map(),apiCalls=[];
+  const element=id=>{
+    if(!elements.has(id))elements.set(id,{value:'',textContent:'',placeholder:'打字说，或者点麦克风',dataset:{},style:{},
+      classList:{hidden:id==='voiceFollowupReference',add(name){if(name==='hidden')this.hidden=true},remove(name){if(name==='hidden')this.hidden=false},toggle(name,force){this.hidden=force}},
+      focus(){},setSelectionRange(){},dispatchEvent(){}});
+    return elements.get(id);
+  };
+  const oldReply={turn_id:'assistant_old',role:'assistant',action:'ask',version:2,text:'旧回复：请告诉我持续了几天？',model_context_ids:[]};
+  const currentReply={turn_id:'assistant_current',role:'assistant',action:'reply',version:1,text:'新回复：我记下了。',model_context_ids:[]};
+  const elderMessage={turn_id:'elder_old',role:'elder',source_kind:'elder',version:1,text:'我这几天不舒服。'};
+  const initial={conversation_id:'conversation_followup_ui',subject_id:'subject_self',version:4,status:'active',
+    selected_context_ids:['context_keep'],health_context:[{context_id:'context_keep'}],turns:[oldReply,currentReply,elderMessage]};
+  const context=vm.createContext({activeConversation:initial,pendingFollowupTarget:null,activeHealthSubjectId:'subject_self',
+    healthSubjectSwitchBusy:false,healthSubjectChanged:false,healthSubjectUiEpoch:0,saveBusy:false,pendingConversationTurn:null,window:{dispatchEvent(){}},
+    pendingCorrectionReview:null,pendingMediaRetry:null,conversationEditingTurnId:null,voicePermissionGeneration:0,lastSpokenTurnId:null,
+    crypto:webcrypto,speechSynthesis:{cancel(){}},setTimeout,clearTimeout,$ : element,
+    document:{querySelector:()=>null},Event:class Event{constructor(type){this.type=type}},
+    isMockContent:turn=>turn?.is_mock===true,renderVoiceConversation(){},renderConversationReport(){},updateHealthContextButton(){},
+    setVoiceComposerEnabled(){},updateHealthSubjectLabels(){},speakAssistant(){},setVoiceStatus(text){element('voiceConversationStatus').textContent=text},
+    async loadEvents(){},async api(path,options={}){
+      apiCalls.push({path,options,body:options.body?JSON.parse(options.body):null});
+      const saved={...context.activeConversation,version:context.activeConversation.version+1,
+        turns:[...context.activeConversation.turns,{turn_id:'elder_sent',role:'elder',text:context.activeConversationDraft||'',version:1},
+          {turn_id:'assistant_after_send',role:'assistant',action:'reply',text:'已收到。',version:1}]};
+      return {r:{ok:true,status:200},j:{conversation:saved,ai_failed:false}};
+    },
+  });
+  const followupStart=appSource.indexOf('function followupTargetTurn('),followupEnd=appSource.indexOf('function openVoiceTurnMenu(',followupStart);
+  vm.runInContext(appSource.slice(followupStart,followupEnd),context);
+  const syncStart=appSource.indexOf('function syncConversation('),syncEnd=appSource.indexOf('function conversationHasPendingReply(',syncStart);
+  vm.runInContext(appSource.slice(syncStart,syncEnd),context);
+  const sendStart=appSource.indexOf('async function submitConversationText('),sendEnd=appSource.indexOf('function escapeHtml(',sendStart);
+  vm.runInContext(appSource.slice(sendStart,sendEnd),context);
+  return {context,elements,apiCalls,initial,oldReply,currentReply,elderMessage};
+}
+
+test('same-conversation sync preserves invalid reply references and repeated sends make no request',async t=>{
+  const changes={
+    superseded(conversation,target){target.superseded=true},
+    version_changed(conversation,target){target.version++},
+    background_revoked(conversation,target){target.model_context_ids=['context_keep'];conversation.selected_context_ids=[];conversation.health_context=[]},
+  };
+  for(const [name,change] of Object.entries(changes))await t.test(name,async()=>{
+    const h=voiceFollowupUiHarness(),draft='我想追问：还会不会咳？';
+    assert.equal(h.context.selectVoiceFollowupTarget(h.oldReply.turn_id),true);
+    h.elements.get('voiceTextInput').value=draft;
+    const updated=plain(h.initial);change(updated,updated.turns[0]);updated.version++;
+    assert.equal(h.context.syncConversation(updated,{speak:false}),true);
+    assert.equal(h.context.pendingFollowupTarget.invalid,true,'target stays bound but becomes invalid');
+    assert.equal(h.elements.get('voiceFollowupReference').classList.hidden,false);
+    assert.match(h.elements.get('voiceFollowupReferenceText').textContent,/原话已变化/);
+    assert.equal(h.elements.get('voiceTextInput').value,draft,'assistant wording never enters patient draft');
+    await h.context.saveVoiceSupplement();
+    await h.context.saveVoiceSupplement();
+    assert.equal(h.apiCalls.length,0,'two consecutive send attempts are stopped before any request');
+    assert.equal(h.elements.get('voiceTextInput').value,draft);
+    assert.equal(h.context.pendingFollowupTarget.invalid,true);
+  });
+});
+
+test('cancel or reselect explicitly releases an invalid reply reference before sending',async()=>{
+  const cancelled=voiceFollowupUiHarness(),cancelDraft='我想补充这句。';
+  assert.equal(cancelled.context.selectVoiceFollowupTarget(cancelled.oldReply.turn_id),true);
+  cancelled.elements.get('voiceTextInput').value=cancelDraft;
+  const stale=plain(cancelled.initial);stale.turns[0].superseded=true;stale.version++;
+  cancelled.context.syncConversation(stale,{speak:false});
+  await cancelled.context.saveVoiceSupplement();
+  assert.equal(cancelled.apiCalls.length,0);
+  cancelled.context.clearVoiceFollowupTarget();
+  assert.equal(cancelled.context.pendingFollowupTarget,null);
+  await cancelled.context.saveVoiceSupplement();
+  assert.equal(cancelled.apiCalls.length,1,'explicit cancellation permits an ordinary send');
+  assert.equal(cancelled.apiCalls[0].body.quote_ref,undefined);
+  assert.equal(cancelled.apiCalls[0].body.text,cancelDraft);
+
+  const reselected=voiceFollowupUiHarness(),reselectedDraft='我想继续追问新回复。';
+  assert.equal(reselected.context.selectVoiceFollowupTarget(reselected.oldReply.turn_id),true);
+  reselected.elements.get('voiceTextInput').value=reselectedDraft;
+  const refreshed=plain(reselected.initial);refreshed.turns[0].version++;refreshed.version++;
+  reselected.context.syncConversation(refreshed,{speak:false});
+  await reselected.context.saveVoiceSupplement();
+  assert.equal(reselected.apiCalls.length,0);
+  assert.equal(reselected.context.selectVoiceFollowupTarget(reselected.currentReply.turn_id),true);
+  assert.equal(reselected.elements.get('voiceTextInput').value,reselectedDraft);
+  assert.equal(reselected.elements.get('voiceTextInput').value.includes(reselected.oldReply.text),false);
+  await reselected.context.saveVoiceSupplement();
+  assert.equal(reselected.apiCalls.length,1,'explicit re-selection permits a bound follow-up');
+  assert.deepEqual(plain(reselected.apiCalls[0].body.quote_ref),{
+    turn_id:reselected.currentReply.turn_id,version:reselected.currentReply.version,
+  });
+  assert.equal(reselected.apiCalls[0].body.text,reselectedDraft);
+});
+
+test('switching conversation or owner clears the prior reply reference',()=>{
+  const h=voiceFollowupUiHarness();
+  assert.equal(h.context.selectVoiceFollowupTarget(h.oldReply.turn_id),true);
+  const other=plain(h.initial);other.conversation_id='conversation_other';other.version++;
+  h.context.syncConversation(other,{speak:false});
+  assert.equal(h.context.pendingFollowupTarget,null);
+  assert.equal(h.elements.get('voiceFollowupReference').classList.hidden,true);
+  assert.equal(h.context.selectVoiceFollowupTarget(h.oldReply.turn_id),true);
+  const differentOwner=plain(other);differentOwner.subject_id='subject_family';
+  h.context.syncConversation(differentOwner,{speak:false});
+  assert.equal(h.context.pendingFollowupTarget,null);
+  assert.equal(h.elements.get('voiceFollowupReference').classList.hidden,true);
+});
+
+test('own and assistant messages can be quoted without putting quoted text in the draft or legacy answer binding',async()=>{
+  const h=voiceFollowupUiHarness(),draft='我想问这句话是什么意思。';
+  assert.equal(h.apiCalls.length,0);
+  assert.equal(h.context.selectVoiceFollowupTarget('elder_old'),true,'the elder message can be quoted');
+  assert.equal(h.elements.get('voiceTextInput').value,'','selecting a quote does not edit the draft');
+  h.elements.get('voiceTextInput').value=draft;h.context.activeConversationDraft=draft;
+  await h.context.saveVoiceSupplement();
+  assert.equal(h.apiCalls.length,1);
+  assert.deepEqual(plain(h.apiCalls[0].body.quote_ref),{turn_id:'elder_old',version:1});
+  assert.equal(h.apiCalls[0].body.responding_to,undefined);
+  assert.equal(h.apiCalls[0].body.text,draft);
+
+  const shortcut=voiceFollowupUiHarness();
+  assert.equal(shortcut.context.selectVoiceFollowupTarget(shortcut.oldReply.turn_id),true);
+  assert.equal(shortcut.apiCalls.length,0,'selecting the quote alone never calls the model');
+  shortcut.elements.get('voiceTextInput').value='我还没发送的草稿';
+  await shortcut.context.sendVoiceQuoteShortcut('解释一下');
+  assert.equal(shortcut.apiCalls.length,1,'the explicit shortcut click sends exactly once');
+  assert.deepEqual(plain(shortcut.apiCalls[0].body.quote_ref),{turn_id:shortcut.oldReply.turn_id,version:shortcut.oldReply.version});
+  assert.equal(shortcut.apiCalls[0].body.text,'解释一下');
+  assert.equal(shortcut.elements.get('voiceTextInput').value,'我还没发送的草稿','sending a shortcut preserves the separate unsent draft');
+});
+
+test('copy and replay restore focus to the originating message after the menu closes', async () => {
+  for (const action of ['copy', 'replay']) {
+    let menuActions = [], copied = 0, replayed = 0, focused = 0;
+    const turn = { turn_id: 'assistant_focus', role: 'assistant', action: 'reply', text: '请告诉我持续了几天？', version: 1 };
+    const node = { dataset: { voiceTurn: turn.turn_id }, isConnected: true, focus() { focused++; } };
+    const button = turnAction => ({ dataset: { turnMenuAction: turnAction }, focus() {}, onclick: null });
+    const menu = { classList: { add() {}, remove() {}, contains: () => false }, style: {},
+      replaceChildren() { menuActions = []; }, getBoundingClientRect: () => ({ width: 100, height: 60 }),
+      querySelectorAll: () => menuActions, querySelector: () => ({ focus() {} }) };
+    Object.defineProperty(menu, 'innerHTML', { set(value) {
+      menuActions = [...value.matchAll(/data-turn-menu-action="([^"]+)"/g)].map(match => button(match[1]));
+    } });
+    const context = vm.createContext({ activeConversation: { turns: [turn] }, pendingFollowupTarget: null,
+      voiceTurnMenuFocus: null, $: id => id === 'voiceTurnMenu' ? menu : null,
+      turnById: id => id === turn.turn_id ? turn : null, isMockContent: () => false,
+      followupTargetTurn: () => turn, voiceSupplementTurn: () => false,
+      innerWidth: 800, innerHeight: 800, navigator: { clipboard: { writeText: async () => { copied++; } } },
+      toast() {}, speakAssistant: () => { replayed++; }, document: {} });
+    const start = appSource.indexOf('function closeVoiceTurnMenu('), end = appSource.indexOf('function bindVoiceTurnMenus(', start);
+    vm.runInContext(appSource.slice(start, end), context);
+    context.openVoiceTurnMenu(node, 20, 20);
+    await menuActions.find(item => item.dataset.turnMenuAction === action).onclick();
+    assert.equal(focused, 1, `${action} restores focus to the original message`);
+    assert.equal(copied, action === 'copy' ? 1 : 0);
+    assert.equal(replayed, action === 'replay' ? 1 : 0);
+  }
+});
 
 test('candidate history persists and transfers while doctor pending questions decrease 2 → 1 → 0', async () => {
   const h = await harness();

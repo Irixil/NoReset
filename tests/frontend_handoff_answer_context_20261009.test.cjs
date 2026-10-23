@@ -154,22 +154,24 @@ test('current danger resolves its literal saved topic only and keeps the other t
   assert.equal(h.calls.length, calls);
 });
 
-test('actual fever No then current danger leaves only chest; editing that answer to unknown v2 reopens fever', async () => {
+test('an older fever answer cannot be edited after a newer danger turn; all saved state stays intact', async () => {
   const h = await harness();
   let c = await feverNo(h, await initial(h));
   const no = c.turns.find(turn => turn.role === 'elder' && turn.text === '没有。');
-  const nomination = plain(coverage(c).candidates[0].nomination);
   const calls = h.calls.length;
   c = await h.say(c, '我现在喘不上气，结束吧。');
   assertPending(c, [questions[2]]);
-  c = (await h.request(`/api/conversations/${c.conversation_id}/turns/${no.turn_id}/edit`, { text: '不知道。', expected_version: no.version, expected_conversation_version: c.version })).conversation;
-  assert.equal(c.turns.find(turn => turn.turn_id === no.turn_id).version, 2);
-  assert.equal(c.completeness, null);
-  assertPending(c, [questions[0], questions[2]]);
-  assert.deepEqual(plain(coverage(c).candidates[0].nomination), nomination, 'Answer edits do not rebind nomination anchors');
-  assert.deepEqual(plain(coverage(c).resolved_questions.map(item => item.question)), [questions[1]]);
-  assert.equal(coverage(c).sources.turns.find(turn => turn.turn_id === no.turn_id).quote, '不知道。');
-  assert.equal(shortPairs(c).find(pair => pair.source_turn_ids.includes(no.turn_id)).text, '不知道。');
+  const before = await h.read(c), priorNo = plain(before.turns.find(turn => turn.turn_id === no.turn_id));
+  const refused = await h.api.request(`/api/conversations/${c.conversation_id}/turns/${no.turn_id}/edit`, {
+    method: 'POST', headers: { 'Idempotency-Key': webcrypto.randomUUID() },
+    body: JSON.stringify({ text: '不知道。', expected_version: no.version, expected_conversation_version: before.version }),
+  });
+  assert.equal(refused.r.status, 409);
+  assert.equal(refused.j.error, 'turn_not_latest');
+  const after = await h.read(before);
+  assert.deepEqual(plain(after), plain(before), 'rejected edit must preserve conversation, report and later turns');
+  assert.deepEqual(plain(after.turns.find(turn => turn.turn_id === no.turn_id)), priorNo, 'the earlier answer and version remain unchanged');
+  assertPending(after, [questions[2]]);
   assert.equal(h.calls.length, calls);
 });
 

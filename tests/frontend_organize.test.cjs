@@ -46,7 +46,7 @@ async function harness(initial) {
     }
     return elements.get(id);
   }
-  for (const id of ['modePill', 'toast', 'homeRecent', 'eventsList', 'archiveEvents', 'detail', 'dangerBanner', 'recordBtn', 'saveBtn', 'refreshBtn', 'handoffBtn', 'rawText']) element(id);
+  for (const id of ['modePill', 'toast', 'homeRecent', 'eventsList', 'archiveEvents', 'detail', 'dangerBanner', 'recordBtn', 'saveBtn', 'refreshBtn', 'handoffBtn', 'rawText', 'cancelVoiceFollowupBtn']) element(id);
   const context = vm.createContext({
     console, FormData, URL,
     location: { hostname: 'localhost', port: '18768' },

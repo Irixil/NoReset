@@ -99,7 +99,7 @@ test('a failed archive correction transaction preserves original event, conversa
   assert.equal(saved.turns.find(turn => turn.role === 'elder').text, source.text);
 });
 
-test('archive correction waits for an in-flight reply and supersedes its old inference', async () => {
+test('archive correction waits for an in-flight reply then refuses to edit an older own message', async () => {
   const h = await harness();
   const first = await h.say(await h.start(), '纯虚构：昨天左膝酸痛');
   const source = first.turns.find(turn => turn.role === 'elder');
@@ -112,12 +112,16 @@ test('archive correction waits for an in-flight reply and supersedes its old inf
   await new Promise(setImmediate);
   assert.equal(revised, false, 'archive correction uses conversation lock before event lock');
   remote.resolve({ ...reply, assistant_text: '走路时哪边更不舒服？' });
-  await sending; assert.equal((await revision).r.ok, true);
+  const sent = await sending;
+  const denied = await revision;
+  assert.equal(denied.r.status, 409);
+  assert.equal(denied.j.error, 'conversation_turn_not_latest');
   const saved = (await h.request(`/api/conversations/${first.conversation_id}`)).j.conversation;
-  assert.match(saved.report.body, /右膝酸痛/);
-  assert.doesNotMatch(saved.report.body, /左膝酸痛/);
-  assert.ok(saved.turns.filter(turn => turn.role === 'assistant').slice(1).every(turn => turn.superseded));
-  assert.equal(saved.completeness, null);
+  assert.equal(JSON.stringify(saved.turns), JSON.stringify(sent.turns), 'the completed reply and every own message remain unchanged');
+  assert.equal(saved.version, sent.version);
+  assert.match(saved.report.body, /左膝酸痛/);
+  assert.doesNotMatch(saved.report.body, /右膝酸痛/);
+  assert.equal((await h.api.vault.get(`event:${source.record_id}`)).raw_text, source.text);
 });
 
 test('a new conversation cannot link an old source while archive replacement is committing', async () => {
@@ -166,7 +170,7 @@ test('deleting a conversation with a shared source refuses without damaging eith
   }, 'DELETE');
   assert.equal(removed.r.status, 409);
   assert.equal(removed.j.error, 'conversation_source_shared');
-  assert.match(removed.j.message, /其他对话引用/);
+  assert.match(removed.j.message, /被其他对话或记录使用/);
   for (const before of [first, second]) {
     const saved = (await h.request(`/api/conversations/${before.conversation_id}`)).j.conversation;
     assert.match(saved.report.body, /右膝酸痛/);

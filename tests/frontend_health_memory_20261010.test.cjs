@@ -160,7 +160,8 @@ test('revoking reuse and deleting an entry stop future disclosure and clear reta
   await h.say(await h.start()); assert.deepEqual(JSON.parse(h.calls.filter(call => call.path === '/api/ai/conversation-turn').at(-1).body).health_context, []);
   const deletion = await h.request(`/api/health-memory/${saved.context_id}`, { expected_version: (await h.memory()).version }, 'DELETE'); assert.equal(deletion.r.status, 200);
   assert.equal((await h.memory()).entries.length, 0);
-  assert.equal(JSON.stringify(await h.api.vault.get(`conversation:${c.conversation_id}`)).includes(saved.text), false);
+  const debugValue=await h.api.vault.get(`conversation:${c.conversation_id}`);
+  assert.equal(JSON.stringify(debugValue).includes(saved.text), false);
   await h.say(await h.start()); assert.deepEqual(JSON.parse(h.calls.filter(call => call.path === '/api/ai/conversation-turn').at(-1).body).health_context, []);
 });
 

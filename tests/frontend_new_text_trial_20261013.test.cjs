@@ -39,7 +39,8 @@ async function harness(existingDriver = null, sharedResponses = null, sharedCall
   el('vaultPassphrase').value = password;
   await el('vaultForm').onsubmit({ preventDefault() {} }); await ready;
   const request = (path, body, headers = {}) => api.request(path, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body), headers });
-  const start = () => request('/api/conversations/start', { mode: 'new', local_date: '2026-10-13' });
+  const currentLocalDate=()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`};
+  const start = () => request('/api/conversations/start', { mode: 'new', local_date: currentLocalDate() });
   return { driver, calls, responses, api, context, request, start,
     reopen: async () => { api.lock(); return harness(driver, responses, calls); } };
 }
@@ -139,15 +140,15 @@ async function savedOnlyAfterReopen() {
   const turn = read.j.conversation.turns.find(item => item.role === 'elder' && item.turn_id === result.j.turn_id);
   return { reopened, conversation: read.j.conversation, turn, stop };
 }
-function appResumeHarness(reopened, localDate = '2026-10-13') {
+function appResumeHarness(reopened, localDate = (()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`})()) {
   const statuses = [], elements = new Map(); let context;
   const element = id => {
     if (!elements.has(id)) elements.set(id, { value: '', classList: { add() {}, remove() {}, toggle() {} } });
     return elements.get(id);
   };
   context = vm.createContext({
-    HealthLocal: reopened.api, activeConversation: null, localMode: true, conversationLoading: false,
-    healthSubjectSwitchBusy: false, pendingAudioReview: null, pendingAudioReviewCandidates: [],
+    HealthLocal: reopened.api, activeConversation: null, localMode: true, conversationLoading: false, conversationLoadSequence: 0,
+    activeHealthSubjectId:'subject_self',healthSubjectsVersion:1,healthSubjectUiEpoch:0,healthSubjectSwitchBusy: false,healthSubjectChanged:false,pendingAudioReview: null, pendingAudioReviewCandidates: [],
     conversationEditingTurnId: null, saveBusy: false, ensureHealthSubjectReady: async () => true,
     api: (path, options) => reopened.api.request(path, options), localDateValue: () => localDate,
     pendingAudioRecoveryRequestId: 0,
@@ -158,6 +159,9 @@ function appResumeHarness(reopened, localDate = '2026-10-13') {
     isMockContent: turn => Boolean(turn?.is_mock), escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, ''),
   });
   for (const [start, end] of [
+    ['function audioDurationLabel(', 'function naturalCorrectionTargets('],
+    ['function assistantFailureCopy(', 'function voiceTurnHtml('],
+    ['function legacyAudioNeedsExplicitRecovery(', 'function literalRecordTitle('],
     ['function trialVoiceMessage(', 'async function continueTrialVoice('],
     ['function canShowSavedTextFirstSend(', 'function renderVoiceConversation('],
     ['async function loadConversation(', 'async function sendSavedTextFirst('],
@@ -536,7 +540,8 @@ test('same-day reopen keeps saved-only text visible and independent from a retai
   const saved = await submit(first, conversation);
   assert.equal(saved.j.text_trial.state, 'saved_only');
   const reopened = await first.reopen();
-  const current = await reopened.request('/api/conversations/current?local_date=2026-10-13');
+  const d=new Date(),localDate=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const current = await reopened.request('/api/conversations/current?local_date='+localDate);
   const direct = await reopened.request(`/api/conversations/${conversation.conversation_id}`);
   assert.equal(current.r.status, 200);
   assert.equal(direct.r.status, 200);
@@ -544,10 +549,10 @@ test('same-day reopen keeps saved-only text visible and independent from a retai
   const statuses = [], elements = new Map(), el = id => elements.get(id) || {};
   let context;
   context = vm.createContext({
-    HealthLocal: reopened.api, activeConversation: null, localMode: true, conversationLoading: false,
-    healthSubjectSwitchBusy: false, pendingAudioReview: null, pendingAudioReviewCandidates: [],
+    HealthLocal: reopened.api, activeConversation: null, localMode: true, conversationLoading: false, conversationLoadSequence: 0,
+    activeHealthSubjectId:'subject_self',healthSubjectsVersion:1,healthSubjectUiEpoch:0,healthSubjectSwitchBusy: false,healthSubjectChanged:false,pendingAudioReview: null, pendingAudioReviewCandidates: [],
     conversationEditingTurnId: null, saveBusy: false, ensureHealthSubjectReady: async () => true,
-    api: (path, options) => reopened.api.request(path, options), localDateValue: () => '2026-10-13',
+    api: (path, options) => reopened.api.request(path, options), localDateValue: () => localDate,
     syncConversation: conversation => { context.activeConversation = conversation; },
     setVoiceComposerEnabled() {}, setVoiceStatus: (text, tone) => statuses.push({ text, tone }),
     renderVoiceConversation() {}, renderConversationReport() {}, loadEvents: async () => {},
@@ -556,6 +561,7 @@ test('same-day reopen keeps saved-only text visible and independent from a retai
     isMockContent: turn => Boolean(turn?.is_mock), escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, ''),
   });
   for (const [start, end] of [
+    ['function audioDurationLabel(', 'function naturalCorrectionTargets('],
     ['function trialVoiceMessage(', 'async function continueTrialVoice('],
     ['function canShowSavedTextFirstSend(', 'function renderVoiceConversation('],
     ['async function loadConversation(', 'async function sendSavedTextFirst('],
@@ -967,15 +973,24 @@ test('corrected reorganization failure preserves pending report and duplicate cl
   const grant={grant_id:'synthetic-correction-fail',receipt_id:'synthetic-correction-fail-receipt',receipt_sha256:'f'.repeat(64),
     expires_at:new Date(Date.now()+60_000).toISOString(),http_payload_sha256:hash(JSON.stringify(payload)),remaining_requests:1,kind:'llm',retries:0};
   h.responses.set('/api/app/config',{text_trial:grant});
-  h.responses.set('/api/ai/conversation-turn',async()=>{await new Promise(resolve=>setTimeout(resolve,10));return {__status:503,error:'provider_unavailable'}});
+  h.responses.set('/api/ai/conversation-turn',async()=>{await new Promise(resolve=>setTimeout(resolve,10));return {__status:422,error:'ai_conversation_failed',failure_code:'model_http_error',provider_http_status:429,failure_reason:'untrusted remote reason',remote_body:'untrusted remote body'}});
   const snapshot=await correctionSnapshot(h,conversation);
   const pair=await Promise.all([h.request(correctionPath(conversation),snapshot),h.request(correctionPath(conversation),snapshot)]);
   assert.equal(llmCalls(h).length,1);
   const read=await h.request(`/api/conversations/${conversation.conversation_id}`);
   assert.equal(read.j.conversation.manual_correction_analysis_pending,true);
   assert.equal(read.j.conversation.report.manual_correction_analysis_pending,true);
+  assert.equal(read.j.conversation.manual_correction_reorganization.provider_http_status,429);
+  assert.equal(JSON.stringify(read).includes('untrusted remote'),false);
   assert.equal((await h.api.vault.get(`event:${conversation.turns.at(-1).record_id}`)).raw_text,conversation.turns.at(-1).text);
   assert.equal(pair.filter(item=>item.j.dispatched).length,1);
+  const ui=appResumeHarness(h);await ui.load();
+  assert.match(ui.statuses.map(item=>item.text).join('\n'),/请求较多或受到限制/);
+  assert.doesNotMatch(ui.statuses.map(item=>item.text).join('\n'),/429|untrusted remote/);
+  const storedKey=`conversation:${conversation.conversation_id}`,stored=await h.api.vault.get(storedKey);
+  await h.api.vault.put(storedKey,{...stored,manual_correction_reorganization:{...stored.manual_correction_reorganization,provider_http_status:418}});
+  const sanitized=await h.request(`/api/conversations/${conversation.conversation_id}`);
+  assert.equal(Object.hasOwn(sanitized.j.conversation.manual_correction_reorganization,'provider_http_status'),false);
 });
 
 test('a late reorganization result is discarded if the selected background changes after dispatch', async () => {

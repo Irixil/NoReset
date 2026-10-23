@@ -26,6 +26,7 @@ function harness({ media = false, activeView = null, startupMode = 'stub', stora
       const attributes = new Map();
       const el = {
         id, value: '', textContent: '', innerHTML: '', disabled: false, dataset: {}, style: {}, children: [], attributes,
+        insertAdjacentHTML(position, html) { assert.equal(position,'beforeend');this.innerHTML+=html; },
         classList: {
           add(name) { classes.add(name); },
           remove(name) { classes.delete(name); },
@@ -351,8 +352,15 @@ test('renamed photos retain original bytes but use the detected image type', asy
   const retained = await h.run('retainSelectedFile(renamedPhoto)');
   assert.equal(retained.type, 'image/png');
   assert.deepEqual(new Uint8Array(await retained.arrayBuffer()), bytes);
-  h.run("mediaMessage('照片原件读取失败，请重新选择')");
+  h.run("mediaMessage('照片原件读取失败，请重新选择','image')");
   assert.equal(h.element('photoStatus').textContent, '照片原件读取失败，请重新选择');
+});
+
+test('audio and archive media messages leave the latest photo feedback visible', () => {
+  const h = harness({ media: true });
+  h.run("mediaMessage('照片已选好，尚未上传','image'); mediaMessage('录音识别失败，原件仍可查看和重试')");
+  assert.equal(h.element('mediaStatus').textContent, '录音识别失败，原件仍可查看和重试');
+  assert.equal(h.element('photoStatus').textContent, '照片已选好，尚未上传');
 });
 
 

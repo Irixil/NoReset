@@ -65,7 +65,7 @@ def run(turns, controller=None, provider=None, health_context=None):
 
 def test_prompt_contract_is_the_clinical_intake_version():
     result = run([turn(1, "我头疼。")])
-    assert result["prompt_version"] == PROMPT_VERSION == "clinical-intake-v13-single-focus-uncertainty"
+    assert result["prompt_version"] == PROMPT_VERSION == "clinical-intake-v15-quote-context"
     assert set(result["completeness"]["clinical_state"]) == set(CATEGORIES)
 
 
@@ -115,6 +115,67 @@ def test_unrelated_audio_transcript_stays_chat_only():
     assert result["stop_reason"] == "non_health_input"
     assert all(item["status"] == "missing" for item in result["completeness"]["clinical_state"].values())
     assert result["controller"]["non_health_sources"][0]["text_sha256"]
+
+
+@pytest.mark.parametrize("status", ["machine_transcribed", "user_edited", "original_comparison"])
+def test_audio_source_metadata_is_validated_and_forwarded_without_becoming_confirmation(status):
+    seen = {}
+
+    class CaptureProvider:
+        def complete_json(self, system, payload):
+            seen["system"] = system
+            seen["turns"] = payload["turns"]
+            return model_draft(payload["turns"])
+
+    audio_turn = {
+        **turn(81, "我这两天腿有些疼。"),
+        "version": 2,
+        "source": {
+            "kind": "audio_transcript", "status": status,
+            "record_id": "rec_12345678", "record_version": 2,
+            "media_id": "media_12345678", "media_version": 3,
+        },
+    }
+    result = conversation_turn({"turns": [audio_turn]}, CaptureProvider())
+
+    assert seen["turns"][0]["source"] == audio_turn["source"]
+    assert "不表示本人已对照原录音或确认医学事实" in seen["system"]
+    assert "health_memory" not in result
+    assert "source_review" not in result
+
+
+@pytest.mark.parametrize("source", [
+    {"kind": "audio_transcript", "status": [], "record_id": "rec_12345678", "record_version": 1, "media_id": "media_12345678", "media_version": 1},
+    {"kind": "audio_transcript", "status": "confirmed", "record_id": "rec_12345678", "record_version": 1, "media_id": "media_12345678", "media_version": 1},
+    {"kind": "audio_transcript", "status": "machine_transcribed", "record_id": "rec_12345678", "record_version": True, "media_id": "media_12345678", "media_version": 1},
+    {"kind": "audio_transcript", "status": "machine_transcribed", "record_id": "rec_12345678", "record_version": 1, "media_id": "media_12345678", "media_version": 0},
+    {"kind": "audio_transcript", "status": "machine_transcribed", "record_id": "bad id", "record_version": 1, "media_id": "media_12345678", "media_version": 1},
+    {"kind": "audio_transcript", "status": "machine_transcribed", "record_id": "rec_12345678", "record_version": 1, "media_id": "media_12345678", "media_version": 1, "confirmed": True},
+])
+def test_malformed_audio_source_is_rejected_before_provider_call(source):
+    calls = []
+
+    class NeverCallProvider:
+        def complete_json(self, *_args):
+            calls.append(True)
+            return {}
+
+    with pytest.raises(ConversationError, match="turn_source_invalid"):
+        conversation_turn({"turns": [{**turn(82, "我咳嗽。"), "source": source}]}, NeverCallProvider())
+    assert calls == []
+
+
+def test_legacy_text_turn_without_source_metadata_remains_compatible():
+    seen = {}
+
+    class CaptureProvider:
+        def complete_json(self, _system, payload):
+            seen["turns"] = payload["turns"]
+            return model_draft(payload["turns"])
+
+    source = turn(83, "我咳嗽。")
+    conversation_turn({"turns": [source]}, CaptureProvider())
+    assert seen["turns"][0] == {"turn_id": source["turn_id"], "text": source["text"], "version": 1}
 
 
 def test_non_health_intent_cannot_cite_latest_turn_as_clinical_evidence():
@@ -1030,6 +1091,97 @@ def test_short_answer_to_linked_assistant_question_is_grounded_without_keywords(
     unverified_impact = unverified["completeness"]["clinical_state"]["functional_impact"]
     assert unverified_impact["status"] == "missing"
     assert unverified_impact["evidence_turn_ids"] == []
+
+
+@pytest.mark.parametrize("source", [
+    "我咳嗽两天了，晚上明显些。",
+    "以前咳嗽，现在又咳嗽。",
+])
+def test_associated_symptom_cannot_be_grounded_by_complaint_or_time_repetition(source):
+    class UnsupportedAssociatedProvider:
+        def complete_json(self, _system, payload):
+            value = model_draft(payload["turns"])
+            latest = payload["turns"][-1]
+            value["clinical_state"]["associated_symptoms"] = {
+                "status": "known", "summary": "另有胸痛",
+                "evidence_turn_ids": [latest["turn_id"]], "context_ids": [],
+            }
+            return value
+
+    result = run([turn(1, source)], provider=UnsupportedAssociatedProvider())
+    associated = result["completeness"]["clinical_state"]["associated_symptoms"]
+    assert associated == {"status": "missing", "summary": "", "evidence_turn_ids": [], "context_ids": []}
+
+
+def test_explicit_concurrent_distinct_symptom_is_grounded_with_full_source():
+    source = "我咳嗽两天了，同时还觉得恶心。"
+
+    class AssociatedProvider:
+        def complete_json(self, _system, payload):
+            value = model_draft(payload["turns"])
+            latest = payload["turns"][-1]
+            value["clinical_state"]["associated_symptoms"] = {
+                "status": "known", "summary": "另有胸痛",
+                "evidence_turn_ids": [latest["turn_id"]], "context_ids": [],
+            }
+            return value
+
+    result = run([turn(1, source)], provider=AssociatedProvider())
+    associated = result["completeness"]["clinical_state"]["associated_symptoms"]
+    assert associated["status"] == "known"
+    assert "恶心" in associated["summary"]
+    assert "咳嗽" in associated["summary"]
+
+
+def test_associated_excerpt_excludes_unrelated_historical_clause():
+    source = "我咳嗽两天了，同时还觉得恶心。以前有头晕。"
+
+    class AssociatedProvider:
+        def complete_json(self, _system, payload):
+            value = model_draft(payload["turns"])
+            latest = payload["turns"][-1]
+            value["clinical_state"]["associated_symptoms"] = {
+                "status": "known", "summary": "咳嗽、恶心、头晕",
+                "evidence_turn_ids": [latest["turn_id"]], "context_ids": [],
+            }
+            return value
+
+    result = run([turn(1, source)], provider=AssociatedProvider())
+    associated = result["completeness"]["clinical_state"]["associated_symptoms"]
+    assert associated["status"] == "known"
+    assert "恶心" in associated["summary"]
+    assert "以前有头晕" not in associated["summary"]
+
+
+def test_negative_associated_short_answer_remains_literal_and_question_bound():
+    question = "除了刚才说的情况，还有什么是一起出现的？"
+    first = turn(1, "我咳嗽两天了。")
+    answer = {
+        **turn(2, "没有。"),
+        "responding_to": {"turn_id": "turn_assistant_q002", "text": question},
+    }
+    controller = opening_controller(
+        asked_categories=["main_complaint", "associated_symptoms"],
+        question_counts={**opening_controller()["question_counts"], "associated_symptoms": 1},
+        asked_questions=["您今天最难受的是哪里，或者是什么感觉？", question],
+        question_count=2, last_question_category="associated_symptoms",
+    )
+
+    class NegativeAssociatedProvider:
+        def complete_json(self, _system, payload):
+            value = model_draft(payload["turns"])
+            latest = payload["turns"][-1]
+            value["clinical_state"]["associated_symptoms"] = {
+                "status": "known", "summary": "胸痛",
+                "evidence_turn_ids": [latest["turn_id"]], "context_ids": [],
+            }
+            return value
+
+    result = run([first, answer], controller, provider=NegativeAssociatedProvider())
+    associated = result["completeness"]["clinical_state"]["associated_symptoms"]
+    assert associated["status"] == "known"
+    assert associated["summary"] == "没有。"
+    assert associated["evidence_turn_ids"] == [answer["turn_id"]]
 
 
 def test_explicit_unknown_is_kept_as_a_short_source_excerpt():

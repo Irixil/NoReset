@@ -308,6 +308,102 @@ def test_app_config_reports_text_trial_gate_without_exposing_grant_material(monk
         assert config.body["text_trial"] is None
 
 
+def test_ordinary_runtime_does_not_require_private_trial_but_controlled_handlers_still_do(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("APP_AUTO_BIND_LOOPBACK", "true")
+    monkeypatch.setenv("MODEL_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-test-key")
+    monkeypatch.setattr(server.text_trial, "is_installed", lambda: True)
+    monkeypatch.setattr(server.text_trial, "available_grant", lambda: None)
+    observed = []
+    monkeypatch.setattr(server, "conversation_turn", lambda body: observed.append(body) or {"action": "reply", "reply": "已记下。"})
+    origin = "http://127.0.0.1:5173"
+    body = {"turns": [{"turn_id": "turn_ordinary_0001", "text": "我咳嗽两天了。"}]}
+
+    with running_http_server(server.OrdinaryHandler) as base_url:
+        client = HttpClient(base_url, {"Content-Type": "application/json", "Origin": origin})
+        config = client.request("GET", "/api/app/config")
+        headers = local_session(client, origin)
+        denied_csrf = client.request(
+            "POST", "/api/ai/conversation-turn", body,
+            headers={**headers, "X-CSRF-Token": "wrong"},
+        )
+        denied_origin = client.request(
+            "POST", "/api/ai/conversation-turn", body,
+            headers={**headers, "Origin": "https://untrusted.example"},
+        )
+        ordinary = client.request("POST", "/api/ai/conversation-turn", body, headers=headers)
+
+    assert config.status == 200
+    assert config.body["text_trial_required"] is False
+    assert config.body["text_trial"] is None
+    assert denied_csrf.status == 403
+    assert denied_origin.status == 403
+    assert ordinary.status == 200
+    assert ordinary.body["reply"] == "已记下。"
+    assert observed == [body]
+
+    for handler in (server.Handler, server.ProductHandler):
+        with running_http_server(handler) as base_url:
+            client = HttpClient(base_url, {"Content-Type": "application/json", "Origin": origin})
+            headers = local_session(client, origin)
+            controlled = client.request("POST", "/api/ai/conversation-turn", body, headers=headers)
+        assert controlled.status == 422
+        assert controlled.body["error"] == "trial_authorization_required"
+    assert observed == [body]
+
+
+def test_ordinary_runtime_never_falls_back_when_explicit_trial_header_is_invalid(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("APP_AUTO_BIND_LOOPBACK", "true")
+    monkeypatch.setenv("MODEL_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-test-key")
+    monkeypatch.setattr(server.text_trial, "is_installed", lambda: True)
+    calls = []
+    monkeypatch.setattr(server, "conversation_turn", lambda _body: calls.append("ordinary"))
+    monkeypatch.setattr(
+        server.text_trial, "run_turn",
+        lambda *_args: (_ for _ in ()).throw(server.trial_gate.TrialGateError("trial_authorization_required")),
+    )
+    monkeypatch.setattr(
+        server.saved_audio_trial, "run_turn",
+        lambda *_args: (_ for _ in ()).throw(server.trial_gate.TrialGateError("trial_authorization_required")),
+    )
+    origin = "http://127.0.0.1:5173"
+    with running_http_server(server.OrdinaryHandler) as base_url:
+        client = HttpClient(base_url, {"Content-Type": "application/json", "Origin": origin})
+        headers = local_session(client, origin)
+        body = {"turns": [{"turn_id": "turn_ordinary_0002", "text": "我头晕。"}]}
+        for header in ("X-NoReset-Text-Trial", "X-NoReset-Saved-Audio-Trial"):
+            response = client.request(
+                "POST", "/api/ai/conversation-turn", body,
+                headers={**headers, header: "invalid-test-grant"},
+            )
+            assert response.status == 422
+            assert response.body["error"] == "trial_authorization_required"
+    assert calls == []
+
+
+def test_normal_serve_selects_only_the_explicit_ordinary_handler(monkeypatch):
+    observed = {}
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            observed["address"] = address
+            observed["handler"] = handler
+
+        def serve_forever(self):
+            observed["started"] = True
+
+    monkeypatch.setattr(server, "ThreadingHTTPServer", FakeServer)
+    server.serve(host="127.0.0.1", port=12345)
+    assert observed == {
+        "address": ("127.0.0.1", 12345),
+        "handler": server.OrdinaryHandler,
+        "started": True,
+    }
+
+
 def test_app_config_reports_missing_real_model_credentials_without_network(monkeypatch, tmp_path):
     configure(monkeypatch, tmp_path)
     monkeypatch.setenv("MODEL_PROVIDER", "deepseek")

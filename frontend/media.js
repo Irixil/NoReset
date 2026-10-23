@@ -1,5 +1,5 @@
 // Saved-media upload and recognition. Recording pause is manual; no fake VAD.
-let mediaItems=[], mediaEventsForDisplay=null, uploadBusy=false, selectedPhoto=null, pendingRecordingBlob=null, mediaCapabilities=null, mediaOnlineStatusRequestId=0, mediaCapabilitiesRequestId=0;
+let mediaItems=[], mediaEventsForDisplay=null, uploadBusy=false, selectedPhoto=null, pendingRecordingBlob=null, pendingRecordingIntent=null, mediaCapabilities=null, mediaOnlineStatusRequestId=0, mediaCapabilitiesRequestId=0, mediaLoadRequestId=0;
 const localMediaJobs=new Map();
 const recognitionBusy=new Set();
 const originalUrls=new Map();
@@ -68,7 +68,7 @@ function audioReviewDisplay(media,events){
 async function readAudioEvents(){
   try{const {r,j}=await api('/api/events');return r.ok&&Array.isArray(j.events)?j.events:null;}catch{return null;}
 }
-function mediaMessage(text){mediaStatus.textContent=text;const photo=$('photoStatus');if(photo)photo.textContent=text;}
+function mediaMessage(text,kind=null){mediaStatus.textContent=text;if(kind==='image'){const photo=$('photoStatus');if(photo)photo.textContent=text;}}
 function formatMediaUploadLimit(bytes){
   const value=Number(bytes);
   if(!Number.isFinite(value)||value<=0)return '当前上传限制';
@@ -192,22 +192,40 @@ async function loadMediaCapabilities(){
 async function mediaRequest(path,opt){
   const x=await api(path,opt);
   if(!x.r.ok){
-    const trialMessages={trial_stopped:'这次语音处理已停止；录音原件仍在本机，不会自动重发。',trial_review_required:'这段录音仍在待核对状态；原件已保留，请先处理核对停点。',trial_authorization_required:'没有匹配到这段录音的当前单次识别授权；原件已保留，不会自动重试。'};
-    const error=new Error(x.r.status===0?'连接中断，请重试，原文件和重试信息保留':(trialMessages[x.j.error]||(x.j.error==='media_mock_unavailable'?'识别服务尚未接通；原件已保存，可直接打字记录。':readableMediaError(x.j.message||x.j.error))));
+    const errorMessages={trial_stopped:'这次语音处理已停止；录音原件仍在本机，不会自动重发。',trial_review_required:'这段录音仍在待核对状态；原件已保留，请先处理核对停点。',trial_authorization_required:'没有匹配到这段录音的当前单次识别授权；原件已保留，不会自动重试。',audio_recognition_in_progress:'另一段录音正在识别，请等它完成；这段原录音已保存。'};
+    const error=new Error(x.r.status===0?'连接中断，请重试，原文件和重试信息保留':(errorMessages[x.j.error]||(x.j.error==='media_mock_unavailable'?'识别服务尚未接通；原件已保存，可直接打字记录。':readableMediaError(x.j.message||x.j.error))));
     error.code=x.j.error||'';error.status=x.r.status;error.retryable=x.j.retryable===true;throw error;
   }
   return x.j;
 }
 async function loadMedia(){
+  const requestId=++mediaLoadRequestId,dataGeneration=globalThis.recordDataGeneration||0;
   const subjectEpoch=typeof healthSubjectUiEpoch==='number'?healthSubjectUiEpoch:0;
   if(localMode&&typeof ensureHealthSubjectReady==='function'&&!await ensureHealthSubjectReady())return false;
-  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch)return false;
+  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch||requestId!==mediaLoadRequestId||dataGeneration!==globalThis.recordDataGeneration)return false;
   const {r,j}=await api('/api/media');
-  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch)return false;
+  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch||requestId!==mediaLoadRequestId||dataGeneration!==globalThis.recordDataGeneration)return false;
   if(!r.ok){mediaMessage('媒体列表暂时无法读取，请恢复连接后刷新');const box=$('archivePhotos');if(box){releaseOriginalsIn(box);box.innerHTML='<div class="load-error" role="status"><b>原件列表暂时无法读取</b><span>已保存原件不会删除，请恢复连接后刷新。</span></div>';}return false;}
-  mediaItems=j.media||[];mediaEventsForDisplay=mediaItems.some(m=>m.kind==='audio'&&(m.event_link?.record_id||m.record_id))?await readAudioEvents():null;
-  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch)return false;
+  const nextItems=j.media||[],nextEvents=nextItems.some(m=>m.kind==='audio'&&(m.event_link?.record_id||m.record_id))?await readAudioEvents():null;
+  if(typeof healthSubjectUiEpoch==='number'&&subjectEpoch!==healthSubjectUiEpoch||requestId!==mediaLoadRequestId||dataGeneration!==globalThis.recordDataGeneration)return false;
+  mediaItems=nextItems;mediaEventsForDisplay=nextEvents;
   renderMedia(mediaEventsForDisplay);return true;
+}
+function standaloneMedia(m){return Boolean(m?.media_id&&m.delete_eligibility?.allowed===true&&m.save_status==='saved'&&m.recognition_status!=='processing')}
+function mediaDeleteBlockMessage(m){const reason=m?.delete_eligibility?.reason;return reason==='linked'?'这份原件仍被记录或对话引用，不能单独删除。':reason==='link_pending'?'这份原件仍在关联处理中，暂不能删除。':reason==='processing'?'这份原件仍在处理中，暂不能删除。':reason==='upload_in_progress'?'这份原件仍在上传，暂不能删除。':reason==='trial_controlled'?'这份原件属于受控处理，暂不能删除。':reason==='owner_unknown'?'原件关联的所属人暂时无法确认，请刷新核对。':''}
+function invalidateMediaAfterDelete(mediaId=null){
+  mediaLoadRequestId++;
+  const exactIds=Array.isArray(mediaId)?[...new Set(mediaId.filter(id=>typeof id==='string'&&id))]:mediaId?[mediaId]:null;
+  const releaseIds=exactIds||[...originalTargets.keys()];
+  releaseIds.forEach(id=>{releaseOriginal(id);recognitionBusy.delete(id)});
+  if(exactIds){
+    const deleted=new Set(exactIds);
+    for(const [key,job] of localMediaJobs)if(deleted.has(job?.mediaId))localMediaJobs.delete(key);
+    try{for(let index=localStorage.length-1;index>=0;index--){const key=localStorage.key(index);if(!key?.startsWith('elder_media_upload_v2:'))continue;try{if(deleted.has(JSON.parse(localStorage.getItem(key)||'null')?.mediaId))localStorage.removeItem(key)}catch{}}}catch{}
+    mediaItems=mediaItems.filter(item=>!deleted.has(item.media_id));
+    if(exactIds.length)mediaEventsForDisplay=null;
+  }else{mediaItems=[];mediaEventsForDisplay=null;}
+  renderMedia(mediaEventsForDisplay);
 }
 function renderMedia(events=typeof mediaEventsForDisplay==='undefined'?null:mediaEventsForDisplay){
   releaseOriginalsIn($('archivePhotos'));
@@ -223,10 +241,14 @@ function renderMedia(events=typeof mediaEventsForDisplay==='undefined'?null:medi
     const audioReviewStatus=audioReview?`<p class="status">${AUDIO_REVIEW_LABELS[audioReview.state]}</p>`:'';
     const recognitionError=(m.recognition?.error_message||unusableAudio)?`<p class="status error">${escapeHtml(unusableAudio||readableMediaError(m.recognition.error_message,'识别没有完成，请保留原件并重试'))}</p>`:'';
     const terminalMessage=terminalUnavailable&&!unusableAudio?'<p class="status error">该识别失败不可重试，原件仍可查看。</p>':'';
-    return `<article class="handoff-item" id="media-${m.media_id}"><b>${escapeHtml(m.original_filename||'媒体原件')}</b><p>${mediaLabel(m)}</p>${audioReviewStatus}${mock?'<p class="status error">模拟识别结果，不是患者原话；不会进入报告或对话事实。原始录音仍保留。</p>':''}${recognitionError}${terminalMessage}<button class="outline" data-original="${m.media_id}" ${m.save_status!=='saved'?'disabled':''}>查看原件</button>${actionButton}<div class="media-result"></div></article>`;
+    const deletable=standaloneMedia(m);
+    const deleteButton=deletable?`<button class="outline" data-delete-media="${m.media_id}">删除这份未关联原件</button>`:'';
+    const deleteBlock=deletable?'':mediaDeleteBlockMessage(m)?`<p class="status" role="status">${escapeHtml(mediaDeleteBlockMessage(m))}</p>`:'';
+    return `<article class="handoff-item" id="media-${m.media_id}"><b>${escapeHtml(m.original_filename||'媒体原件')}</b><p>${mediaLabel(m)}</p>${audioReviewStatus}${mock?'<p class="status error">模拟识别结果，不是患者原话；不会进入报告或对话事实。原始录音仍保留。</p>':''}${recognitionError}${terminalMessage}<button class="outline" data-original="${m.media_id}" ${m.save_status!=='saved'?'disabled':''}>查看原件</button>${actionButton}${deleteButton}${deleteBlock}<div class="media-result"></div></article>`;
   }).join(''):'<p class="muted">还没有上传原件</p>';
   document.querySelectorAll('[data-original]').forEach(b=>b.onclick=()=>openOriginal(b.dataset.original));
   document.querySelectorAll('[data-recognize]').forEach(b=>b.onclick=()=>recognizeMedia(b.dataset.recognize));
+  document.querySelectorAll('[data-delete-media]').forEach(b=>b.onclick=()=>deleteMedia(mediaItems.find(item=>item.media_id===b.dataset.deleteMedia),b));
 }
 function latestMediaFirst(items){return items.slice().sort((a,b)=>{const at=Date.parse(a.created_at||a.updated_at||'')||0;const bt=Date.parse(b.created_at||b.updated_at||'')||0;return bt-at||String(b.media_id||'').localeCompare(String(a.media_id||''))})}
 function releaseOriginal(id){
@@ -241,7 +263,7 @@ function releaseOriginalsIn(container){
     if(target.box===container||container.contains?.(target.box)||target.box?.isConnected===false)releaseOriginal(id);
   }
 }
-async function openOriginal(id,{box=null,media=null}={}){
+async function openOriginal(id,{box=null,media=null,controls=true}={}){
   let url,target;
   try{
     const m=media||mediaItems.find(m=>m.media_id===id);box=box||$('media-'+id)?.querySelector('.media-result');
@@ -249,11 +271,11 @@ async function openOriginal(id,{box=null,media=null}={}){
     releaseOriginalsIn(box);releaseOriginal(id);
     target={box,node:null};originalTargets.set(id,target);
     if(globalThis.HealthLocal?.active)url=await globalThis.HealthLocal.originalObjectUrl(id);
-    else{await health();const r=await fetch(API+`/api/media/${id}/original`,{credentials:'include',headers:{'X-Session-Token':token}});if(!r.ok)throw new Error('原件暂时无法读取');url=URL.createObjectURL(await r.blob());}
+    else{await health();const r=await fetch(API+`/api/media/${id}/original`,{credentials:'include',headers:{'X-Session-Token':token}});if(!r.ok){const error=new Error('original_read_failed');error.status=r.status;throw error}url=URL.createObjectURL(await r.blob());}
     if(box.isConnected===false||originalTargets.get(id)!==target){URL.revokeObjectURL(url);if(originalTargets.get(id)===target)originalTargets.delete(id);return false}
     originalUrls.set(id,url);
-    const node=document.createElement(m.kind==='audio'?'audio':'img');target.node=node;node.src=url;
-    if(m.kind==='audio'){node.controls=true;node.style.maxWidth='100%';}else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
+    const node=document.createElement(m.kind==='audio'?'audio':'img');target.node=node;if(m.kind==='audio')node.preload='metadata';node.src=url;
+    if(m.kind==='audio'){node.controls=controls;node.style.maxWidth='100%';if(!controls){node.hidden=true;node.setAttribute('aria-hidden','true')}}else{node.alt='已保存的照片原件';node.style.maxWidth='100%';}
     box.replaceChildren(node);
     if(m.kind==='image'){const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';link.textContent='放大查看原件';box.append(link);}
     return true;
@@ -261,7 +283,10 @@ async function openOriginal(id,{box=null,media=null}={}){
     if(url&&originalUrls.get(id)!==url)URL.revokeObjectURL(url);
     if(target&&originalTargets.get(id)===target){
       releaseOriginal(id);
-      if(box&&box.isConnected!==false)box.textContent='原件暂时无法读取，请重新打开核对。';
+      const missing=e?.message==='原件不存在'||e?.message==='original_unavailable'||e?.status===404;
+      const denied=e?.message==='subject_mismatch'||[401,403,423].includes(e?.status);
+      if(missing&&typeof unavailableConversationOriginalIds!=='undefined')unavailableConversationOriginalIds.add(id);
+      if(box&&box.isConnected!==false)box.textContent=missing?'没有找到这段录音原件；识别文字与修改历史仍保留。':denied?'目前无法读取或访问这段录音；请确认本机资料已解锁后重试。':'原录音暂时无法读取；识别文字与修改历史仍保留，请稍后重试。';
     }else if(!box)mediaMessage(e.message);
   }
   return false;
@@ -306,7 +331,7 @@ async function uploadMedia(file,kind,{temporary=false,conversationId=null}={}){
     if(job?.mediaId){
       try{
         const {media}=await mediaRequest('/api/media/'+job.mediaId);
-        if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体');await loadMedia();return media;}
+        if(media.save_status==='saved'){mediaMessage('原件已经保存，重复提交已复用同一条媒体',kind);await loadMedia();return media;}
       }catch(error){
         if(error.status!==404)throw error;
         // Deletion, successful temporary-audio cleanup or backup restore can
@@ -321,19 +346,19 @@ async function uploadMedia(file,kind,{temporary=false,conversationId=null}={}){
       job={key:crypto.randomUUID(),chunkSize,metadata:{kind,content_type:type,total_parts:String(total),expected_size:String(file.size),expected_sha256:hash,original_filename:file.name||`recording.${type.split('/')[1]}`,actor_name:'老人',temporary:String(temporary===true),conversation_id:conversationId||''}};
       if(globalThis.HealthLocal?.active)localMediaJobs.set(jobKey,job);else localStorage.setItem(jobKey,JSON.stringify(job));
     }
-    mediaMessage('正在创建上传，原件尚未保存完整');
+    mediaMessage('正在创建上传，原件尚未保存完整',kind);
     const form=new FormData();Object.entries(job.metadata).forEach(([k,v])=>form.append(k,v));
     const {upload}=await mediaRequest('/api/media/uploads',{method:'POST',headers:{'Idempotency-Key':job.key+':create'},body:form});
     job.mediaId=upload.media_id;job.uploadId=upload.upload_id;if(globalThis.HealthLocal?.active)localMediaJobs.set(jobKey,job);else localStorage.setItem(jobKey,JSON.stringify(job));
     for(let i=0;i<Number(job.metadata.total_parts);i++){
-      mediaMessage(`正在上传 ${i+1}/${job.metadata.total_parts}，原件尚未保存完整`);
+      mediaMessage(`正在上传 ${i+1}/${job.metadata.total_parts}，原件尚未保存完整`,kind);
       const part=new FormData();part.append('file',file.slice(i*job.chunkSize,(i+1)*job.chunkSize),`part-${i}`);
       await mediaRequest(`/api/media/uploads/${job.uploadId}/parts/${i}`,{method:'POST',headers:{'Idempotency-Key':job.key+':part:'+i},body:part});
     }
     const {media}=await mediaRequest(`/api/media/uploads/${job.uploadId}/complete`,{method:'POST',headers:{'Idempotency-Key':job.key+':complete'},body:'{}'});
     if(media.save_status!=='saved')throw new Error('原件尚未确认保存，请重试');
-    mediaMessage('原件已保存，正在开始识别');await loadMedia();return media;
-  }catch(e){mediaMessage(e.message);toast(e.message);}
+    mediaMessage('原件已保存，正在开始识别',kind);await loadMedia();return media;
+  }catch(e){mediaMessage(e.message,kind);toast(e.message);}
   finally{uploadBusy=false;}
 }
 async function currentSavedAudioSource(media){
@@ -452,9 +477,9 @@ $('photoInput').onchange=async e=>{
   // Clearing the value after capturing the File permits selecting the same
   // path again after a failed upload. Copy the bytes first because some
   // embedded browsers revoke their temporary file handle when it is cleared.
-  try{selectedPhoto=await retainSelectedFile(source)}catch{e.target.value='';mediaMessage('照片原件读取失败，请重新选择');return}
+  try{selectedPhoto=await retainSelectedFile(source)}catch{e.target.value='';mediaMessage('照片原件读取失败，请重新选择','image');return}
   e.target.value='';
-  mediaMessage('照片已选好，尚未上传');
+  mediaMessage('照片已选好，尚未上传','image');
   const preview=$('photoPreview'),savePhoto=$('savePhotoBtn');preview.replaceChildren();const img=document.createElement('img');
   img.src=URL.createObjectURL(selectedPhoto);img.alt='待上传照片预览';img.onload=()=>{URL.revokeObjectURL(img.src);savePhoto.scrollIntoView?.({behavior:window.matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth',block:'center'})};preview.append(img);
   const note=document.createElement('p');note.textContent='仅预览，尚未上传或识别';preview.append(note);preview.classList.remove('hidden');savePhoto.classList.remove('hidden');savePhoto.scrollIntoView?.({behavior:'auto',block:'center'});
@@ -463,17 +488,22 @@ $('savePhotoBtn').onclick=async()=>{if(uploadBusy)return;const m=await uploadMed
 $('audioUploadInput').onchange=async e=>{if(mediaCapabilities&&mediaCapabilities.enabled!==true)return;const source=e.target.files?.[0];if(!source)return;let f;try{f=await retainSelectedFile(source)}catch{e.target.value='';mediaMessage('录音原件读取失败，请重新选择');return}e.target.value='';const m=await uploadMedia(f,'audio');showView('archiveView');if(m)await recognizeMedia(m.media_id);};
 async function savePendingRecording(){
   if(!pendingRecordingBlob||uploadBusy)return;
+  const recordingDurationSeconds=Math.max(1,Math.round(Number(elapsedMs||0)/1000));
   const retry=$('retryVoiceUploadBtn');retry.disabled=true;
-  const media=await uploadMedia(pendingRecordingBlob,'audio',{temporary:true,conversationId:activeConversation?.conversation_id||null});
+  const media=await uploadMedia(pendingRecordingBlob,'audio',{temporary:true,conversationId:pendingRecordingIntent?.conversationId??activeConversation?.conversation_id??null});
   if(media){
     pendingRecordingBlob=null;voiceUploadPending=false;setRecording(false);
     retry.classList.add('hidden');$('voiceHint').textContent='原录音已保存，正在尝试语音转文字';if(typeof showVoiceMediaSaved==='function')showVoiceMediaSaved(media);
-    const recognized=await recognizeMedia(media.media_id);if(typeof showVoiceMediaResult==='function')await showVoiceMediaResult(recognized||media);
+    const captureIntent=pendingRecordingIntent;
+    const recognized=await recognizeMedia(media.media_id);if(typeof showVoiceMediaResult==='function')await showVoiceMediaResult(recognized||media,{newRecording:true,durationSeconds:recordingDurationSeconds,captureIntent});
+    if(pendingConversationTurn?.audio_processing){pendingConversationTurn=null;renderVoiceConversation()}
+    if(pendingRecordingIntent===captureIntent)pendingRecordingIntent=null;
   }else{
     // A non-retryable capability/provider failure cannot be fixed by clicking
     // this button.  Keep the original in memory, but avoid presenting a
     // misleading retry affordance.
     const retryable=mediaCapabilities?.enabled!==false;
+    if(pendingConversationTurn?.audio_processing){pendingConversationTurn={...pendingConversationTurn,pending_audio_stage:'upload_failed',text:'录音尚未保存；可点重试。'};renderVoiceConversation()}
     retry.classList.toggle('hidden',!retryable);
     $('voiceHint').textContent=retryable?'录音尚未保存，请在本页重试，先不要刷新或关闭页面':'录音尚未保存；当前媒体能力不可用，请恢复配置后再试';
     if(typeof setVoiceStatus==='function')setVoiceStatus($('voiceHint').textContent,'error');
@@ -485,8 +515,12 @@ $('finishVoiceBtn').onclick=()=>{
   if(voiceUploadPending||voicePermissionPending)return;
   const recorder=mediaRecorder;
   if(!recorder||recorder.state==='inactive'){stopVoice('没有可上传录音，请先开启麦克风或上传已有录音');return;}
+  const elapsedAtFinishMs=Number(elapsedMs||0)+(recorder.state==='recording'&&Number.isFinite(Number(startedAt))?Math.max(0,Date.now()-Number(startedAt)):0);
   const recordingChunks=chunks;
+  pendingRecordingIntent=typeof voiceCaptureIntent==='undefined'?null:voiceCaptureIntent;
   voiceUploadPending=true;
+  pendingConversationTurn={turn_id:'pending-audio',role:'elder',source_kind:'audio_transcript',text:'正在保存录音…',audio_duration_seconds:Math.max(1,Math.round(elapsedAtFinishMs/1000)),pending:true,audio_processing:true,pending_audio_stage:'saving',followOnRender:true};
+  renderVoiceConversation();
   const keepRecording=async()=>{
     const blob=new Blob(recordingChunks,{type:recorder.mimeType||recordingChunks[0]?.type||''});
     if(blob.size){
@@ -494,7 +528,7 @@ $('finishVoiceBtn').onclick=()=>{
       $('retryVoiceUploadBtn').classList.remove('hidden');
       await savePendingRecording();
     }
-    else {voiceUploadPending=false;setRecording(false);const message='没有录到声音，请检查麦克风后重试，也可以上传已有录音或直接输入文字';mediaMessage(message);$('voiceHint').textContent=message;if(typeof setVoiceStatus==='function')setVoiceStatus(message,'error');}
+    else {pendingRecordingIntent=null;voiceUploadPending=false;setRecording(false);if(pendingConversationTurn?.audio_processing){pendingConversationTurn=null;renderVoiceConversation()}const message='没有录到声音，请检查麦克风后重试，也可以上传已有录音或直接输入文字';mediaMessage(message);$('voiceHint').textContent=message;if(typeof setVoiceStatus==='function')setVoiceStatus(message,'error');}
   };
   recorder.addEventListener('stop',keepRecording,{once:true});
   if(!stopVoice('正在保留这一段录音'))void keepRecording();

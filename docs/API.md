@@ -1,14 +1,8 @@
 # 前后端接口合同 v0.5
 
-## 2026-10-17 待核实更正的本机恢复
+## 已被 Spec17 取代的 2026-10-17 更正方案
 
-自然更正无法逐字唯一对应旧话时，保持待核实，不做近义匹配。文字对话提供“核对这条更正”：使用者自行选中同一所属人、同一对话中更早的一整句原话，查看原句与更正原文中的新句，再明确确认。没有默认选项，不推测确认者是否患者本人。语音文字继续走原录音核对流程。
-
-本机 `POST /api/conversations/:id/corrections/:correctionTurnId` 接受 `{expected_conversation_version,expected_correction_version,target_turn_id,expected_target_version,expected_event_version,old_quote,confirmed:true}`。关联记录存在时必须提供其版本，否则 `expected_event_version:null`。替换文字只能从库内该条完整更正中解析；请求不能提供新内容。校验原句完整且仅出现一次、时间顺序、当前版本、来源归属与关联记录，在同一原子事务保存目标新版本、旧版、更正原文及确认记录。过期、跨人、来源改变或保存失败均不写入部分结果。
-
-此动作不调用模型。成功返回 `model_called:false`，旧自动分析失效，报告标记“原话已修订 · 自动整理待更新”。应用过的更正保留在修订历史，不再次作为当前事实发送；后续请求采用修订后的原话。修订历史记载当时版本，不将旧修订称作后来仍然有效的事实。
-
-生活影响的来源校验可保留模型已分类且引用到真实原话的完整字面句子，不受既有关键词清单遗漏影响。程序不采用模型改写的片段，保留时间和否定；未知、假设、他人话语、来源不符、已被替代的旧句不能借此成为确定事实。这是来源保真处理，不代表模型分类准确率已得到临床验证。
+本节旧方案曾允许从同一对话选择较早的一整句原话进行自然语言更正。它已被 Spec17 的“只修改最新一条仍有效的老人消息”规则取代，不再是当前接口合同，也不能据此允许直接请求修改较早消息。较早消息可查看/引用，但不能通过更正端点改写；保存时仍须重新核对最新有效消息、会话和来源版本。旧实现说明留在此处仅供历史追溯。
 
 ## 2026-10-01 照片来源核对门槛
 
@@ -23,6 +17,14 @@
 ## 内测版的正式边界
 
 `APP_MODE=local_first` 是内测版的正式运行模式。记录、修订历史、媒体原件和备份由浏览器的 Web Crypto + IndexedDB 处理，后端不创建 SQLite 健康数据库，并对旧 `/api/events`、`/api/media`、`/api/handoffs` 服务端路由返回 `404 legacy_api_disabled`。前端保留同形本地请求层，用于降低旧界面迁移风险；这些本地请求不会离开浏览器。
+
+本机编辑与删除也由 `HealthLocal` 在当前浏览器的加密资料库执行，不是后端持久化 API。当前会话只允许修改最新一条仍有效的老人消息；后续 AI 回复不取消该资格，较早的老人消息只有追问入口。保存时必须重新核对该条消息仍是最新有效老人消息、会话版本和原话版本未变化，并在有关联来源时核对记录/媒体版本；旧编辑窗口、录音原文编辑或直接请求都不能绕过这项检查。会话或记录删除须由使用者明确确认并绑定当前版本；成功后在本机原子清理所选范围内的对话/记录及修订历史、报告视图、关联录音照片原件与上传分片、派生操作资料，并刷新记录、看病资料、详情和当前会话视图。取消或失败不得显示删除成功。该删除不改写或自动删除先前下载/上传的历史密文备份；恢复旧备份可能带回备份时仍存在的资料。
+
+看病资料中的无关联本机媒体可通过 `HealthLocal` 的 `DELETE /api/media/{media_id}` 删除，请求为 `{delete_scope_confirmed:true,expected_version}`。仅当当前媒体版本仍一致、没有记录/会话/对话回合引用、没有正在执行的识别，也没有尚未完成的上传时才可删除；本机事务删除媒体元数据、加密原件及引用该媒体的操作记录。上传中的媒体返回冲突，必须先完成或取消上传。无法确认媒体所属人、仍有关联或正在识别的媒体必须保留，取消、版本冲突或删除失败不改变资料。这个同形路径由浏览器本地层处理；公网/持久化后端仍禁用 `/api/media` 旧存储路由，不提供媒体删除 API。既有云端密文备份不随本机删除自动改写。
+
+实现核对限制（2026-10-23，前端 v170 本地代码/合成回归）：单条记录若仍被会话引用，删除仍返回 `409 conversation_source_changed`，需删除整段会话；记录删除兼容分支仍允许请求省略 `expected_version`，因此版本绑定并非对直接本机请求的强制要求。较早的老人消息现不再显示修改入口，保存端也复核其仍是最新有效消息。会话删除现把回合直接引用的媒体 ID 纳入删除计划，并在所属人/其他会话引用检查不通过时拒绝；只清理删除响应明确返回的原件 ID 对应上传缓存，不清理其他原件或重试任务。这些结论来自本地代码和合成回归，不等同于真实浏览器或正常资料验收。
+
+另有一项独立的健康记忆限制：更正/撤销某条健康记忆时，失效联动仅扫描 `selected_context_ids` 或当前 `health_context` 含该 `context_id` 的会话；如果该记忆只残留在会话 `report_history` 中，该会话不会进入联动清理流程。`report_history` 是 `conversation:<conversation_id>` 加密文档里的历史报告字段；不能因文字相似就推断它与某条被删除的记录或媒体有关。此限制只涉及健康记忆失效，不代表当前记录/媒体删除范围。
 
 ### 2026-10-09 隔离语音试验保护
 
@@ -50,7 +52,7 @@ ASR文字是机器初稿，可供正常对话整理，但会话报告保持 `aut
 - `POST /api/app/login`：请求 `{"password":"..."}`，成功设置已签名、HttpOnly、SameSite=Strict 的 Cookie。
 - `POST /api/app/logout`：需 Cookie + `X-CSRF-Token`，清除当前 Cookie。
 - `POST /api/ai/organize`：需 Cookie + CSRF + `consent:true`；只返回经验证的草稿和本地安全字段，不写数据库。
-- `POST /api/ai/conversation-turn`：需精确 Origin、签名 Cookie 和 CSRF。`turns` 为 1–40 条老人原话，每条 `{turn_id,text,version?,responding_to?:{turn_id,text}}`；`responding_to` 只解释回答语境，助手 ID 不能作为患者事实来源。`health_context` 在客户端发送前限制为本次显式勾选的最多 5 项；未勾选内容不外发。完整对话仍保存在本机。`action` 可为 `ask / reply / finish / urgent`：`reply` 表示本轮仅回应、不结束、不新增追问计数；`assistant_text` 是已经验证的完整回应，模型内部 `reply_text` 不作为患者事实。若 `model_intent="non_health"`，最新原话与健康记录无关，返回 `action="reply"`、`stop_reason="non_health_input"`，不追问、不将这句话写入临床字段；原话仍由本机完整保留。
+- `POST /api/ai/conversation-turn`：需精确 Origin、签名 Cookie 和 CSRF。`turns` 为 1–40 条老人原话，每条 `{turn_id,text,version?,responding_to?:{turn_id,text},source?}`；`responding_to` 只解释回答语境，助手 ID 不能作为患者事实来源。`version` 和 `source` 是客户端提供的上下文/来源说明，不是服务端身份凭证。可选 top-level `quote_context` 是独立的引用上下文快照（`{conversation_id,turn_id,role:"elder"|"assistant",version,text,source:{source_kind,record_id,record_version,media_id,media_version}}`）；`assistant` 的来源类型必须为 `assistant_message` 且患者来源 ID/版本均为 null。它不属于 `turns`，不代表患者回答了 AI 问题，不得进入临床事实、风险证据、健康记忆或报告来源。引用文本是不可信数据，不能覆盖系统规则。模型层验证字段形状、角色与长度；无效结构返回 400 `quote_context_invalid`，若引用目标同时出现在 `turns` 中但角色/版本/原文/音频来源不一致，返回 409 `quote_context_stale`。较早、未出现在截断 `turns` 内的引用可存在。所属人及目标当前版本/来源由浏览器加密本地存储层在发送前核实；后端不持有本地资料库，不能宣称独立验证其归属。`health_context` 在客户端发送前限制为本次显式勾选的最多 5 项；未勾选内容不外发。完整对话仍保存在本机。`action` 可为 `ask / reply / finish / urgent`：`reply` 表示本轮仅回应、不结束、不新增追问计数；`assistant_text` 是已经验证的完整回应，模型内部 `reply_text` 不作为患者事实。若 `model_intent="non_health"`，最新原话与健康记录无关，返回 `action="reply"`、`stop_reason="non_health_input"`，不追问、不将这句话写入临床字段；原话仍由本机完整保留。
   `controller.followup_questions?:string[]` 保存模型多项候选中经过现有单问和范围校验的项目（最多 12 条，每条最多 160 字，包含已问/已答项目）；客户端原样加密保存并在后续发言时回传。`completeness.pending_questions?:string[]` 是未明确的候选，医生报告将其标为“助手候选 · 待核实”，不得当作患者事实或阴性结论。未知的实际回答保留原句和来源，不称为已经否认。模型仍选择下一问；此元数据不强制固定问序，不突破主动结束、疲劳与总计 12 问上限。未核实项会在结束后保留，`complete` 不因其他类别已有事实而忽略它们。同一类别多个短回答分别绑定实际问题和患者来源。
   本机医生报告另列“原话与对应问题”：短答保留患者原句、原话 ID 和版本，旁列实际助手问题全文及其 ID/版本，标为非患者陈述；不会将“没有”扩写成症状结论。对应关系须匹配库内实际问题和原始顺序，失效问题只作历史展示。
   报告的 `question_coverage` 是候选提名来源与当前回答的工程记录，不是临床分析。追加危险原话后，即使旧临床分析已清除，仍逐项从当前原话和有效问答重算待核实清单；未知、拒答、历史、他人和未回答说明不作否认。提名的原话或背景范围改变时，旧候选明确标为历史、范围需重新核实。刷新与加密备份恢复同样检查来源和版本，不复用失效摘要。
@@ -66,6 +68,10 @@ ASR文字是机器初稿，可供正常对话整理，但会话报告保持 `aut
 只有服务启动时明确选用的 `ProductHandler` 才为本地优先产品路由建立普通产品执行作用域；默认导入的 `Handler` 和直接构造的客户端保持有限试验授权门禁。显式 standalone／已保存录音试验上下文优先于产品作用域，失效上下文不能复用。HTTP 请求、环境变量不能切换此策略。`GET /api/app/config` 的 `capabilities.*.available` 反映当前 Handler 是否允许产品路由尝试；`connection_state: unverified` 仍表示没有验证供应商连接。服务端放行不等于识别质量或真实用户流程已验证。Mock 路由仍返回 `503 provider_mock_unavailable` / `503 media_mock_unavailable`，隔离自动化测试里的 Mock 不能作为用户功能验收。客户端也拒绝 `recognition.is_mock` 或旧 `[Mock ASR/OCR]` 占位文字进入患者事实，并保留录音。历史模拟回合标记 `is_mock:true`，从模型输入与报告事实中排除，历史不静默删除。
 
 本机接口 `POST /api/conversations/:id/context {context_ids:[...]}` 只保存这次选择，不请求 AI；下次发言或主动重试才发送。`POST /api/conversations/:id/resume-assistant` 可重试未完成回复或失败提示，保留同一条老人原话。交接材料带记录/日期筛选时只附所选记录关联的原件；未关联原件仍在“看病资料”。首次空库可直接从已验证加密备份恢复，已有库覆盖恢复仍需明确确认。
+
+本机普通会话 `POST /api/conversations/:id/turns` 可选 `responding_to:{turn_id,version,text}`，用于明确绑定本条新原话所回答的助手问题。客户端仅在助手回合属于同一会话/所属人、仍存在且未 `superseded`、非 `mock`/失败、原文和版本一致，且问题所用背景仍有效时才发送。用户没有选择目标、请求中不带 `responding_to` 时，保持原有自动相邻问题行为；用户明确选择的绑定若已失效、版本不符或背景失效，必须拒绝此次提交、保留输入并提示重新选择，不能静默省略绑定后改答另一条。成功写入本机回合时保存既有 `responding_to:{turn_id,text}` 与 `responding_to_version` 字段。通用引用另用可选 `quote_ref:{turn_id,version}`，本地层必须以 URL 中的会话 ID 重读当前加密资料并验证唯一目标、所属人、角色、版本、原文及其原件/记录版本；客户端不得自报 role/text/source 快照。通过后在新消息保存独立 `quote_context`，并以 `/api/ai/conversation-turn` 顶层字段发送；录音回合也可带 quote_ref。引用存在时禁止自动绑定为临床问答答案，不能复用 `responding_to`。旧目标失效时拒绝并保留输入，不发送旧引用；仅当引用仍在模型 turns 截断窗口内时后端可进一步校对一致性。后续云端 `/api/ai/conversation-turn` 仍不把 `responding_to` 的版本发送给模型，也不将助手问题当作患者证据。
+
+该可选字段仅属于普通本机会话新增回合接口，不属于 `saved-audio-trial` 或其他私有试验请求；试验请求体、来源绑定和已冻结 wire 保持不变。
 
 生产环境的 TOS 签名使用函数所绑定 IAM 角色的请求级 STS 凭据（`X-Faas-Access-Key-Id`、`X-Faas-Secret-Access-Key`、`X-Faas-Session-Token`），不配置长期 TOS AK/SK。角色策略必须限制到目标私有 Bucket 的 `backups/` 前缀。函数到 TOS 的列表请求使用同地域内网 Endpoint；签发给浏览器的短链接使用公网 HTTPS Endpoint。
 
@@ -320,8 +326,18 @@ link_status:        not_linked | pending | linked | link_failed
 
 - 录音媒体的 `recognition.text` 与原始 `event_link` 保留为原始 ASR 和来源锚点。原件核对入口沿同一所属人的 `supersedes_id` 修订链读取唯一当前记录，分叉、循环、缺失或跨所属人链不能作为当前来源。
 - 本机 `POST /api/events/:record_id/source-review` 对 `audio_transcript` 要求当前版本 `expected_version`、显式 `compared_with_original:true` 和仍存在的关联录音原件。返回的 `source_review` 包含 `method, text, confirmed_at, record_id`；记录保持 inbox、医学确认范围为空。确认只证明使用者声明文字准确，不清除风险。再次修订清空该确认。
-- 用已保存录音新建对话时使用当前已核对记录的 `raw_text`、`record_id`、`media_id` 与 `source_version`；本机保存再次检查版本和来源，冲突拒绝，不能重用原始 ASR 代替当前文字。当前受控试验停点优先阻止新建，不会通过文字确认解除或自动调用模型。
+- 通过这条核对流程后新建对话、以及下文独立已核对录音私有试验时，仍使用当前记录和完整来源绑定；该旧路径不代表当前普通语音聊天必须先核对。
 - 本机新增错误：`audio_original_unavailable`、`audio_source_review_required`、`audio_source_changed`。无原件或保存失败不能显示确认成功。多使用者／家庭隔离、原始识别回包及历史保留规则沿用。
+
+### 当前普通语音聊天来源合同（Spec14）
+
+当前本机优先聊天允许成功识别的新录音直接进入当次对话。`POST /api/ai/conversation-turn` 的每个录音用户回合可带可选 `source`：`{kind:"audio_transcript",status:"machine_transcribed"|"user_edited"|"original_comparison",record_id,record_version,media_id,media_version}`。后端检查对象字段、状态、ID 和正整数版本；缺少 `source` 的旧文字客户端保持兼容。后端将来源描述随同一轮对话上下文传给模型，不额外调用模型。
+
+`source` 是客户端提供的来源说明，不是服务端身份凭证或原件真实性证明。前端必须在本机核对当前对话所属人、当前原话、记录版本、录音媒体版本和会话绑定；当前新转写只允许本次自动提交一次，刷新或重开时旧待处理录音不得自动外发。`machine_transcribed` 与 `user_edited` 不表示用户逐字核对；`original_comparison` 也只记录客户端状态，不是医学确认。自动转写及用户修改内容不得因此写入已确认健康记忆；报告应保留自动转写/用户修改来源状态，任何已核对状态不能从 ASR 自动产生。修改或过期来源继续按现有版本机制使旧派生结果失效。
+
+报告 `transcript[]` 对音频回合使用扁平字段 `source_status`、`source_record_id`、`source_record_version`、`source_media_id`、`source_media_version`、`source_verified_by_user`；旧来源不完整的记录可用 `legacy_unclassified`，对应编号/版本可为 `null`。交接导出 `conversation_reports[].transcript[]` 则将来源放在 `source` 对象中，字段为 `kind`、`status`、`record_id`、`record_version`、`media_id`、`media_version`、`verified_by_user`；同时保留原文版本历史。`verified_by_user` 仅表示来源文字是否对照过原音，不表示医学确认。
+
+此普通聊天合同不放宽照片 OCR、后台保存或 `saved-audio-trial` 的严格私有授权规则；真实媒体/模型链路及准确性仍需分别验收。
 
 ### 独立的已核对录音单次承接
 

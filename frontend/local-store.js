@@ -17,6 +17,7 @@
   const RECOVERABLE_MEDIA_ERRORS = new Set(['media_mock_unavailable', 'provider_not_configured', 'media_configuration_invalid', 'session_unavailable', 'authentication_required', 'access_not_configured', 'ai_rate_limited', 'configuration_missing', 'network_unavailable', 'provider_timeout', 'provider_unavailable', 'provider_rate_limited']);
   const CONVERSATION_FAILURE_CODES = new Set(['ai_conversation_failed', 'model_timeout', 'model_network_error', 'model_configuration_invalid', 'model_redirect_rejected', 'model_response_too_large', 'model_output_truncated', 'model_response_invalid', 'model_mock_unavailable', 'model_http_error', 'model_account_binding_required', 'model_schema_invalid', 'model_evidence_invalid', 'model_reply_unsafe', 'reviewed_risk_invalid', 'trial_authorization_required', 'trial_budget_exhausted', 'trial_stopped', 'trial_review_required', 'saved_audio_trial_source_changed', 'saved_audio_trial_not_authorized', 'audio_source_review_required', 'session_unavailable', 'authentication_required', 'access_not_configured', 'ai_rate_limited', 'network_unavailable', 'subject_mismatch', 'conversation_not_found', 'conversation_version_conflict']);
   const CONVERSATION_HTTP_FAILURE_STATUSES = new Set([401, 403, 408, 409, 422, 429, 500, 502, 503, 504]);
+  const PROVIDER_HTTP_FAILURE_STATUSES = new Set([401, 403, 408, 429, 500, 502, 503, 504]);
   let initialisePromise;
   let active = false;
   let pendingLocalOperations = 0;
@@ -30,6 +31,11 @@
   const conversationWrites = new Map();
   const eventWrites = new Map();
   const mediaWrites = new Map();
+  const mediaRecognitionWrites = new Map();
+  const audioRecognitionWrites = new Map();
+  const AUDIO_RECOGNITION_LOCK = 'bingli-audio-recognition-active-v1';
+  let localAudioRecognitionScopes = 0;
+  const localMediaRecognitionIds = new Set();
   const TRIAL_VOICE_KEY = 'trial-control:voice';
   function notifyVaultState(state) {
     for (const listener of vaultStateListeners) {
@@ -166,9 +172,10 @@
     return (conversation?.turns || []).filter(turn => !turn.superseded);
   }
   function reportableConversationTurns(conversation) {
-    const turns = liveConversationTurns(conversation);
+    const turns = liveConversationTurns(conversation).filter(turn => turn.audio_source_invalidated !== true);
     const pendingAudioIndex = turns.findIndex(turn => turn.role === 'elder'
-      && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true);
+      && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true
+      && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status));
     return pendingAudioIndex < 0 ? turns : turns.slice(0, pendingAudioIndex);
   }
   function explicitNaturalCorrection(text) {
@@ -189,7 +196,7 @@
   function mockSource(item) {
     return item?.is_mock === true || /\[Mock (?:ASR|OCR)\]/i.test(String(item?.raw_text || item?.text || ''));
   }
-  function audioReviewCurrent(turn, eventIndex, mediaIndex = null, conversationId = null) {
+  function audioReviewCurrent(turn, eventIndex, mediaIndex = null, conversationId = null, expectedSubjectId = null) {
     const event = eventIndex.get(turn?.record_id);
     const media = mediaIndex && turn?.media_id ? mediaIndex.get(turn.media_id) : null;
     return turn?.source_kind === 'audio_transcript' && turn.audio_source_reviewed === true
@@ -198,8 +205,93 @@
       && event.source_review?.method === 'original_comparison'
       && event.source_review.record_id === event.record_id && event.source_review.text === turn.text
       && (!conversationId || !turn.audio_source_conversation_id || turn.audio_source_conversation_id === conversationId)
-      && (!media || !Number.isInteger(turn.audio_source_media_version) || media.version === turn.audio_source_media_version)
+      && (!expectedSubjectId || subjectOf(event) === expectedSubjectId)
+      && (!media || subjectOf(media) === subjectOf(event)
+        && (!Number.isInteger(turn.audio_source_media_version) || media.version === turn.audio_source_media_version))
       && !safety.audioNeedsReview(event);
+  }
+  function audioConversationSourceBindingCurrent(turn, eventIndex, mediaIndex, conversationId, expectedSubjectId) {
+    if (audioReviewCurrent(turn, eventIndex, mediaIndex, conversationId, expectedSubjectId)) return true;
+    if (!['machine_transcribed', 'user_edited'].includes(turn?.audio_source_status)) return false;
+    const event = eventIndex.get(turn.record_id), media = mediaIndex.get(turn.media_id);
+    return turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true
+      && event?.source_kind === 'audio_transcript' && event.state !== 'superseded'
+      && event.version === turn.audio_source_version && event.raw_text === turn.text
+      && media?.kind === 'audio' && media.recognition_status === 'succeeded'
+      && !mockSource(media) && media.version === turn.audio_source_media_version
+      && Number.isSafeInteger(turn.audio_source_media_version) && Number.isSafeInteger(turn.audio_source_version)
+      && subjectOf(media) === subjectOf(event)
+      && (!expectedSubjectId || subjectOf(event) === expectedSubjectId)
+      && turn.audio_source_conversation_id === conversationId && media.conversation_id === conversationId
+      && (!event.source_conversation_id || event.source_conversation_id === conversationId)
+      && (turn.audio_source_status !== 'user_edited' || !event.source_review)
+      && safety.currentAudioSource(media, [...eventIndex.values()])?.record_id === event.record_id;
+  }
+  function audioConversationSourceCurrent(turn, eventIndex, mediaIndex, conversationId, expectedSubjectId) {
+    return turn?.audio_source_invalidated !== true
+      && audioConversationSourceBindingCurrent(turn, eventIndex, mediaIndex, conversationId, expectedSubjectId);
+  }
+  async function quoteContextCurrent(conversation, quote) {
+    if (!quote || quote.conversation_id !== conversation?.conversation_id || !Array.isArray(conversation.turns)) return false;
+    const matches = conversation.turns.filter(turn => turn.turn_id === quote.turn_id);
+    const turn = matches[0], source = quote.source || {};
+    if (matches.length !== 1 || !turn || turn.superseded || mockSource(turn) || turn.text !== quote.text
+      || turn.role !== quote.role || (turn.version ?? 1) !== quote.version) return false;
+    if (turn.role === 'assistant') {
+      if (source.source_kind !== 'assistant_message' || source.record_id !== null || source.record_version !== null
+        || source.media_id !== null || source.media_version !== null || turn.ai_failed
+        || !['ask', 'reply', 'finish', 'urgent', 'soon_evaluation'].includes(turn.action)
+        || (conversation.stale_responding_to_turn_ids || []).includes(turn.turn_id)) return false;
+      const currentContext = await healthContext(subjectOf(conversation));
+      if (Number(conversation.health_context_version || 0) !== Number(currentContext.version || 0)) return false;
+      const selectedContextIds = new Set((conversation.selected_context_ids || []).filter(contextId =>
+        currentContext.entries.some(entry => entry.context_id === contextId && usableHealthEntry(entry, subjectOf(conversation)))));
+      return !Array.isArray(turn.model_context_ids) || turn.model_context_ids.every(contextId => selectedContextIds.has(contextId));
+    }
+    if (turn.role !== 'elder' || !turn.record_id || source.record_id !== turn.record_id) return false;
+    const event = await vault.get(eventKey(turn.record_id));
+    if (!event || subjectOf(event) !== subjectOf(conversation) || event.state === 'superseded'
+      || event.raw_text !== turn.text || event.version !== source.record_version) return false;
+    if (turn.source_kind !== 'audio_transcript') return source.source_kind === 'elder'
+      && source.media_id === null && source.media_version === null && event.source_kind === 'elder';
+    const media = turn.media_id ? await vault.get(mediaKey(turn.media_id)) : null;
+    if (!media || source.source_kind !== 'audio_transcript' || source.media_id !== media.media_id
+      || source.media_version !== media.version || media.kind !== 'audio' || mockSource(media)
+      || media.recognition_status !== 'succeeded' || !(await vault.get(mediaBinaryKey(media.media_id)))?.bytes) return false;
+    return audioConversationSourceCurrent(turn, new Map([[event.record_id, event]]), new Map([[media.media_id, media]]),
+      conversation.conversation_id, subjectOf(conversation));
+  }
+  function reportHistoryIncluding(history, previous, next) {
+    if (!previous || !next || previous.version === next.version) return Array.isArray(history) ? history : [];
+    const saved = Array.isArray(history) ? history : [];
+    return saved.some(item => item?.version === previous.version) ? saved : [...saved, previous];
+  }
+  function removeRevokedContextFromReport(report, changed) {
+    if (!report || !Array.isArray(report.sections)) return report;
+    const revoked=new Set(changed||[]),sections=report.sections.map(section=>({...section,lines:(section.lines||[]).filter(line=>{
+      const ids=[...(line.source_context_ids||[]),line.source_context?.context_id].filter(Boolean);
+      return !ids.some(contextId=>revoked.has(contextId));
+    })})).filter(section=>section.lines.length);
+    const transcript=Array.isArray(report.transcript)?report.transcript.filter(turn=>turn.role==='elder').map(turn=>turn.text).filter(Boolean):[];
+    const bodyParts=sections.map(section=>`${section.title}\n${section.lines.map(line=>`- ${line.tags?.length?`${line.tags.join('、')}：`:''}${line.text}`).join('\n')}`);
+    if(transcript.length)bodyParts.push(`老人原话历史（按说话顺序完整保留）\n${transcript.join('\n')}`);
+    const scrubCoverage=coverage=>{
+      if(!coverage||typeof coverage!=='object')return coverage;
+      const scrubNomination=nomination=>nomination?{...nomination,context:(nomination.context||[]).filter(item=>!revoked.has(item.context_id)),
+        selected_context_ids:(nomination.selected_context_ids||[]).filter(contextId=>!revoked.has(contextId))}:nomination;
+      const sources=coverage.sources?{...coverage.sources,context:(coverage.sources.context||[]).filter(item=>!revoked.has(item.context_id)),
+        selected_context_ids:(coverage.sources.selected_context_ids||[]).filter(contextId=>!revoked.has(contextId))}:coverage.sources;
+      return {...coverage,...(sources?{sources}:{}),...(Array.isArray(coverage.candidates)?{candidates:coverage.candidates.map(item=>({...item,nomination:scrubNomination(item.nomination)}))}:{})};
+    };
+    const safeCoverage=scrubCoverage(report.question_coverage);
+    return {...report,sections,body:bodyParts.join('\n\n'),source_context_ids:(report.source_context_ids||[]).filter(contextId=>!revoked.has(contextId)),
+      ...(safeCoverage?{question_coverage:safeCoverage}:{})};
+  }
+  function audioConversationSourcesCurrent(conversation, eventIndex, mediaIndex) {
+    return liveConversationTurns(conversation).filter(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript')
+      .every(turn => ['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)
+        ? audioConversationSourceCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, subjectOf(conversation))
+        : audioReviewCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, subjectOf(conversation)));
   }
   function reconcileConversationAudioReview(conversation, events, mediaItems = null) {
     if (!conversation || !Array.isArray(events)) return conversation;
@@ -207,10 +299,16 @@
     const mediaIndex = Array.isArray(mediaItems) ? new Map(mediaItems.map(item => [item.media_id, item])) : null;
     let changed = false;
     const turns = (conversation.turns || []).map(turn => {
-      if (turn.role !== 'elder' || turn.source_kind !== 'audio_transcript' || turn.audio_source_reviewed !== true
-        || audioReviewCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id)) return turn;
+      if (turn.role !== 'elder' || turn.source_kind !== 'audio_transcript') return turn;
+      const status = turn.audio_source_status;
+      const managedStatus = ['machine_transcribed', 'user_edited'].includes(status);
+      if (!managedStatus && turn.audio_source_reviewed !== true) return turn;
+      const current = managedStatus
+        ? Boolean(mediaIndex && audioConversationSourceBindingCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, subjectOf(conversation)))
+        : audioReviewCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, subjectOf(conversation));
+      if (current && turn.audio_source_invalidated !== true || !current && turn.audio_source_invalidated === true) return turn;
       changed = true;
-      return { ...turn, audio_source_reviewed: false };
+      return { ...turn, audio_source_invalidated: !current };
     });
     if (!changed) return conversation;
     const updated = { ...conversation, turns };
@@ -228,7 +326,9 @@
   function pendingElderTurn(conversation) {
     const turns = liveConversationTurns(conversation);
     const latest = turns[turns.length - 1];
-    if (turns.some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) return null;
+    if (turns.some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript'
+      && (turn.audio_source_invalidated === true || turn.audio_source_reviewed !== true
+        && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)))) return null;
     if (latest?.role === 'elder' && !mockSource(latest)) return latest;
     return latest?.role === 'assistant' && latest.ai_failed && turns.at(-2)?.role === 'elder' && !mockSource(turns.at(-2)) ? turns.at(-2) : null;
   }
@@ -256,6 +356,24 @@
     const run = index => index >= ids.length ? task() : withMediaLock(ids[index], () => run(index + 1));
     return run(0);
   }
+  async function audioRecognitionInFlight() {
+    if (localAudioRecognitionScopes > 0) return true;
+    const locks = globalThis.navigator?.locks;
+    if (!locks) return false;
+    if (typeof locks.query === 'function') {
+      try {
+        const state = await locks.query();
+        if ([...(state.held || []), ...(state.pending || [])].some(lock => lock.name === AUDIO_RECOGNITION_LOCK)) return true;
+        return false;
+      } catch { /* Fall through to a non-blocking lock probe. */ }
+    }
+    if (typeof locks.request !== 'function') return true;
+    try {
+      let acquired = false;
+      await locks.request(AUDIO_RECOGNITION_LOCK, { ifAvailable: true }, lock => { acquired = Boolean(lock); });
+      return !acquired;
+    } catch { return true; }
+  }
   async function withEventLocks(recordIds, task) {
     const ids = [...new Set(recordIds.filter(Boolean))].sort();
     const run = index => index >= ids.length ? task() : withEventLock(ids[index], () => run(index + 1));
@@ -279,6 +397,10 @@
   }
 
   function validLocalDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value); }
+  function currentLocalDate() {
+    const date=new Date();
+    return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+  }
   async function listConversations() {
     const values = await vault.list('conversation:');
     const [currentContext, events, mediaItems] = await Promise.all([healthContext(), listEvents(), mediaList()]);
@@ -423,6 +545,8 @@
       // current scope; current background caches and clinical state are cleared.
       clean.report = conversation.report ? await buildCurrentConversationReport(clean,
         legacyCompatibility ? conversation.report : { ...conversation.report, question_coverage: null }, saved) : null;
+      const history=reportHistoryIncluding(conversation.report_history,conversation.report,clean.report).map(report=>removeRevokedContextFromReport(report,changed));
+      if(history.length)clean.report_history=history;
       puts.push({ key: conversationKey(conversation.conversation_id), value: clean });
       unchanged.push({ key: conversationKey(conversation.conversation_id), value: conversation });
     }
@@ -474,6 +598,13 @@
     return await saveHealthMemory(current, saved, registry) ? ok(method === 'POST' ? 201 : 200, { ok: true, subject_id: current.subject_id, health_context: saved }) : fail(409, 'stale_health_memory');
   }
   function elderTurns(conversation) { return reportableConversationTurns(conversation).filter(turn => turn.role === 'elder' && !mockSource(turn)); }
+  function latestEditableOwnTurn(conversation) {
+    const latest = (conversation?.turns || []).filter(turn => turn.role === 'elder' && !turn.superseded
+      && turn.audio_source_invalidated !== true && !mockSource(turn)).at(-1) || null;
+    if (latest?.source_kind === 'audio_transcript' && latest.audio_source_reviewed !== true
+      && !['machine_transcribed', 'user_edited'].includes(latest.audio_source_status)) return null;
+    return latest;
+  }
   function analysisSources(conversation, currentContext = null) {
     const selected = [...(conversation.selected_context_ids || [])].sort();
     const contexts = currentContext ? currentContext.entries.filter(item => selected.includes(item.context_id) && usableHealthEntry(item, subjectOf(conversation))) : conversation.health_context || [];
@@ -704,13 +835,13 @@
     const withinClause = '[^，。；！？,;!?\\n]*';
     return new RegExp(`${topic}${withinClause}${unknown}|${unknown}${withinClause}${topic}`).test(text || '');
   }
-  function reportTurnCategories(turn, state) {
-    const fromState = CLINICAL_CATEGORIES.filter(category => state?.[category]?.status === 'known' && state[category].evidence_turn_ids?.includes(turn.turn_id));
-    // Once reviewed source references exist, do not reclassify "晚上睡得好"
-    // as an onset time merely because it contains "晚上".
-    if (Object.keys(state).length) return fromState;
-    const fromWords = CLINICAL_CATEGORIES.filter(category => REPORT_PATTERNS[category].test(turn.text || ''));
-    return [...new Set([...fromState, ...fromWords])];
+  function reportTurnCategories(turn, state, conversation) {
+    // Raw quotes can inherit a category only when that category's own current
+    // summary passed the literal-source check. A rejected summary must not
+    // keep its label alive through an evidence ID or a keyword fallback.
+    return CLINICAL_CATEGORIES.filter(category => state?.[category]?.status === 'known'
+      && state[category].evidence_turn_ids?.includes(turn.turn_id)
+      && groundedReportSummary(state[category], conversation));
   }
   function reportSectionFor(categories, preferChief = false) {
     if (preferChief && categories.includes('main_complaint')) return 'chief_complaint';
@@ -1090,6 +1221,18 @@
       }
     }
     const hasCurrentSummary = grouped.some(section => section.lines.some(line => line.kind === 'summary'));
+    const priorNonHealthRecord = (conversation.report?.sections || []).some(section =>
+      section.key === 'source_record' && section.title === '原话记录');
+    const boundUnclassifiedSources = boundAnalysis && !nonHealthOnly && !priorNonHealthRecord && !hasCurrentSummary
+      ? unclassifiedReportLines(conversation).filter(line => {
+        const turn = turns.find(item => item.turn_id === line.source_turn_ids[0]);
+        return turn && !reportTurnCategories(turn, state, conversation).length;
+      }) : [];
+    if (boundUnclassifiedSources.length) {
+      const section = { key: 'source_record', title: '患者原话（未分类 · 待整理）', lines: boundUnclassifiedSources };
+      grouped.push(section);
+      bySection.set(section.key, section);
+    }
     if (!hasCurrentSummary) grouped.filter(section => !['patient_questions', 'source_record', 'correction_pending_sources', 'correction_history'].includes(section.key))
       .forEach(section => { section.title += '（原话历史 · 待核对）'; });
     turns.forEach((turn, index) => {
@@ -1105,7 +1248,7 @@
       }
       if (hasCurrentSummary) return;
       if (!boundAnalysis) return;
-      const categories = reportTurnCategories(turn, state);
+      const categories = reportTurnCategories(turn, state, conversation);
       const sectionKey = reportSectionFor(categories, !hasChiefComplaint);
       if (!sectionKey) return;
       if (sectionKey === 'chief_complaint') hasChiefComplaint = true;
@@ -1221,6 +1364,10 @@
         role: turn.role,
         text: turn.text,
         source_kind: turn.source_kind || (turn.role === 'assistant' ? 'system' : 'elder'),
+        ...(turn.source_kind === 'audio_transcript' ? { source_status: turn.audio_source_reviewed === true ? 'original_comparison' : turn.audio_source_status || 'legacy_unclassified',
+          source_record_id: turn.record_id || null, source_record_version: turn.audio_source_version ?? null,
+          source_media_id: turn.media_id || null, source_media_version: turn.audio_source_media_version ?? null,
+          source_verified_by_user: turn.audio_source_reviewed === true } : {}),
         created_at: turn.created_at,
         version: turn.version,
       })),
@@ -1262,6 +1409,14 @@
       const section = reportSectionFor([category], category === 'main_complaint');
       return line && section && !shortAnswerSummary(line.text) ? [JSON.stringify([section, { ...line, clinical_categories: [category] }])] : [];
     }).sort() : [];
+    const priorNonHealthRecord = (conversation.report?.sections || []).some(section =>
+      section.key === 'source_record' && section.title === '原话记录');
+    const boundUnclassifiedSources = !nonHealthOnly && !priorNonHealthRecord && !correctionPending && analysisSourcesCurrent(conversation, currentContext)
+      && !expectedSummaries.length ? unclassifiedReportLines(conversation).filter(line => {
+        const turn = elderTurns(conversation).find(item => item.turn_id === line.source_turn_ids[0]);
+        const state = conversation.completeness?.clinical_state || {};
+        return turn && !reportTurnCategories(turn, state, conversation).length;
+      }) : [];
     const cachedSummaryLines = (conversation.report?.sections || []).flatMap(section => (section.lines || [])
       .filter(line => line.kind === 'summary').map(line => [section.key, line]));
     const hasCachedCategories = cachedSummaryLines.length > 0 && cachedSummaryLines.every(([, line]) => Array.isArray(line.clinical_categories));
@@ -1305,9 +1460,17 @@
     const staleUnboundChecklist = unboundChecklistText !== null
       && (cachedChecklist.length !== 1 || cachedChecklist[0] !== unboundChecklistText);
     const unclassifiedSources = unclassifiedReportLines(conversation);
+    const boundUnclassifiedIds = new Set(boundUnclassifiedSources.flatMap(line => line.source_turn_ids || []));
+    const staleBoundClassifiedQuotes = boundUnclassifiedIds.size > 0 && (conversation.report?.sections || []).some(section =>
+      ['chief_complaint', 'onset_course', 'symptoms_impact', 'background_actions'].includes(section.key)
+      && (section.lines || []).some(line => line.kind === 'quote'
+        && (line.source_turn_ids || []).some(turnId => boundUnclassifiedIds.has(turnId))));
     const sourceRecordCurrent = correctionPending ? !sourceRecord : nonHealthOnly
       ? Boolean(sourceRecord && sourceRecord.title === '原话记录' && !hasClinicalUnknowns
         && sameAudioData(sourceRecord.lines || [], nonHealthReportLines(conversation, currentTurns)))
+      : analysisSourcesCurrent(conversation, currentContext) && boundUnclassifiedSources.length
+        ? Boolean(sourceRecord && sourceRecord.title === '患者原话（未分类 · 待整理）'
+          && sameAudioData(sourceRecord.lines || [], boundUnclassifiedSources) && !staleBoundClassifiedQuotes)
       : !analysisSourcesCurrent(conversation, currentContext) && unclassifiedSources.length
         ? Boolean(sourceRecord && sourceRecord.title === '患者原话（未分类 · 待整理）'
           && sameAudioData(sourceRecord.lines || [], unclassifiedSources))
@@ -1363,7 +1526,7 @@
   async function conversationArchiveView(conversation) {
     const legacyCandidate=legacyReorganizationOutputCandidate(conversation);
     const current = await conversationWithCurrentReport(conversation);
-    const operation=current.manual_correction_reorganization||{};
+    const operation=current.manual_correction_reorganization;
     return {
       conversation_id: current.conversation_id,
       subject_id: subjectOf(current),
@@ -1375,13 +1538,16 @@
       version: current.version,
       new_text_trial: current.new_text_trial || null,
       report: current.report,
+      report_history: Array.isArray(current.report_history)?current.report_history:[],
       manual_corrections:(current.manual_corrections||[]).map(item=>({correction_turn_id:item.correction_turn_id,target_turn_id:item.target_turn_id,
         target_version_after:item.target_version_after,target_text_after:item.target_text_after,confirmed_at:item.confirmed_at})),
-      manual_correction_reorganization:{state:operation.state||null,scope_id:operation.scope_id||null,body_sha256:operation.body_sha256||null,
+      ...(operation?{manual_correction_reorganization:{state:operation.state||null,scope_id:operation.scope_id||null,body_sha256:operation.body_sha256||null,
+        ...(CONVERSATION_FAILURE_CODES.has(operation.failure_code)?{failure_code:operation.failure_code}:{}),
+        ...(storedProviderHttpStatus(operation.provider_http_status,operation.failure_code)?{provider_http_status:operation.provider_http_status}:{}),
         operation_kind:operation.operation_kind||null,result_provenance:operation.result_provenance||null,
         trace_id:operation.trace_id||null,provider:operation.provider||null,model_id:operation.model_id||null,
         source_binding:operation.source_binding?structuredClone(operation.source_binding):null,
-        legacy_reply_review:operation.legacy_reply_review||null},
+        legacy_reply_review:operation.legacy_reply_review||null}}:{}),
       legacy_reorganization_candidate:projectLegacyReorganizationCandidate(legacyCandidate),
       last_ai_metadata:current.last_ai_metadata?{trace_id:current.last_ai_metadata.trace_id||null,provider:current.last_ai_metadata.provider||null,
         model_id:current.last_ai_metadata.model_id||null,prompt_version:current.last_ai_metadata.prompt_version||null}:null,
@@ -1389,7 +1555,10 @@
         .map(turn=>({turn_id:turn.turn_id,version:turn.version,text:turn.text,created_at:turn.created_at,
           trace_id:turn.legacy_reorganization_history.trace_id,provider:turn.legacy_reorganization_history.provider,
           confirmed_at:turn.legacy_reorganization_history.confirmed_at})),
-      turns: liveConversationTurns(current).map(turn => ({
+      turns: liveConversationTurns(current).map(turn => {
+        const errorCode = CONVERSATION_FAILURE_CODES.has(turn.error_code) ? turn.error_code : null;
+        const providerStatus = storedProviderHttpStatus(turn.provider_http_status, errorCode);
+        return ({
         turn_id: turn.turn_id,
         role: turn.role,
         text: turn.text,
@@ -1402,15 +1571,20 @@
         versions: turn.versions || [],
         action: turn.action || null,
         ai_failed: turn.ai_failed === true,
-        error_code: CONVERSATION_FAILURE_CODES.has(turn.error_code) ? turn.error_code : null,
+        ...(errorCode ? { error_code: errorCode } : {}),
+        ...(providerStatus ? { provider_http_status: providerStatus } : {}),
         is_mock: mockSource(turn),
         audio_source_reviewed: turn.audio_source_reviewed === true,
+        audio_source_status: turn.audio_source_status || null,
+        audio_source_invalidated: turn.audio_source_invalidated === true,
         audio_source_version: turn.audio_source_version || null,
         audio_source_media_version: turn.audio_source_media_version || null,
         audio_source_conversation_id: turn.audio_source_conversation_id || null,
         audio_source_conversation_version: turn.audio_source_conversation_version || null,
+        audio_duration_seconds: Number.isInteger(turn.audio_duration_seconds) ? turn.audio_duration_seconds : null,
         local_safety: turn.local_safety || null,
-      })),
+      });
+      }),
     };
   }
   async function conversationCurrentView(conversation, events = null, mediaItems = null) {
@@ -1421,7 +1595,23 @@
       .map(turn => ({ turn_id: turn.turn_id, version: turn.version, text: turn.text, created_at: turn.created_at,
         trace_id: turn.legacy_reorganization_history.trace_id, provider: turn.legacy_reorganization_history.provider,
         confirmed_at: turn.legacy_reorganization_history.confirmed_at }));
-    return withSavedOnlyTextFirstSendState({ ...current,
+    const safeTurns=(current.turns||[]).map(turn=>{
+      const errorCode=CONVERSATION_FAILURE_CODES.has(turn.error_code)?turn.error_code:null;
+      const providerStatus=storedProviderHttpStatus(turn.provider_http_status,errorCode);
+      return Object.fromEntries(Object.entries(turn).flatMap(([key,value])=>key==='error_code'
+        ?(errorCode?[[key,errorCode]]:[]):key==='provider_http_status'?(providerStatus?[[key,providerStatus]]:[]):[[key,value]]));
+    });
+    const operation=current.manual_correction_reorganization;
+    const safeOperation=operation?(()=>{
+      const failureCode=CONVERSATION_FAILURE_CODES.has(operation.failure_code)?operation.failure_code:null;
+      const providerStatus=storedProviderHttpStatus(operation.provider_http_status,failureCode);
+      return Object.fromEntries(Object.entries(operation).flatMap(([key,value])=>key==='failure_code'
+        ?(failureCode?[[key,failureCode]]:[]):key==='provider_http_status'?(providerStatus?[[key,providerStatus]]:[]):[[key,value]]));
+    })():null;
+    const projectedTurns=await Promise.all(safeTurns.map(async turn=>turn.quote_context?{...turn,
+      quote_context_valid:await quoteContextCurrent(current,turn.quote_context)}:turn));
+    return withSavedOnlyTextFirstSendState({ ...current, turns:projectedTurns,
+      ...(safeOperation?{manual_correction_reorganization:safeOperation}:{}),
       ...(candidate ? { legacy_reorganization_candidate: projectLegacyReorganizationCandidate(candidate) } : {}),
       ...(history.length ? { legacy_reorganization_history: history } : {}) });
   }
@@ -1473,6 +1663,15 @@
     const status = result?.r?.status;
     return Number.isInteger(status) && CONVERSATION_HTTP_FAILURE_STATUSES.has(status) ? `http_${status}` : 'ai_conversation_failed';
   }
+  function safeProviderHttpStatus(result, errorCode = result?.j?.failure_code || result?.j?.error) {
+    const status = result?.j?.provider_http_status;
+    return ['model_http_error', 'model_account_binding_required'].includes(errorCode)
+      && Number.isSafeInteger(status) && PROVIDER_HTTP_FAILURE_STATUSES.has(status) ? status : null;
+  }
+  function storedProviderHttpStatus(status, errorCode) {
+    return ['model_http_error', 'model_account_binding_required'].includes(errorCode)
+      && Number.isSafeInteger(status) && PROVIDER_HTTP_FAILURE_STATUSES.has(status) ? status : null;
+  }
   async function saveConversation(conversation, unchanged = []) {
     let report=conversation.report;
     if(report&&conversation.manual_correction_reorganization?.legacy_reply_review?.state==='confirmed'){
@@ -1480,7 +1679,10 @@
       if(JSON.stringify(report.question_coverage)!==JSON.stringify(coverage))report={...report,question_coverage:coverage,
         version:(Number.isSafeInteger(report.version)?report.version:0)+1,generated_at:now()};
     }
-    const saved = { ...conversation,...(report!==conversation.report?{report}:{}), version: (conversation.version || 0) + 1, updated_at: now() };
+    const previous=await vault.get(conversationKey(conversation.conversation_id));
+    const reportHistory=reportHistoryIncluding(conversation.report_history||previous?.report_history,previous?.report,report);
+    const saved = { ...conversation,...(report!==conversation.report?{report}:{}),
+      ...(reportHistory.length?{report_history:reportHistory}:{}), version: (conversation.version || 0) + 1, updated_at: now() };
     await ownedMutation({ puts: [{ key: conversationKey(saved.conversation_id), value: saved }], unchanged });
     return saved;
   }
@@ -1491,8 +1693,17 @@
       if (!media || media.trial_control || media.kind !== 'audio' || media.temporary !== true || media.recognition_status !== 'succeeded' || media.recognition?.is_mock || mockSource(media.recognition)) return false;
       const event = safety.currentAudioSource(media, await listEvents());
       if (event && safety.audioNeedsReview(event)) return false;
-      await ownedMutation({ deletes: [mediaBinaryKey(mediaId), mediaKey(mediaId)] });
-      return true;
+      const conversations = await vault.list('conversation:');
+      if (conversations.some(conversation => (conversation?.turns || []).some(turn => turn.media_id === mediaId))) return false;
+      try {
+        await ownedMutation({ deletes: [mediaBinaryKey(mediaId), mediaKey(mediaId)],
+          unchanged: [...conversations.map(conversation => ({ key: conversationKey(conversation.conversation_id), value: conversation })),
+            { key: mediaKey(mediaId), value: media }] });
+        return true;
+      } catch (error) {
+        if (['document_changed', 'subject_changed', 'stale_health_subjects'].includes(error?.message)) return false;
+        throw error;
+      }
     });
   }
 
@@ -1752,7 +1963,7 @@
         const mediaIndex = new Map(media ? [[media.media_id, media]] : []);
         if (!media || !sameAudioData(media, source.media) || subjectOf(media) !== owner.subject_id
           || media.kind !== 'audio' || media.recognition_status !== 'succeeded' || mockSource(media.recognition)
-          || !audioReviewCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id)
+          || !audioConversationSourceCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, owner.subject_id)
           || !(await vault.get(mediaBinaryKey(media.media_id)))?.bytes) return false;
       } else if (current.source_kind !== 'elder') return false;
     }
@@ -1763,7 +1974,7 @@
     if (!current || current.manual_correction_analysis_pending !== true) return localOnly('not_pending');
     if (current.trial_control) return localOnly('trial_review_required');
     if (current.manual_correction_reorganization?.state === 'sending') return localOnly('already_sending');
-    if (liveConversationTurns(current).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) return localOnly('audio_source_review_required');
+    if (liveConversationTurns(current).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_invalidated === true)) return localOnly('audio_source_review_required');
     const registry = await healthSubjects(), subjectId = await activeSubjectId(registry);
     if (subjectId !== subjectOf(current)) return localOnly('subject_mismatch');
     const sourceEvents=[];
@@ -1776,7 +1987,7 @@
       if (event.source_kind === 'audio_transcript') {
         const media = mediaIndex.get(turn.media_id);
         if (!media || media.kind !== 'audio' || media.recognition_status !== 'succeeded' || mockSource(media.recognition)
-          || !audioReviewCurrent(turn, eventIndex, mediaIndex, current.conversation_id)
+          || !audioConversationSourceCurrent(turn, eventIndex, mediaIndex, current.conversation_id, subjectId)
           || safety.currentAudioSource(media, currentEvents)?.record_id !== event.record_id
           || !(await vault.get(mediaBinaryKey(media.media_id)))?.bytes) return localOnly('audio_source_review_required');
         if (!sourceEvents.some(item=>item.record_id===event.record_id)) sourceEvents.push({record_id:event.record_id,event,text:turn.text,turn,media});
@@ -2293,10 +2504,13 @@
     }
     return { graph: current, recordIds: [...ids] };
   }
-  async function collectDeletionPlan(recordIds, conversationId = null) {
+  async function collectDeletionPlan(recordIds, conversationId = null, explicitMediaIds = []) {
     const recordSet = new Set(recordIds);
-    const linkedMedia = (await mediaList()).filter(item => recordSet.has(item.event_link?.record_id)
-      || recordSet.has(item.record_id) || (conversationId && item.conversation_id === conversationId));
+    const ownMedia = await mediaList(), ownMediaIds = new Set(ownMedia.map(item => item.media_id));
+    explicitMediaIds = new Set(explicitMediaIds.filter(id => ownMediaIds.has(id)));
+    const linkedMedia = ownMedia.filter(item => recordSet.has(item.event_link?.record_id)
+      || recordSet.has(item.record_id) || (conversationId && item.conversation_id === conversationId)
+      || explicitMediaIds.has(item.media_id));
     const mediaIds = new Set(linkedMedia.map(item => item.media_id));
     const uploads = await vault.list('upload:');
     const uploadIds = new Set(uploads.filter(item => mediaIds.has(item.media_id)
@@ -2414,6 +2628,7 @@
     if (!event) return fail(404, 'event_not_found');
     if (parts.length === 3 && method === 'DELETE') {
       if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
+      if (Object.prototype.hasOwnProperty.call(body, 'expected_version') && Number(body.expected_version) !== event.version) return fail(409, 'stale_version');
       const plan = await eventDeletionPlan(recordId);
       if (plan.error === 'conversation_source_changed') return linkedSourceConflict();
       if (plan.error) return fail(plan.error === 'event_not_found' ? 404 : 409, plan.error);
@@ -2423,7 +2638,8 @@
         if (latest.error) return fail(latest.error === 'event_not_found' ? 404 : 409, latest.error);
         if (latest.mediaIds.some(mediaId => !plan.mediaIds.includes(mediaId))) return fail(409, 'stale_media_links');
         await ownedMutation({ deletes: latest.deletes });
-        return ok(200, { ok: true, deleted: { record_id: recordId, record_count: latest.recordIds.length, local_media_count: latest.mediaIds.length, encrypted_backups_unchanged: true } });
+        return ok(200, { ok: true, deleted: { record_id: recordId, record_count: latest.recordIds.length, local_media_count: latest.mediaIds.length,
+          media_ids: latest.mediaIds, encrypted_backups_unchanged: true } });
       });
     }
     if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, event: mockSource(event) ? { ...event, is_mock: true } : event });
@@ -2452,13 +2668,14 @@
             if (turn.role !== 'elder' || turn.superseded || turn.record_id !== recordId || turn.text !== updated.raw_text) return turn;
             const sourceMedia = originals.find(item => item.media_id === turn.media_id);
             changed = true;
-            return { ...turn, audio_source_reviewed: true, audio_source_version: updated.version,
+            return { ...turn, audio_source_reviewed: true, audio_source_status: 'original_comparison', audio_source_invalidated: false, audio_source_version: updated.version,
               audio_source_media_version: sourceMedia ? sourceMedia.version + 1 : turn.audio_source_media_version,
               audio_source_conversation_id: latest.conversation_id, audio_source_conversation_version: latest.version + 1 };
           });
           if (!changed) continue;
           const reviewed = { ...latest, turns, version: latest.version + 1, updated_at: now() };
           reviewed.report = await buildCurrentConversationReport(reviewed, latest.report);
+          reviewed.report_history=reportHistoryIncluding(latest.report_history,latest.report,reviewed.report);
           puts.push({ key: conversationKey(latest.conversation_id), value: reviewed });
           unchanged.push({ key: conversationKey(latest.conversation_id), value: latest });
         }
@@ -2526,6 +2743,8 @@
           || !Array.isArray(conversation.turns)) return linkedSourceConflict();
         const liveSourceTurns = conversation.turns.filter(turn => turn.role === 'elder' && !turn.superseded && turn.record_id === recordId);
         if (liveSourceTurns.some(turn => turn.source_kind !== event.source_kind || turn.text !== event.raw_text)) return linkedSourceConflict();
+        const latestOwnTurn = latestEditableOwnTurn(conversation);
+        if (liveSourceTurns.some(turn => latestOwnTurn?.turn_id !== turn.turn_id)) return fail(409, 'conversation_turn_not_latest');
         const firstIndex = conversation.turns.findIndex(turn => turn.role === 'elder' && !turn.superseded && turn.record_id === recordId);
         if (firstIndex < 0) {
           if (event.source_kind !== 'audio_transcript') return linkedSourceConflict();
@@ -2570,6 +2789,7 @@
               ? { ...conversation.manual_correction_reorganization, state: 'stale', invalidated_at: editedAt }
               : null } : {}) };
         updated.report = await buildCurrentConversationReport(updated, conversation.report);
+        updated.report_history=reportHistoryIncluding(conversation.report_history,conversation.report,updated.report);
         puts.push({ key: conversationKey(conversation.conversation_id), value: updated });
         unchangedConversations.push({ key: conversationKey(conversation.conversation_id), value: conversation });
       }
@@ -2613,7 +2833,7 @@
     const eventIndex = new Map(events.map(event => [event.record_id, event])), mediaIndex = new Map(mediaItems.map(item => [item.media_id, item]));
     const allElderTurns = elderTurns(conversation).filter(turn => {
       if (turn.source_kind !== 'audio_transcript') return true;
-      return audioReviewCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id);
+      return audioConversationSourceCurrent(turn, eventIndex, mediaIndex, conversation.conversation_id, subjectOf(conversation));
     }).slice(-40);
     if (subjectOf(conversation) !== await activeSubjectId()) throw new Error('subject_mismatch');
     const currentContext = await healthContext(subjectOf(conversation));
@@ -2628,8 +2848,12 @@
     const requestStaleSources = invalidatedRespondingSources(conversation, invalidatedContextIds);
     const staleSources = new Set(requestStaleSources);
     const requestController = invalidateContextController(conversation, invalidatedContextIds, requestStaleSources);
+    const latestElder=liveConversationTurns(conversation).filter(turn=>turn.role==='elder').at(-1);
+    const quoteContext=latestElder?.quote_context||null;
+    if(quoteContext&&!await quoteContextCurrent(conversation,quoteContext))throw new Error('quote_context_stale');
     return {
       subject_id: subjectOf(conversation),
+      ...(quoteContext?{quote_context:structuredClone(quoteContext)}:{}),
       turns: allElderTurns.map(turn => {
         const index = conversation.turns.findIndex(item => item.turn_id === turn.turn_id);
         const previous = conversation.turns[index - 1];
@@ -2647,6 +2871,11 @@
           && (!Array.isArray(question.model_context_ids) || question.model_context_ids.every(id => activeContextIds.has(id)))
           ? questionIndex === 0 ? question.text : questionText(question.text) || question.text : null;
         return { turn_id: turn.turn_id, text: turn.text, version: turn.version,
+          ...(turn.source_kind === 'audio_transcript' ? { source: {
+            kind: 'audio_transcript', status: turn.audio_source_reviewed ? 'original_comparison' : turn.audio_source_status,
+            record_id: turn.record_id, record_version: turn.audio_source_version, media_id: turn.media_id,
+            media_version: turn.audio_source_media_version,
+          } } : {}),
           responding_to: text ? { turn_id: question.turn_id, text } : null };
       }),
       controller: requestController,
@@ -2719,8 +2948,9 @@
     if (stored.manual_correction_analysis_pending === true) return fail(409, 'report_correction_pending');
     const [events, mediaItems] = await Promise.all([listEvents(), mediaList()]);
     const current = reconcileConversationAudioReview(excludeMockFacts(stored), events, mediaItems);
-    if (!analysisSourcesCurrent(current, context)
-      || liveConversationTurns(current).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) {
+    const audioEventIndex = new Map(events.map(item => [item.record_id, item]));
+    const audioMediaIndex = new Map(mediaItems.map(item => [item.media_id, item]));
+    if (!analysisSourcesCurrent(current, context) || !audioConversationSourcesCurrent(current, audioEventIndex, audioMediaIndex)) {
       return fail(409, 'report_sources_not_current');
     }
     const contextKey = healthContextKey(subjectId), contextRaw = await vault.get(contextKey);
@@ -2795,7 +3025,8 @@
     if (!summaryChanged && JSON.stringify(stored.completeness?.clinical_state) === JSON.stringify(nextState)) {
       return ok(200, { ok: true, changed: false, conversation: await conversationCurrentView(stored, events, mediaItems) });
     }
-    const timestamp = now(), history = [...(stored.report_history || []), stored.report];
+    const timestamp = now(), history = reportHistoryIncluding(stored.report_history,stored.report,
+      { ...candidateReport, version: (Number.isSafeInteger(stored.report?.version) ? stored.report.version : 0) + 1, generated_at: timestamp });
     const report = { ...candidateReport, version: (Number.isSafeInteger(stored.report?.version) ? stored.report.version : 0) + 1, generated_at: timestamp };
     const saved = { ...stored, completeness: nextCompleteness, report, report_history: history,
       version: stored.version + 1, updated_at: timestamp };
@@ -2844,8 +3075,11 @@
     const finalClaim={grant_id:owner.grant?.grant_id||null,receipt_id:owner.grant?.receipt_id||null,
       receipt_sha256:owner.grant?.receipt_sha256||null,subject_id:owner.subject_id,conversation_id:owner.conversation_id,
       scope_id:owner.scope_id,body_sha256:owner.body_sha256,state};
-    const next={...stored,manual_correction_reorganization:{...operation,...provenance,state,
-      ...(routineAnalysis?{}:{failure_code:result?.r?.ok?'reorganization_result_not_routine':safeConversationFailureCode(result)})},
+    const {failure_code:_oldFailureCode,provider_http_status:_oldProviderStatus,...operationBase}=operation;
+    const failureCode=routineAnalysis?null:result?.r?.ok?'reorganization_result_not_routine':safeConversationFailureCode(result);
+    const providerStatus=routineAnalysis?null:safeProviderHttpStatus(result,failureCode);
+    const next={...stored,manual_correction_reorganization:{...operationBase,...provenance,state,
+      ...(failureCode?{failure_code:failureCode}:{}),...(providerStatus?{provider_http_status:providerStatus}:{})},
       version:stored.version+1,updated_at:now()};
     if(routineAnalysis){
       next.completeness=completeness;
@@ -2877,6 +3111,7 @@
   async function appendAssistantResult(conversation, result, extraGuards = []) {
     const sendingVersion = conversation.version;
     const sendingSources = JSON.stringify(analysisSources(conversation));
+    const sendingQuote = elderTurns(conversation).at(-1)?.quote_context || null;
     let storedConversation = await vault.get(conversationKey(conversation.conversation_id));
     let currentContext = await healthContext(subjectOf(conversation));
     const sourceUnchanged = latest => latest && latest.version === sendingVersion
@@ -2922,6 +3157,7 @@
         : riskRequested && !riskAssessment ? 'reviewed_risk_invalid'
         : !replyTextSafe && !reviewedFixedText ? 'model_reply_unsafe' : 'model_response_invalid'
       : safeConversationFailureCode(result);
+    const providerHttpStatus = safeProviderHttpStatus(result, failureCode);
     const assistant = {
       turn_id: id('turn'), role: 'assistant', text: assistantText,
       model_context_ids: safeResult ? (sendingContext || []).map(item => item.context_id) : [],
@@ -2930,6 +3166,7 @@
       stop_reason: safeResult ? riskAssessment ? 'reviewed_risk_rule' : result.j.stop_reason || null : 'model_failed',
       created_at: now(), version: 1, ai_failed: !safeResult,
       ...(failureCode ? { error_code: failureCode } : {}),
+      ...(providerHttpStatus ? { provider_http_status: providerHttpStatus } : {}),
       ...(safeResult && riskAssessment ? { risk_assessment: riskAssessment, reviewed_risk_validated: true } : {}),
     };
     const next = {
@@ -2945,7 +3182,8 @@
     };
     const current = invalidateChangedAnalysis(next, currentContext);
     current.report = await buildCurrentConversationReport(current, conversation.report, currentContext);
-    const saved = { ...current, version: conversation.version + 1, updated_at: now() };
+    const reportHistory=reportHistoryIncluding(conversation.report_history,conversation.report,current.report);
+    const saved = { ...current,...(reportHistory.length?{report_history:reportHistory}:{}), version: conversation.version + 1, updated_at: now() };
     const registry = await healthSubjects();
     if (registry.active_subject_id !== subjectOf(conversation)) return { conversation: storedConversation, applied: false };
     const contextGuard = [{ key: HEALTH_SUBJECTS_KEY, value: registry }, ...extraGuards];
@@ -2953,6 +3191,28 @@
       const rawContext = await vault.get(healthContextKey(subjectOf(conversation)));
       if (Number(rawContext?.version || 0) !== currentContext.version) return { conversation: storedConversation, applied: false };
       contextGuard.push({ key: healthContextKey(subjectOf(conversation)), value: rawContext });
+    }
+    const latestQuote = elderTurns(storedConversation).at(-1)?.quote_context || null;
+    if (JSON.stringify(latestQuote) !== JSON.stringify(sendingQuote)) return { conversation: storedConversation, applied: false };
+    if (latestQuote) {
+      if (!await quoteContextCurrent(storedConversation, latestQuote)) return { conversation: storedConversation, applied: false };
+      const source = latestQuote.source;
+      if (source.record_id) {
+        const event = await vault.get(eventKey(source.record_id));
+        if (!event || event.version !== source.record_version || event.raw_text !== latestQuote.text || event.state === 'superseded') {
+          return { conversation: storedConversation, applied: false };
+        }
+        contextGuard.push({ key: eventKey(source.record_id), value: event });
+      }
+      if (source.media_id) {
+        const media = await vault.get(mediaKey(source.media_id)), original = await vault.get(mediaBinaryKey(source.media_id));
+        if (!media || media.version !== source.media_version || !original?.bytes) return { conversation: storedConversation, applied: false };
+        contextGuard.push({ key: mediaKey(source.media_id), value: media }, { key: mediaBinaryKey(source.media_id), value: original });
+      }
+      if (latestQuote.role === 'assistant') {
+        const contextKey = healthContextKey(subjectOf(storedConversation)), rawContext = await vault.get(contextKey);
+        if (!contextGuard.some(guard => guard.key === contextKey)) contextGuard.push({ key: contextKey, value: rawContext });
+      }
     }
     if (await vault.putIfUnchanged(conversationKey(conversation.conversation_id), storedConversation, saved, contextGuard)) {
       return { conversation: saved, applied: true };
@@ -2966,7 +3226,9 @@
     if (conversation.trial_control && !trialContinue && !correctionReorganization) return fail(409, 'trial_review_required');
     const [conversationEvents, conversationMedia] = await Promise.all([listEvents(), mediaList()]);
     conversation = reconcileConversationAudioReview(conversation, conversationEvents, conversationMedia);
-    if (liveConversationTurns(conversation).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) return fail(409, 'audio_source_review_required');
+    if (liveConversationTurns(conversation).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript'
+      && (turn.audio_source_invalidated === true || turn.audio_source_reviewed !== true
+        && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)))) return fail(409, 'audio_source_review_required');
     const latest = elderTurns(conversation).at(-1);
     if (latest?.local_safety?.danger_detected) {
       return ok(200, { action: 'urgent', assistant_text: safety.DANGER_REMINDER,
@@ -2985,10 +3247,16 @@
     }
     const body = parseBody(options);
     if (body.subject_id && body.subject_id !== await activeSubjectId()) return fail(403, 'subject_mismatch');
-    if (!sourceLocked && method === 'POST' && parts[3] === 'turns' && parts.length === 4 && body.record_id) {
+    if (!sourceLocked && method === 'POST' && parts[3] === 'turns' && parts.length === 4) {
       // Existing-source linking participates in archive correction/deletion
       // locks so a new conversation cannot acquire a source midway through it.
-      return withEventLock(body.record_id, () => conversationRequest(path, options, true, true));
+      const lockIds=[];if(body.record_id)lockIds.push(body.record_id);
+      if(body.quote_ref?.turn_id){
+        const targetConversation=await vault.get(conversationKey(decodeURIComponent(parts[2]||'')));
+        const target=targetConversation?.turns?.find(turn=>turn.turn_id===body.quote_ref.turn_id);
+        if(target?.role==='elder'&&target.record_id)lockIds.push(target.record_id);
+      }
+      if(lockIds.length)return withEventLocks(lockIds,()=>conversationRequest(path,options,true,true));
     }
     if (pathname === '/api/conversations/saved-audio-trial/start' && method === 'POST') {
       if (!sourceLocked) return withEventLock(body.record_id, () => conversationRequest(path, options, true, true));
@@ -3058,6 +3326,7 @@
         version:(Number.isSafeInteger(report.version)?report.version:0)+1,generated_at:confirmedAt};
       const saved={...storedConversation,turns,
         report,
+        ...(reportChanged?{report_history:reportHistoryIncluding(storedConversation.report_history,storedConversation.report,report)}:{}),
         manual_correction_reorganization:{...storedConversation.manual_correction_reorganization,legacy_reply_review:review},
         version:storedConversation.version+1,updated_at:confirmedAt};
       try{await ownedMutation({puts:[{key:conversationKey(conversationId),value:saved}],unchanged:[{key:conversationKey(conversationId),value:storedConversation}]});}
@@ -3104,6 +3373,7 @@
         || !fullSentenceQuotes(target.text).includes(quote) || exactOccurrenceCount(target.text, quote) !== 1) {
         return fail(409, 'correction_target_invalid');
       }
+      if (latestEditableOwnTurn(conversation)?.turn_id !== target.turn_id) return fail(409, 'correction_target_not_latest');
       if (target.record_id ? !Number.isSafeInteger(body.expected_event_version) : body.expected_event_version !== null) {
         return fail(400, 'correction_source_version_required');
       }
@@ -3147,6 +3417,7 @@
         relevant_health_context: [], manual_corrections: [...(conversation.manual_corrections || []), manualCorrection],
         manual_correction_analysis_pending: true };
       edited.report = buildConversationReport(edited, conversation.report);
+      edited.report_history=reportHistoryIncluding(conversation.report_history,conversation.report,edited.report);
       puts.push({ key: conversationKey(conversationId), value: edited });
       try { await ownedMutation({ puts, unchanged }); }
       catch (error) { return fail(409, error.message === 'document_changed' ? 'conversation_source_changed' : 'correction_save_failed'); }
@@ -3156,9 +3427,26 @@
       if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
       if (Number(body.expected_version) !== conversation.version) return fail(409, 'stale_conversation');
       const recordIds = [...new Set(conversation.turns.filter(turn => turn.role === 'elder').map(turn => turn.record_id).filter(Boolean))];
+      const turnMediaIds = [...new Set(conversation.turns.map(turn => turn.media_id).filter(value => typeof value === 'string' && value))];
       const component = await eventRevisionComponent(recordIds);
       const lockedRecords = new Set([...recordIds, ...component.recordIds]);
-      const lockedMedia = new Set();
+      const lockedMedia = new Set(turnMediaIds);
+      const mediaReferenceError = async (ids, ownedRecordIds) => {
+        const ownedRecords = new Set(ownedRecordIds);
+        for (const mediaId of ids) {
+          const media = await vault.get(mediaKey(mediaId));
+          if (!media) {
+            if (await vault.get(mediaBinaryKey(mediaId))) return 'conversation_media_owner_unknown';
+            continue;
+          }
+          if (subjectOf(media) !== subjectOf(conversation)) return 'conversation_media_owner_mismatch';
+          const linkedRecordId = media.event_link?.record_id || media.record_id;
+          if (linkedRecordId && !ownedRecords.has(linkedRecordId)) return 'conversation_source_shared';
+          if (media.conversation_id && media.conversation_id !== conversationId
+            && await vault.get(conversationKey(media.conversation_id))) return 'conversation_source_shared';
+        }
+        return null;
+      };
       // The atomic plan covers item.conversation_id === conversationId media,
       // removeEventBody(recordId) history/event keys, and remove(conversationKey(conversationId)).
       while (true) {
@@ -3168,13 +3456,28 @@
           if ((await conversationsUsingRecords(currentComponent.recordIds)).some(item => item.conversation_id !== conversationId)) {
             return { error: 'conversation_source_shared' };
           }
-          const initialPlan = await collectDeletionPlan(currentComponent.recordIds, conversationId);
+          const mediaOwners = await vault.list('conversation:');
+          const sharesDeletedScope = (owners, mediaIds, recordIds) => owners.some(item => item.conversation_id !== conversationId
+            && item.turns.some(turn => mediaIds.has(turn.media_id) || recordIds.has(turn.record_id)));
+          if (sharesDeletedScope(mediaOwners, new Set(turnMediaIds), new Set(currentComponent.recordIds))) {
+            return { error: 'conversation_source_shared' };
+          }
+          const initialPlan = await collectDeletionPlan(currentComponent.recordIds, conversationId, turnMediaIds);
+          if (sharesDeletedScope(mediaOwners, new Set(initialPlan.mediaIds), new Set(currentComponent.recordIds))) {
+            return { error: 'conversation_source_shared' };
+          }
           if (initialPlan.mediaIds.some(id => !lockedMedia.has(id))) return { retryMedia: initialPlan.mediaIds };
           return withMediaLocks([...lockedMedia], async () => {
             const latestComponent = await eventRevisionComponent(recordIds);
             if (latestComponent.recordIds.some(id => !lockedRecords.has(id))) return { retryRecords: latestComponent.recordIds };
-            const latestPlan = await collectDeletionPlan(latestComponent.recordIds, conversationId);
+            const referenceError = await mediaReferenceError(turnMediaIds, latestComponent.recordIds);
+            if (referenceError) return { error: referenceError };
+            const latestPlan = await collectDeletionPlan(latestComponent.recordIds, conversationId, turnMediaIds);
             if (latestPlan.mediaIds.some(id => !lockedMedia.has(id))) return { retryMedia: latestPlan.mediaIds };
+            const latestOwners = await vault.list('conversation:');
+            if (sharesDeletedScope(latestOwners, new Set(latestPlan.mediaIds), new Set(latestComponent.recordIds))) {
+              return { error: 'conversation_source_shared' };
+            }
             await ownedMutation({ deletes: latestPlan.deletes });
             return { ok: true, plan: latestPlan };
           });
@@ -3187,12 +3490,15 @@
           for (const id of result.retryMedia) lockedMedia.add(id);
           continue;
         }
-        if (result.error === 'conversation_source_shared') return fail(409, result.error, {
-          message: '这段对话的原话还被其他对话引用，暂不能删除，以免其他报告失去来源。当前资料未被删除。',
+        if (['conversation_source_shared', 'conversation_media_owner_mismatch', 'conversation_media_owner_unknown'].includes(result.error)) return fail(409, result.error, {
+          message: result.error === 'conversation_source_shared'
+            ? '这段对话引用的资料还被其他对话或记录使用，暂不能删除。当前资料未被删除。'
+            : '无法确认这段对话关联原件的所属人；本次没有删除，请先核对原件关联。',
         });
         if (!result.ok) return fail(409, 'stale_delete_scope');
         return ok(200, { ok: true, deleted: { conversation_id: conversationId, record_count: result.plan.recordIds.length,
-          local_media_count: result.plan.mediaIds.length, pending_upload_count: result.plan.uploadIds.length, encrypted_backups_unchanged: true } });
+          local_media_count: result.plan.mediaIds.length, media_ids: result.plan.mediaIds,
+          pending_upload_count: result.plan.uploadIds.length, encrypted_backups_unchanged: true } });
       }
     }
     if (parts.length === 3 && method === 'GET') {
@@ -3228,7 +3534,9 @@
         || body.expected_context_version !== context.version || current.manual_correction_analysis_pending !== true) {
         return fail(409, 'correction_reorganization_source_changed', { conversation: current });
       }
-      if (liveConversationTurns(current).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) {
+      if (liveConversationTurns(current).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript'
+        && (turn.audio_source_invalidated === true || turn.audio_source_reviewed !== true
+          && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)))) {
         return fail(409, 'audio_source_review_required', { conversation: current });
       }
       const result = await runCorrectionReorganization(current);
@@ -3289,13 +3597,26 @@
       return (async () => {
         const [events, mediaItems] = await Promise.all([listEvents(), mediaList()]);
         let latest = reconcileConversationAudioReview(excludeMockFacts(await vault.get(conversationKey(conversationId))), events, mediaItems);
-        if (liveConversationTurns(latest).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) {
+        if (liveConversationTurns(latest).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript'
+          && (turn.audio_source_invalidated === true || turn.audio_source_reviewed !== true
+            && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)))) {
           return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest, pending_reason: 'audio_source_review_required' });
         }
         const trial = await trialVoiceState();
         if (latest?.trial_control || trial && trial.state !== 'completed') return ok(200, { ok: true, conversation: await withSavedOnlyTextFirstSendState(latest), trial_control: latest?.trial_control || trial, recovered: false });
         const pending = pendingElderTurn(latest);
         if (!pending) return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest });
+        if (pending.source_kind === 'audio_transcript' && ['machine_transcribed', 'user_edited'].includes(pending.audio_source_status)) {
+          if (body.explicit_audio_retry !== true) return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: latest, pending_reason: 'audio_reply_requires_user_retry' });
+          if (body.expected_version !== latest.version) return fail(409, 'stale_conversation', { conversation: latest });
+          const eventIndex = new Map(events.map(item => [item.record_id, item])), mediaIndex = new Map(mediaItems.map(item => [item.media_id, item]));
+          if (!audioConversationSourceCurrent(pending, eventIndex, mediaIndex, latest.conversation_id)) return fail(409, 'audio_source_changed', { conversation: latest });
+          const result = await conversationReply(latest);
+          const appended = await appendAssistantResult(latest, result);
+          return ok(result.r.ok ? 200 : 202, { ok: true, recovered: appended.applied,
+            result_discarded: !appended.applied, ai_failed: !!appended.conversation.last_ai_metadata?.ai_failed,
+            conversation: appended.conversation });
+        }
         if (latest.new_text_trial?.turn_id === pending.turn_id) return ok(200, { ok: true, recovered: false, ai_failed: false, conversation: await withSavedOnlyTextFirstSendState(latest), pending_reason: 'new_text_trial_no_replay' });
         const result = await conversationReply(latest);
         const appended = await appendAssistantResult(latest, result);
@@ -3339,7 +3660,55 @@
       if (conversation.trial_control && !controlled) return fail(409, 'trial_review_required');
       if (controlled && !controlledText && sourceMedia?.conversation_id !== conversationId) return fail(409, 'trial_source_changed');
       if (Number(body.expected_version) !== conversation.version) return fail(409, 'stale_conversation');
-      if (liveConversationTurns(conversation).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true)) return fail(409, 'audio_source_review_required');
+      if (liveConversationTurns(conversation).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript'
+        && (turn.audio_source_invalidated === true || turn.audio_source_reviewed !== true
+          && !['machine_transcribed', 'user_edited'].includes(turn.audio_source_status)))) return fail(409, 'audio_source_review_required');
+      let explicitRespondingTo = null;
+      if (Object.prototype.hasOwnProperty.call(body,'quote_ref')) {
+        const ref=body.quote_ref,keys=ref&&typeof ref==='object'&&!Array.isArray(ref)?Object.keys(ref).sort():[];
+        if(keys.join(',')!=='turn_id,version'||typeof ref.turn_id!=='string'||!Number.isSafeInteger(ref.version)||ref.version<1
+          ||Object.prototype.hasOwnProperty.call(body,'responding_to'))return fail(400,'quote_context_invalid');
+        if(body.media_id&&controlled||controlledText||unrelatedText||conversation.trial_control||conversation.saved_audio_trial
+          ||trial&&trial.state!=='completed')return fail(409,'quote_context_stale');
+        const matches=conversation.turns.filter(turn=>turn.turn_id===ref.turn_id),target=matches[0];
+        if(matches.length!==1||!target||target.superseded||target.ai_failed||mockSource(target)
+          ||(target.version??1)!==ref.version||!['elder','assistant'].includes(target.role))return fail(409,'quote_context_stale');
+        const source=target.role==='assistant'?{source_kind:'assistant_message',record_id:null,record_version:null,media_id:null,media_version:null}:await (async()=>{
+          if(!target.record_id)return null;
+          const event=await readEvent(target.record_id);if(!event||event.state==='superseded'||event.raw_text!==target.text)return null;
+          if(target.source_kind!=='audio_transcript')return event.source_kind==='elder'?{source_kind:'elder',record_id:event.record_id,record_version:event.version,media_id:null,media_version:null}:null;
+          const media=target.media_id?await vault.get(mediaKey(target.media_id)):null;
+          if(!media||media.kind!=='audio'||mockSource(media)||media.recognition_status!=='succeeded'
+            ||!(await vault.get(mediaBinaryKey(media.media_id)))?.bytes)return null;
+          return {source_kind:'audio_transcript',record_id:event.record_id,record_version:event.version,media_id:media.media_id,media_version:media.version};
+        })();
+        const quoteContext=source?{conversation_id:conversationId,turn_id:target.turn_id,role:target.role==='assistant'?'assistant':'elder',
+          version:target.version??1,text:target.text,source}:null;
+        if(!quoteContext||!await quoteContextCurrent(conversation,quoteContext))return fail(409,'quote_context_stale');
+        explicitRespondingTo={quoteContext,target};
+      }
+      if (Object.prototype.hasOwnProperty.call(body, 'responding_to')) {
+        const target = body.responding_to, targetKeys = target && typeof target === 'object' && !Array.isArray(target) ? Object.keys(target).sort() : [];
+        if (targetKeys.join(',') !== 'text,turn_id,version' || typeof target.turn_id !== 'string'
+          || typeof target.text !== 'string' || !Number.isSafeInteger(target.version) || target.version < 1) return fail(400, 'responding_to_invalid');
+        if (body.media_id || body.record_id || body.source_kind === 'audio_transcript' || controlled || controlledText
+          || unrelatedText || conversation.trial_control || conversation.saved_audio_trial || trial && trial.state !== 'completed') {
+          return fail(409, 'followup_target_not_allowed');
+        }
+        const matches = conversation.turns.filter(turn => turn.turn_id === target.turn_id), selected = matches[0];
+        if (matches.length !== 1 || !selected || selected.role !== 'assistant' || selected.superseded || selected.ai_failed
+          || mockSource(selected) || !['ask', 'reply'].includes(selected.action)
+          || selected.text !== target.text || (selected.version ?? 1) !== target.version) return fail(409, 'followup_target_stale');
+        if ((conversation.stale_responding_to_turn_ids || []).includes(selected.turn_id)) return fail(409, 'followup_target_context_changed');
+        const currentContext = await healthContext(subjectOf(conversation));
+        if (Number(conversation.health_context_version || 0) !== Number(currentContext.version || 0)) return fail(409, 'followup_target_context_changed');
+        const selectedContextIds = new Set((conversation.selected_context_ids || []).filter(contextId =>
+          currentContext.entries.some(entry => entry.context_id === contextId && usableHealthEntry(entry, subjectOf(conversation)))));
+        if (Array.isArray(selected.model_context_ids) && selected.model_context_ids.some(contextId => !selectedContextIds.has(contextId))) {
+          return fail(409, 'followup_target_context_changed');
+        }
+        explicitRespondingTo = selected;
+      }
       let event;
       if (body.record_id) event = await readEvent(body.record_id);
       if (body.record_id && !event) return fail(409, 'conversation_source_invalid');
@@ -3349,7 +3718,8 @@
       if (event?.source_kind === 'audio_transcript') {
         if (body.source_kind !== 'audio_transcript' || !sourceMedia || sourceMedia.kind !== 'audio'
           || sourceMedia.recognition_status !== 'succeeded' || mockSource(sourceMedia.recognition) || sourceMedia.recognition?.is_mock) return fail(409, 'audio_source_changed');
-        if (safety.audioNeedsReview(event)) return fail(409, 'audio_source_review_required');
+        const acceptedStatus = ['machine_transcribed', 'user_edited'].includes(body.audio_source_status);
+        if (safety.audioNeedsReview(event) && !acceptedStatus) return fail(409, 'audio_source_review_required');
         const existingOwners = await conversationsUsingRecords([event.record_id]);
         const hasForeignOwner = existingOwners.some(owner => owner.conversation_id !== conversationId
           && owner.turns.some(turn => turn.role === 'elder' && !turn.superseded && turn.record_id === event.record_id));
@@ -3371,18 +3741,23 @@
       const userTurn = {
         turn_id: id('turn'), role: 'elder', original_text: text, text, source_kind: event.source_kind,
         record_id: event.record_id, media_id: body.media_id || null, local_safety: event.local_safety, created_at: now(), version: 1, versions: [],
-        ...(event.source_kind === 'audio_transcript' ? { audio_source_reviewed: true, audio_source_version: event.version,
+        ...(event.source_kind === 'audio_transcript' ? { audio_source_reviewed: safety.audioNeedsReview(event) === false,
+          audio_source_status: safety.audioNeedsReview(event) === false ? 'original_comparison' : body.audio_source_status || 'legacy_unclassified', audio_source_version: event.version,
           audio_source_media_version: sourceMedia.version, audio_source_conversation_id: conversationId,
-          audio_source_conversation_version: conversation.version } : {}),
+          audio_source_conversation_version: conversation.version, audio_source_invalidated: false,
+          ...(Number.isInteger(body.audio_duration_seconds) && body.audio_duration_seconds > 0 && body.audio_duration_seconds <= 3600
+            ? { audio_duration_seconds: body.audio_duration_seconds } : {}) } : {}),
       };
-      const previous = liveConversationTurns(conversation).at(-1);
-      if (previous?.role === 'assistant' && ['ask', 'reply'].includes(previous.action) && !mockSource(previous)) {
-        userTurn.responding_to = { turn_id: previous.turn_id, text: previous.text };
-        userTurn.responding_to_version = previous.version;
+      if(explicitRespondingTo?.quoteContext)userTurn.quote_context=explicitRespondingTo.quoteContext;
+      const previous = liveConversationTurns(conversation).at(-1), respondingTo = explicitRespondingTo?.quoteContext?null:explicitRespondingTo || previous;
+      if (respondingTo?.role === 'assistant' && ['ask', 'reply'].includes(respondingTo.action) && !respondingTo.ai_failed && !mockSource(respondingTo)) {
+        userTurn.responding_to = { turn_id: respondingTo.turn_id, text: respondingTo.text };
+        userTurn.responding_to_version = respondingTo.version ?? 1;
       }
       let withUser = {
         ...conversation,
         status: backgroundInactive ? conversation.status : 'active',
+        last_local_date: currentLocalDate(),
         turns: [...conversation.turns, userTurn],
         controller: conversation.controller,
         completeness: conversation.completeness,
@@ -3420,7 +3795,10 @@
       // A recognition already in flight can complete after an explicit pause.
       // Save its source and report, then wait for the user to return for a reply.
       if (backgroundInactive) return ok(201, { ok: true, created: true, conversation, turn_id: userTurn.turn_id });
-      const result = await conversationReply(conversation);
+      let result;try{result=await conversationReply(conversation)}catch(error){
+        if(error?.message==='quote_context_stale')return fail(409,'quote_context_stale',{conversation:await conversationCurrentView(conversation)});
+        throw error;
+      }
       const appended = await appendAssistantResult(conversation, result);
       conversation = appended.conversation;
       if (body.keep_media_until_pause !== true) await cleanupTemporaryAudio(body.media_id);
@@ -3433,9 +3811,22 @@
       const index = conversation.turns.findIndex(turn => turn.turn_id === turnId && turn.role === 'elder');
       if (index < 0) return fail(404, 'turn_not_found');
       const current = conversation.turns[index];
+      if (latestEditableOwnTurn(conversation)?.turn_id !== current.turn_id) return fail(409, 'turn_not_latest');
       if (Number(body.expected_version) !== current.version) return fail(409, 'stale_version');
       if (Number(body.expected_conversation_version) !== conversation.version) return fail(409, 'stale_conversation');
-      if (current.source_kind === 'audio_transcript') return fail(409, 'audio_source_review_required');
+      if (current.source_kind === 'audio_transcript' && (conversation.trial_control || conversation.saved_audio_trial)) {
+        return fail(409, 'audio_source_review_required');
+      }
+      let currentAudioEvent = null;
+      if (current.source_kind === 'audio_transcript') {
+        const [audioEvents, audioMedia] = await Promise.all([listEvents(), mediaList()]);
+        const audioEventIndex = new Map(audioEvents.map(item => [item.record_id, item]));
+        const audioMediaIndex = new Map(audioMedia.map(item => [item.media_id, item]));
+        currentAudioEvent = audioEventIndex.get(current.record_id);
+        if (!audioConversationSourceCurrent(current, audioEventIndex, audioMediaIndex, conversationId, subjectOf(conversation))) {
+          return fail(409, 'audio_source_changed');
+        }
+      }
       const savedOnlyTextCorrection = !conversation.trial_control&&conversation.new_text_trial?.state==='saved_only'
         &&conversation.new_text_trial.turn_id===turnId&&liveConversationTurns(conversation).at(-1)?.turn_id===turnId;
       let trialControl = null, trialGlobal = null;
@@ -3449,7 +3840,11 @@
       }
       const revisedSafety = safety.scanDanger(text);
       const turns = conversation.turns.map((turn, turnIndex) => {
-        if (turnIndex === index) return { ...turn, text, ...(savedOnlyTextCorrection?{original_text:text}:{}), is_mock: false, local_safety: revisedSafety, version: turn.version + 1, edited_at: now(), versions: [...(turn.versions || []), { version: turn.version, text: turn.text, replaced_at: now() }] };
+        if (turnIndex === index) return { ...turn, text, ...(savedOnlyTextCorrection?{original_text:text}:{}), is_mock: false, local_safety: revisedSafety, version: turn.version + 1, edited_at: now(),
+          ...(current.source_kind === 'audio_transcript' ? { audio_source_reviewed: false, audio_source_status: 'user_edited',
+            audio_source_version: currentAudioEvent.version + 1, audio_source_invalidated: false,
+            audio_source_conversation_version: conversation.version + 1 } : {}),
+          versions: [...(turn.versions || []), { version: turn.version, text: turn.text, replaced_at: now() }] };
         if (turnIndex > index && turn.role === 'assistant') return { ...turn, superseded: true };
         return turn;
       });
@@ -3460,6 +3855,7 @@
           turn_version: latest.version, media_id: latest.media_id || null, source_kind: latest.source_kind };
       }
       edited.report = buildConversationReport(edited, conversation.report);
+      edited.report_history=reportHistoryIncluding(conversation.report_history,conversation.report,edited.report);
       const persistCorrection = async () => {
         const puts = [];
         if (current.record_id) {
@@ -3472,7 +3868,8 @@
             puts.push(historyDocument(event, 'conversation_turn_corrected', '聊天原话已由使用者修改'));
             puts.push({ key: eventKey(event.record_id), value: { ...event,
               raw_text: text, updated_at: now(), version: event.version + 1,
-              state: 'inbox', local_safety: revisedSafety, draft: null, ai_metadata: null } });
+              state: 'inbox', local_safety: revisedSafety, draft: null, ai_metadata: null,
+              ...(current.source_kind === 'audio_transcript' ? { source_review: null } : {}) } });
           }
         }
         const saved = { ...edited, version: conversation.version + 1, updated_at: now() };
@@ -3491,7 +3888,23 @@
       }
       if (savedOnlyTextCorrection) return ok(200, { ok: true, ai_failed: false, text_trial: { state: 'saved_only' },
         conversation: await withSavedOnlyTextFirstSendState(conversation) });
-      const result = await conversationReply(conversation);
+      const latestElder = liveConversationTurns(conversation).filter(turn => turn.role === 'elder').at(-1);
+      const latestQuote = latestElder?.quote_context;
+      if (latestQuote && !await quoteContextCurrent(conversation, latestQuote)) {
+        return ok(200, { ok: true, quote_context_invalidated: true, conversation: await conversationCurrentView(conversation) });
+      }
+      let result;
+      try { result = await conversationReply(conversation); }
+      catch (error) {
+        if (error?.message === 'quote_context_stale') {
+          const latest = await vault.get(conversationKey(conversationId));
+          const latestPatientTurn = latest && liveConversationTurns(latest).filter(turn => turn.role === 'elder').at(-1);
+          if (latest && latestPatientTurn?.quote_context && !await quoteContextCurrent(latest, latestPatientTurn.quote_context)) {
+            return ok(200, { ok: true, quote_context_invalidated: true, conversation: await conversationCurrentView(latest) });
+          }
+        }
+        throw error;
+      }
       const appended = await appendAssistantResult(conversation, result);
       conversation = appended.conversation;
       return ok(200, { ok: true, result_discarded: !appended.applied, ai_failed: !!conversation.last_ai_metadata?.ai_failed, conversation });
@@ -3544,12 +3957,93 @@
     }
     return { ...media };
   }
+  function referencesMediaId(value, mediaId, seen = new Set()) {
+    if (!value || typeof value !== 'object' || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some(item => referencesMediaId(item, mediaId, seen));
+    return Object.entries(value).some(([key, child]) =>
+      (['media_id', 'source_media_id', 'source_audio_media_id'].includes(key) && child === mediaId)
+      || referencesMediaId(child, mediaId, seen));
+  }
+  function collectMediaReferences(value, result, seen = new Set()) {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) { value.forEach(item => collectMediaReferences(item, result, seen)); return; }
+    for (const [key, child] of Object.entries(value)) {
+      if (['media_id', 'source_media_id', 'source_audio_media_id'].includes(key) && typeof child === 'string') result.add(child);
+      collectMediaReferences(child, result, seen);
+    }
+  }
+  async function mediaRecognitionIsInFlight(media) {
+    const lockName = `bingli-media-recognition:${media.media_id}`;
+    if (localMediaRecognitionIds.has(media.media_id) || mediaRecognitionWrites.has(lockName)) return true;
+    const locks = globalThis.navigator?.locks;
+    if (typeof locks?.query === 'function') {
+      try {
+        const state = await locks.query();
+        const names = [...(state.held || []), ...(state.pending || [])].map(lock => lock.name);
+        if (names.includes(lockName)) return true;
+        // The audio provider lock does not identify its owner. If this media
+        // still says processing, fail closed while any tab holds that lock.
+        if (media.kind === 'audio' && names.includes(AUDIO_RECOGNITION_LOCK)) return true;
+        return false;
+      } catch { return true; }
+    }
+    if (media.kind === 'audio' && await audioRecognitionInFlight()) return true;
+    if (typeof locks?.request === 'function') {
+      try {
+        let acquired = false;
+        await locks.request(lockName, { ifAvailable: true }, lock => { acquired = Boolean(lock); });
+        return !acquired;
+      } catch { return true; }
+    }
+    return false;
+  }
+  async function mediaDeletionSnapshot() {
+    const [events, conversations, uploads, trial, historyDocs] = await Promise.all([
+      vault.list('event:'), vault.list('conversation:'), vault.list('upload:'), vault.get(TRIAL_VOICE_KEY), driver.listDocs('history:'),
+    ]);
+    const histories = await Promise.all(historyDocs.map(async doc => ({ key: doc.key, value: await vault.get(doc.key) })));
+    const historyMediaIds = new Set();
+    histories.forEach(item => collectMediaReferences(item.value, historyMediaIds));
+    return { events, conversations, uploads, trial, histories, historyMediaIds };
+  }
+  async function mediaDeletionBlock(media, subjectId, snapshot) {
+    if (media.trial_control || referencesMediaId(snapshot.trial, media.media_id)
+      || snapshot.conversations.some(item => referencesMediaId(item?.trial_control, media.media_id))) return 'trial_controlled';
+    if (snapshot.uploads.some(item => item?.media_id === media.media_id)) return 'upload_in_progress';
+    if (media.save_status !== 'saved') return 'upload_in_progress';
+    if (media.recognition_status === 'processing' && await mediaRecognitionIsInFlight(media)) return 'processing';
+    if (media.recognition_status === 'processing') {
+      const publicMedia = mediaPublic(media), updatedAt = Date.parse(media.updated_at || media.created_at);
+      if (publicMedia.recognition_status === 'processing' || !Number.isFinite(updatedAt)) return 'processing';
+    }
+    if (media.conversation_id != null) {
+      if (typeof media.conversation_id !== 'string' || !media.conversation_id) return 'owner_unknown';
+      const owner = snapshot.conversations.find(item => item?.conversation_id === media.conversation_id);
+      if (owner && subjectOf(owner) !== subjectId) return 'owner_unknown';
+    }
+    const linkedRecordIds = new Set([media.event_link?.record_id, media.record_id].filter(Boolean));
+    if (media.event_link?.record_id || media.record_id || media.link_status === 'linked'
+      || snapshot.events.some(event => referencesMediaId(event, media.media_id) || linkedRecordIds.has(event?.record_id))
+      || snapshot.historyMediaIds.has(media.media_id)
+      || snapshot.conversations.some(item => referencesMediaId(item, media.media_id))) return 'linked';
+    if (media.link_status === 'pending' || mediaPublic(media).link_pending_reason) return 'link_pending';
+    return null;
+  }
+  async function mediaWithDeleteEligibility(media, snapshot, subjectId) {
+    const blocked = await mediaDeletionBlock(media, subjectId, snapshot);
+    return { ...mediaPublic(media), delete_eligibility: { allowed: blocked === null, reason: blocked || 'eligible' } };
+  }
   async function mediaList() { const subjectId = await activeSubjectId(); return (await vault.list('media:')).filter(item => item?.media_id && subjectOf(item) === subjectId).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)); }
   function mediaCapabilities() { return { enabled: true, disabled_reason: null, max_total_bytes: MAX_MEDIA_BYTES, max_part_bytes: 2 * 1024 * 1024, max_parts: 12, audio_content_types: MEDIA_TYPES.audio, image_content_types: MEDIA_TYPES.image, multipart_upload: true, resumable_parts: true }; }
   async function mediaRequest(path, options) {
     const method = options?.method || 'GET'; const parts = path.split('/').filter(Boolean);
     if (path === '/api/media/capabilities' && method === 'GET') return ok(200, { ok: true, capabilities: mediaCapabilities() });
-    if (path === '/api/media' && method === 'GET') return ok(200, { ok: true, media: (await mediaList()).map(mediaPublic) });
+    if (path === '/api/media' && method === 'GET') {
+      const [items, subjectId, snapshot] = await Promise.all([mediaList(), activeSubjectId(), mediaDeletionSnapshot()]);
+      return ok(200, { ok: true, media: await Promise.all(items.map(item => mediaWithDeleteEligibility(item, snapshot, subjectId))) });
+    }
     if (path === '/api/media/uploads' && method === 'POST') {
       const form = parseBody(options); const kind = form.get('kind'); const type = String(form.get('content_type') || '').split(';')[0]; const totalParts = Number(form.get('total_parts'));
       if (!MEDIA_TYPES[kind]?.includes(type) || !Number.isInteger(totalParts) || totalParts < 1 || totalParts > 12) return fail(415, 'unsupported_format');
@@ -3607,9 +4101,50 @@
     }
     const mediaId = parts[2]; let media = await vault.get(mediaKey(mediaId));
     if (media && subjectOf(media) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
-    if(!media&&parts.length===3&&method==='GET'){const upload=(await vault.list('upload:')).find(item=>item.media_id===mediaId);if(upload)return subjectOf(upload) === await activeSubjectId() ? ok(200,{ok:true,media:{media_id:mediaId,subject_id:subjectOf(upload),kind:upload.kind,content_type:upload.content_type,original_filename:upload.original_filename,save_status:'uploading',recognition_status:'not_started',link_status:'not_linked',version:0}}) : fail(403,'subject_mismatch');}
+    if(!media&&parts.length===3&&['GET','DELETE'].includes(method)){const upload=(await vault.list('upload:')).find(item=>item.media_id===mediaId);if(upload){if(subjectOf(upload)!==await activeSubjectId())return fail(403,'subject_mismatch');if(method==='DELETE')return fail(409,'media_upload_in_progress');return ok(200,{ok:true,media:{media_id:mediaId,subject_id:subjectOf(upload),kind:upload.kind,content_type:upload.content_type,original_filename:upload.original_filename,save_status:'uploading',recognition_status:'not_started',link_status:'not_linked',version:0}})}}
     if (!media) return fail(404, 'media_not_found');
-    if (parts.length === 3 && method === 'GET') return ok(200, { ok: true, media: mediaPublic(media) });
+    if (parts.length === 3 && method === 'GET') {
+      const [subjectId, snapshot] = await Promise.all([activeSubjectId(), mediaDeletionSnapshot()]);
+      return ok(200, { ok: true, media: await mediaWithDeleteEligibility(media, snapshot, subjectId) });
+    }
+    if (parts.length === 3 && method === 'DELETE') {
+      const body = parseBody(options);
+      if (body.delete_scope_confirmed !== true) return fail(400, 'delete_confirmation_required');
+      if (!Number.isSafeInteger(body.expected_version) || body.expected_version !== media.version) return fail(409, 'stale_version');
+      const initialConversationId = media.conversation_id;
+      const deleteUnderLocks = () => withMediaLock(mediaId, async () => {
+        const current = await vault.get(mediaKey(mediaId));
+        if (!current) return fail(404, 'media_not_found');
+        if (subjectOf(current) !== await activeSubjectId()) return fail(403, 'subject_mismatch');
+        if (current.version !== body.expected_version || current.conversation_id !== initialConversationId) return fail(409, 'stale_version');
+        const snapshot = await mediaDeletionSnapshot();
+        const blocked = await mediaDeletionBlock(current, await activeSubjectId(), snapshot);
+        if (blocked === 'linked') return fail(409, 'media_linked');
+        if (blocked === 'link_pending') return fail(409, 'media_link_pending');
+        if (blocked === 'processing') return fail(409, 'media_processing');
+        if (blocked === 'upload_in_progress') return fail(409, 'media_upload_in_progress');
+        if (blocked === 'trial_controlled') return fail(409, 'media_trial_controlled');
+        if (blocked === 'owner_unknown') return fail(409, 'media_owner_unknown');
+        const unchanged = [
+          { key: mediaKey(mediaId), value: current },
+          { key: mediaBinaryKey(mediaId), value: await vault.get(mediaBinaryKey(mediaId)) },
+          { key: TRIAL_VOICE_KEY, value: snapshot.trial },
+          ...snapshot.events.map(item => ({ key: eventKey(item.record_id), value: item })),
+          ...snapshot.conversations.map(item => ({ key: conversationKey(item.conversation_id), value: item })),
+          ...snapshot.uploads.map(item => ({ key: `upload:${item.upload_id}`, value: item })),
+          ...snapshot.histories.filter(item => referencesMediaId(item.value, mediaId)),
+        ];
+        const deletes = [mediaKey(mediaId), mediaBinaryKey(mediaId)];
+        for (const doc of await driver.listDocs()) if (doc.key.startsWith('operation:')) {
+          const operation = await vault.get(doc.key);
+          if (operation?.media_id === mediaId) { deletes.push(doc.key); unchanged.push({ key: doc.key, value: operation }); }
+        }
+        try { await ownedMutation({ deletes: deletes.filter(Boolean), unchanged }); }
+        catch (error) { if (error.message === 'document_changed') return fail(409, 'stale_version'); throw error; }
+        return ok(200, { ok: true, deleted: { media_id: mediaId, local_media_count: 1, encrypted_backups_unchanged: true } });
+      });
+      return initialConversationId ? withConversationLock(initialConversationId, deleteUnderLocks) : deleteUnderLocks();
+    }
     if (parts[3] === 'recognize' && method === 'POST') {
       return withRecognitionLocks(media, () => withMediaLock('voice-recognition-start', async () => {
         const current = await vault.get(mediaKey(mediaId));
@@ -3622,7 +4157,12 @@
           if (current.trial_control?.asr_trial_receipt_id) return fail(409, current.trial_control.state === 'stopped' ? 'trial_stopped' : 'trial_review_required', { media: mediaPublic(current) });
           if (await trialBlocksAudio(trial, current)) return fail(409, trial.state === 'stopped' ? 'trial_stopped' : 'trial_review_required', { media: mediaPublic(current) });
           if (current.recognition_status === 'succeeded' && current.trial_control) return ok(200, { ok: true, media: mediaPublic(current) });
-          if ((await mediaList()).some(item => item.media_id !== mediaId && item.kind === 'audio' && item.recognition_status === 'processing')) return fail(409, 'audio_recognition_in_progress', { media: mediaPublic(current) });
+          const activeAudio = await audioRecognitionInFlight();
+          const recentProcessing = (await mediaList()).some(item => {
+            const age = Date.now() - (Date.parse(item.updated_at || item.created_at) || 0);
+            return item.media_id !== mediaId && item.kind === 'audio' && item.recognition_status === 'processing' && age < 120000;
+          });
+          if (activeAudio || recentProcessing) return fail(409, 'audio_recognition_in_progress', { media: mediaPublic(current) });
         }
         const processing = { ...current, conversation_version_at_start: sourceConversation?.version ?? null,
           recognition_status: 'processing', version: current.version + 1, updated_at: now(), recognition: null };
@@ -3658,6 +4198,22 @@
   }
 
   async function processRecognition(media, asrOwner = null) {
+    const lockName = `bingli-media-recognition:${media.media_id}`;
+    localMediaRecognitionIds.add(media.media_id);
+    if (media.kind === 'audio') localAudioRecognitionScopes += 1;
+    try {
+      const run = () => withLocalLock(lockName, mediaRecognitionWrites, () => processRecognitionUnlocked(media, asrOwner));
+      // Keep the existing cross-tab audio lock for the whole provider request.
+      return media.kind === 'audio'
+        ? await withLocalLock(AUDIO_RECOGNITION_LOCK, audioRecognitionWrites, run)
+        : await run();
+    } finally {
+      if (media.kind === 'audio') localAudioRecognitionScopes -= 1;
+      localMediaRecognitionIds.delete(media.media_id);
+    }
+  }
+
+  async function processRecognitionUnlocked(media, asrOwner = null) {
     pendingLocalOperations += 1;
     let recognitionTrial = null;
     try {
@@ -3794,7 +4350,23 @@
           if (selected || start || end) return includedRecords.has(recordId);
           return true;
         });
-        const conversationReports = (await listConversations()).filter(item => item.report).map(item => ({ item, elder: elderTurns(item), transcript: liveConversationTurns(item).filter(turn => !mockSource(turn) && (turn.source_kind !== 'audio_transcript' || turn.audio_source_reviewed === true)), hasPendingAudio: liveConversationTurns(item).some(turn => turn.role === 'elder' && turn.source_kind === 'audio_transcript' && turn.audio_source_reviewed !== true) })).filter(({item,elder,hasPendingAudio})=>{const at=Date.parse(`${item.last_local_date||item.local_date}T12:00:00`);return !hasPendingAudio&&(!start||at>=start)&&(!end||at<=end)&&(!selected||elder.some(turn=>selected.has(turn.record_id)))}).map(({item,transcript}) => ({ conversation_id: item.conversation_id, subject_id: subjectOf(item), local_date: item.local_date, last_local_date: item.last_local_date, status: item.status, report: item.report, completeness: item.completeness, transcript: transcript.map(turn => ({ turn_id: turn.turn_id, role: turn.role, text: turn.text, original_text: turn.original_text, created_at: turn.created_at, version: turn.version, versions: turn.versions || [], record_id: turn.record_id || null })) }));
+        const currentMedia = await mediaList();
+        const handoffEventIndex = new Map(allEvents.map(event => [event.record_id, event]));
+        const handoffMediaIndex = new Map(currentMedia.map(item => [item.media_id, item]));
+        const conversationReports = (await listConversations()).filter(item => item.report)
+          .map(item => ({ item, elder: elderTurns(item), transcript: liveConversationTurns(item).filter(turn => !mockSource(turn)),
+            sourcesCurrent: audioConversationSourcesCurrent(item, handoffEventIndex, handoffMediaIndex) }))
+          .filter(({item,elder,sourcesCurrent}) => {
+            const at = Date.parse(`${item.last_local_date||item.local_date}T12:00:00`);
+            return sourcesCurrent && (!start||at>=start) && (!end||at<=end) && (!selected||elder.some(turn=>selected.has(turn.record_id)));
+          })
+          .map(({item,transcript}) => ({ conversation_id: item.conversation_id, subject_id: subjectOf(item), local_date: item.local_date,
+            last_local_date: item.last_local_date, status: item.status, report: item.report, completeness: item.completeness,
+            transcript: transcript.map(turn => ({ turn_id: turn.turn_id, role: turn.role, text: turn.text, original_text: turn.original_text,
+              created_at: turn.created_at, version: turn.version, versions: turn.versions || [], record_id: turn.record_id || null,
+              ...(turn.source_kind === 'audio_transcript' ? { source: { kind: 'audio_transcript', status: turn.audio_source_reviewed === true ? 'original_comparison' : turn.audio_source_status || 'legacy_unclassified',
+                record_id: turn.record_id || null, record_version: turn.audio_source_version ?? null, media_id: turn.media_id || null,
+                media_version: turn.audio_source_media_version ?? null, verified_by_user: turn.audio_source_reviewed === true } } : {}) })) }));
         const pending = items.filter(safety.documentNeedsReview);
         const pendingAudio = items.filter(event => event.source_kind === 'audio_transcript' && safety.audioNeedsReview(event));
         const pendingIds = new Set(pending.map(event => event.record_id));

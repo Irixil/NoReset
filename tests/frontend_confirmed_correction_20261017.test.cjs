@@ -16,27 +16,21 @@ const conversation = { turns: [old, correction], completeness: { contradictions:
   { text: '自然更正无法唯一定位旧原话，待核实。', evidence_turn_ids: ['correction'] },
 ] } };
 
-test('selection keeps decimal values intact and offers only earlier live text sources', () => {
+test('older messages remain quotable but are not offered as rewrite targets', () => {
   const c = structuredClone(conversation);
   c.turns.unshift({...old, turn_id:'audio', source_kind:'audio_transcript'}, {...old, turn_id:'mock', is_mock:true},
     {...old, turn_id:'obsolete', superseded:true}, {...old, turn_id:'assistant', role:'assistant'});
   c.turns.push({...old, turn_id:'later'});
   const choices = context.naturalCorrectionTargets(c, correction);
-  assert.deepEqual(Array.from(choices, item => item.quote), ['昨晚睡了3.5小时。', '早上还好。']);
-  assert.ok(choices.every(item => item.turn.turn_id === 'old'));
+  assert.deepEqual(Array.from(choices), []);
 });
 
-test('confirmation starts with no selected target and disabled save; preview copies original source', () => {
+test('natural correction remains an appended message and has no older-turn rewrite control', () => {
   const targets = context.naturalCorrectionTargets(conversation, correction);
   const initial = context.naturalCorrectionReviewHtml(correction, targets, {turnId:'correction'});
-  assert.doesNotMatch(initial, /\bchecked\b/);
-  assert.match(initial, /data-natural-correction-save disabled/);
-  const selected = context.naturalCorrectionReviewHtml(correction, targets, {selectedKey:targets[0].key});
-  assert.match(selected, /昨晚睡了3.5小时。/);
-  assert.match(selected, /昨晚只睡了一会儿。/);
-  assert.match(selected, /data-natural-correction-save disabled/);
-  const confirmed = context.naturalCorrectionReviewHtml(correction, targets, {selectedKey:targets[0].key, confirmed:true});
-  assert.doesNotMatch(confirmed, /data-natural-correction-save disabled/);
+  assert.match(initial, /更正已作为新原话保留/);
+  assert.match(initial, /较早原话不会被回写/);
+  assert.doesNotMatch(initial, /data-natural-correction-target|data-natural-correction-save|correction-target/);
 });
 
 test('unmatched format or truncated replacement cannot acquire a guessed correction', () => {
@@ -45,12 +39,12 @@ test('unmatched format or truncated replacement cannot acquire a guessed correct
   assert.equal(context.pendingNaturalCorrection({...conversation, manual_corrections:[{correction_turn_id:'correction'}]}, correction), null);
 });
 
-test('source text is escaped in correction choices and preview', () => {
+test('natural correction review does not re-render or modify older source text', () => {
   const target = {...old, text:'<script>unsafe</script>。'};
   const c = {...conversation, turns:[target, correction]};
   const html = context.naturalCorrectionReviewHtml(correction, context.naturalCorrectionTargets(c, correction), {});
-  assert.match(html, /&lt;script&gt;unsafe&lt;\/script&gt;/);
-  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /较早原话不会被回写/);
+  assert.doesNotMatch(html, /<script>|&lt;script&gt;/);
 });
 
 function legacyCandidateFixture(){
