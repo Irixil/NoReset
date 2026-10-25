@@ -28,3 +28,13 @@
 - [ ] 无密钥、数据库、私人录音／照片、依赖目录、模型缓存或未经许可公开的样例
 - [ ] 未恢复已撤回的 60 秒限制；录音提醒后暂停并可续录，具体参数仍按已确认合同处理
 - [ ] 交接说明包含运行、测试、已知限制和下一位负责事项
+
+## 协作与署名
+
+实际参与者及各自贡献：
+
+同一提交确有共同贡献时，在提交说明末尾保留 `Co-authored-by: 姓名 <该作者关联 GitHub 的邮箱>`，并保留已有作者与共同署名。只在 PR 正文中写姓名不会建立提交的共同署名。
+
+确有 Codex 贡献时，可使用 `Co-authored-by: Codex <noreply@openai.com>` 标明 AI 协助。署名说明贡献来源，不代表独立评审或完整产品验收。
+
+格式见 [GitHub 共同作者说明](https://docs.github.com/en/pull-requests/how-tos/commit-changes/creating-a-commit-with-multiple-authors)。
